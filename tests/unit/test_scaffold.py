@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import sys
 
-import agentsense
+import agentsensory
 
 import audel
 from audel import Issue, IssueKind, IssueSource, Report, Severity, Span, Verdict
@@ -32,8 +32,8 @@ def test_audio_issue_is_time_grounded():
 
 
 def test_handoff_is_shared_contract_and_schema_compatible():
-    # Audel and AgentVision both distill to the *same* agentsense.Handoff class.
-    assert audel.Handoff is agentsense.Handoff
+    # Audel and AgentVision both distill to the *same* agentsensory.Handoff class.
+    assert audel.Handoff is agentsensory.Handoff
     r = Report(verdict=Verdict.FAIL, summary="bad",
                issues=[Issue.make(IssueKind.WRONG_LANGUAGE, Severity.ERROR, "heard fr, wanted en")],
                audio_path="intro.wav")

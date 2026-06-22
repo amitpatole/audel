@@ -1,16 +1,16 @@
 """Audel data models.
 
-Built on the shared :mod:`agentsense` contract (re-exported here) plus the *audio* specialisation:
+Built on the shared :mod:`agentsensory` contract (re-exported here) plus the *audio* specialisation:
 the closed ``IssueKind`` / ``IssueSource`` enums and the ``Issue`` / ``Report`` subclasses. Audio
 issues are **time-grounded** via ``span`` (where the eyes use ``bbox``). Because both senses derive
-from agentsense, Audel's ``Handoff`` is schema-identical to AgentVision's.
+from agentsensory, Audel's ``Handoff`` is schema-identical to AgentVision's.
 """
 
 from __future__ import annotations
 
 from enum import Enum
 
-from agentsense import (
+from agentsensory import (
     BBox,
     Brief,
     ClaimResult,

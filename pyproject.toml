@@ -24,7 +24,7 @@ classifiers = [
 # Light core: shared contract + DSP/schema/CLI. Heavy ML/render deps live in extras and are
 # lazy-imported, so `import audel` stays fast and torch-free.
 dependencies = [
-    "agentsense>=0.1",
+    "agentsensory>=0.1",
     "pydantic>=2.6",
     "pydantic-settings>=2.2",
     "numpy>=1.26",

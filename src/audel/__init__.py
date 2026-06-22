@@ -10,7 +10,7 @@ are exposed lazily via ``__getattr__`` so ``import audel`` always works, even on
 
 from __future__ import annotations
 
-from agentsense import (
+from agentsensory import (
     BBox,
     Brief,
     ClaimResult,
