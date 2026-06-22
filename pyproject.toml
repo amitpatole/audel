@@ -1,0 +1,46 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "audel"
+version = "0.0.1"
+description = "Ears for AI Agents — a machine-graded audio feedback loop coding agents consume to self-correct before claiming done."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Amit Patole", email = "amit.patole@gmail.com" }]
+keywords = ["ai", "agents", "audio", "speech", "asr", "llm", "voice", "mcp"]
+classifiers = [
+    "Development Status :: 1 - Planning",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Sound/Audio :: Analysis",
+    "Topic :: Software Development :: Quality Assurance",
+    "Topic :: Software Development :: Testing",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.5", "mypy>=1.10"]
+
+[project.urls]
+Homepage = "https://github.com/amitpatole/audel"
+Repository = "https://github.com/amitpatole/audel"
+Issues = "https://github.com/amitpatole/audel/issues"
+
+[project.scripts]
+audel = "audel.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/audel"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
