@@ -1,17 +1,72 @@
 """Audel — Ears for AI Agents 👂
 
-A machine-graded audio feedback loop that coding agents consume to self-correct before
-claiming an audio/voice/media task done: play → hear → report → (fix) → re-play.
+A machine-graded audio feedback loop coding agents consume to self-correct before claiming an
+audio/voice/media task done: play → hear → report → (fix) → re-play. The audio sibling of
+AgentVision (eyes) and Verel (brain).
 
-The audio sibling of AgentVision (eyes) and Verel (brain). AgentVision confirms a video
-*renders*; Audel confirms it actually has sound and the narration is right.
-
-This is a placeholder release reserving the ``audel`` name on PyPI. The graded API
-(``analyze``/``check``/``watch``/``render``/``compute_diff``) lands in upcoming versions —
-see https://github.com/amitpatole/audel.
+The top-level import is dependency-light. Heavy entry points (ffmpeg/DSP, ASR, CLAP, Playwright)
+are exposed lazily via ``__getattr__`` so ``import audel`` always works, even on a bare server.
 """
 
 from __future__ import annotations
 
-__version__ = "0.0.1"
-__all__ = ["__version__"]
+from agentsense import (
+    BBox,
+    Brief,
+    ClaimResult,
+    ClaimStatus,
+    Confidence,
+    Conformance,
+    Handoff,
+    Importance,
+    IntentClaim,
+    NextAction,
+    Severity,
+    Span,
+    Verdict,
+)
+
+from .config import LoudnessTarget, Settings, load_settings
+from .errors import (
+    AudelError,
+    BackendAuthError,
+    BackendError,
+    ConfigError,
+    DecodeError,
+    MissingDependencyError,
+    UnsafeSourceError,
+)
+from .models import Issue, IssueKind, IssueSource, Report
+
+__version__ = "0.1.0"
+
+__all__ = [
+    "__version__",
+    "Settings", "load_settings", "LoudnessTarget",
+    "AudelError", "UnsafeSourceError", "DecodeError", "MissingDependencyError",
+    "BackendError", "BackendAuthError", "ConfigError",
+    "BBox", "Span", "Issue", "IssueKind", "IssueSource", "Severity", "Confidence",
+    "Verdict", "Report", "Brief", "IntentClaim", "Importance", "ClaimStatus", "ClaimResult",
+    "Conformance", "Handoff", "NextAction",
+    # lazy (built in later phases):
+    "analyze", "check", "watch", "render", "compute_diff",
+    "LoopSession", "GenerativeLoopSession",
+]
+
+_LAZY_CORE = {"analyze", "check", "watch", "render", "compute_diff"}
+
+
+def __getattr__(name: str):
+    # Lazy high-level API — imported on demand to keep the base import light. Until a phase wires
+    # the implementation, accessing it raises a clear, actionable error rather than ImportError.
+    if name in _LAZY_CORE:
+        try:
+            from . import core
+        except ImportError as e:  # pragma: no cover - until Phase 1
+            raise NotImplementedError(
+                f"audel.{name}() lands in a later build; core is not wired yet."
+            ) from e
+        return getattr(core, name)
+    if name in {"LoopSession", "GenerativeLoopSession"}:
+        raise NotImplementedError(f"audel.{name} lands in Phase 5.")
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

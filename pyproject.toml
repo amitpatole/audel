@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "audel"
-version = "0.0.1"
+version = "0.1.0"
 description = "Ears for AI Agents — a machine-graded audio feedback loop coding agents consume to self-correct before claiming done."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -12,7 +12,7 @@ license = { text = "MIT" }
 authors = [{ name = "Amit Patole", email = "amit.patole@gmail.com" }]
 keywords = ["ai", "agents", "audio", "speech", "asr", "llm", "voice", "mcp"]
 classifiers = [
-    "Development Status :: 1 - Planning",
+    "Development Status :: 2 - Pre-Alpha",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3.11",
@@ -21,9 +21,30 @@ classifiers = [
     "Topic :: Software Development :: Quality Assurance",
     "Topic :: Software Development :: Testing",
 ]
-dependencies = []
+# Light core: shared contract + DSP/schema/CLI. Heavy ML/render deps live in extras and are
+# lazy-imported, so `import audel` stays fast and torch-free.
+dependencies = [
+    "agentsense>=0.1",
+    "pydantic>=2.6",
+    "pydantic-settings>=2.2",
+    "numpy>=1.26",
+    "typer>=0.12",
+    "platformdirs>=4.0",
+]
 
 [project.optional-dependencies]
+render = ["playwright>=1.44"]
+asr = ["faster-whisper>=1.0"]
+cloud = ["anthropic>=0.40", "google-genai>=0.3", "httpx>=0.27"]
+clap = ["transformers>=4.40", "torch>=2.2", "librosa>=0.10"]
+serve = ["fastapi>=0.110", "uvicorn[standard]>=0.29", "python-multipart>=0.0.9"]
+mcp = ["mcp>=1.2"]
+all = [
+    "playwright>=1.44", "faster-whisper>=1.0",
+    "anthropic>=0.40", "google-genai>=0.3", "httpx>=0.27",
+    "transformers>=4.40", "torch>=2.2", "librosa>=0.10",
+    "fastapi>=0.110", "uvicorn[standard]>=0.29", "python-multipart>=0.0.9", "mcp>=1.2",
+]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.5", "mypy>=1.10"]
 
 [project.urls]
@@ -32,7 +53,14 @@ Repository = "https://github.com/amitpatole/audel"
 Issues = "https://github.com/amitpatole/audel/issues"
 
 [project.scripts]
-audel = "audel.__main__:main"
+audel = "audel.adapters.cli:main"
+audel-mcp = "audel.adapters.mcp:main"
+audel-serve = "audel.adapters.rest:main"
+
+# Third-party backends register here: `audel-backend-foo` exposes an AudioBackend so
+# `analyze(backend="foo")` resolves it.
+[project.entry-points."audel.backends"]
+local = "audel.backends.local:LocalBackend"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/audel"]
@@ -41,6 +69,14 @@ packages = ["src/audel"]
 line-length = 100
 target-version = "py311"
 
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "W"]
+ignore = ["E501", "UP042"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true

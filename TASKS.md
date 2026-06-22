@@ -58,6 +58,12 @@
 
 ## Phase 0 — Contract + scaffold
 
+> ✅ **Phase 0a DONE (2026-06-22):** `agentsense` 0.1.0 created at
+> `/home/amitpatole/WORKSPACE/agentsense` (own git repo) — neutral `IssueBase`/`ReportBase`/
+> `Conformance`/`Brief`/`Handoff`/enums + `BBox`/`Span` grounding + `Sense` protocol, 7 contract
+> tests. AgentVision refactored on branch `extract-agentsense` to subclass+re-export: **full 147
+> unit tests still green**, ruff+mypy(models) clean. Committed locally in both repos (not pushed).
+
 ### 0a. Extract `agentsense` (touches published agentvision — verify carefully)
 - [ ] Create `agentsense` package (`src/agentsense/`, hatchling, py.typed, pydantic only — zero
       heavy deps). Move the **structural** models: Verdict, Severity, Confidence, Importance,
