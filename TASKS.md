@@ -6,8 +6,10 @@
 
 ## Locked decisions
 
-1. **Dist/import/CLI name:** `audel`. ✅ **Reserved** — skeleton `0.0.1` published to PyPI
-   2026-06-22 (https://pypi.org/project/audel/). Git repo: github.com/amitpatole/audel (private).
+1. **Dist/import/CLI name:** `audel`. ✅ **Reserved on both indexes** — skeleton `0.0.1` published
+   2026-06-22 to PyPI (https://pypi.org/project/audel/) and TestPyPI
+   (https://test.pypi.org/project/audel/). Tokens: `~/.config/PyPi/token` (PyPI),
+   `~/.config/TestPyPi/token` (TestPyPI). Git repo: github.com/amitpatole/audel (private).
 2. **Shared contract:** extract **`agentsense`**; `agentvision.models` re-exports for back-compat.
 3. **Default `analyze` backend:** transcript + text-LLM. **Primary text critique = Ollama Cloud**
    (user has a Max plan = flat-rate, no per-token cost) via OpenAI-compatible `https://ollama.com/v1`,
