@@ -118,6 +118,41 @@ def diff(baseline: str, candidate: str) -> None:
 
 
 @app.command()
+def stream(source: str,
+           chunk_ms: int = typer.Option(500, help="Chunk size fed per step (simulated live cadence).")) -> None:
+    """Grade a source as a LIVE stream: decode, then feed it in chunks to a bounded StreamMonitor.
+
+    Demonstrates the realtime path (live voice-agent / call QA). Prints periodic status, then the
+    final time-grounded report.
+    """
+    import wave
+
+    from ..core.stream import StreamMonitor
+    from ..mediaguard import decode_to_wav, validate_source
+
+    settings = load_settings()
+    path = validate_source(source, settings)
+    wav = decode_to_wav(path, settings)
+    try:
+        with wave.open(str(wav), "rb") as w:
+            sr, ch = w.getframerate(), w.getnchannels()
+            mon = StreamMonitor(sample_rate=sr, channels=ch, settings=settings)
+            n = max(1, int(sr * chunk_ms / 1000))
+            while True:
+                frames = w.readframes(n)
+                if not frames:
+                    break
+                u = mon.feed(frames)
+                typer.echo(f"  t={u.t_ms:>6}ms  rms={u.rms_dbfs:6.1f}dBFS  "
+                           f"{'CLIP ' if u.clipping else ''}{'SILENT ' if u.silent else ''}"
+                           f"→ {u.verdict.value}")
+    finally:
+        wav.unlink(missing_ok=True)
+    typer.secho("\nfinal:", bold=True)
+    _print_report(mon.finalize())
+
+
+@app.command()
 def serve(host: str = typer.Option("127.0.0.1", help="Bind host. Non-loopback requires AUDEL_API_TOKEN."),
           port: int = typer.Option(8000, help="Bind port.")) -> None:
     """Start the REST service (needs audel[serve]). Loopback is zero-config; a routable bind

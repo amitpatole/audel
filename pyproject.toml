@@ -86,3 +86,10 @@ testpaths = ["tests"]
 [tool.mypy]
 python_version = "3.11"
 ignore_missing_imports = true
+
+# numpy's shipped stubs use a PEP 695 `type` statement (3.12-only) that mypy rejects under our
+# 3.11 target; skip following them (numpy is treated as untyped) rather than fail the whole run.
+[[tool.mypy.overrides]]
+module = "numpy.*"
+follow_imports = "skip"
+follow_imports_for_stubs = true

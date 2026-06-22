@@ -50,11 +50,11 @@ __all__ = [
     "Conformance", "Handoff", "NextAction",
     # lazy (built in later phases):
     "analyze", "check", "watch", "render", "compute_diff",
-    "LoopSession", "GenerativeLoopSession",
+    "LoopSession", "GenerativeLoopSession", "StreamMonitor",
 ]
 
 _LAZY_CORE = {"analyze", "check", "watch", "render", "compute_diff",
-              "LoopSession", "GenerativeLoopSession"}
+              "LoopSession", "GenerativeLoopSession", "StreamMonitor"}
 
 
 def __getattr__(name: str):

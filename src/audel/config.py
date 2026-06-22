@@ -98,6 +98,12 @@ class Settings(BaseSettings):
     silence_dbfs: float = -50.0        # below this RMS = silence
     clipping_dbtp: float = -1.0        # true-peak ceiling (dBTP) above which we flag clipping
 
+    # Realtime streaming (Phase 7) — bounded buffers + backpressure for live grading.
+    stream_window_s: float = 3.0       # rolling window the "current" RMS/peak is measured over
+    max_stream_chunk_s: float = 5.0    # a single feed() longer than this is refused (backpressure)
+    max_stream_spans: int = 1000       # cap recorded dropout spans (bound memory on a long stream)
+    stream_dropout_min_s: float = 0.2  # interior silence ≥ this = a dropout (mid-stream gap)
+
     # Decode resource caps (untrusted media → ffmpeg). Enforced BEFORE decode (Phase 1).
     max_media_bytes: int = 200_000_000      # 200 MB byte cap before handing a file to ffmpeg
     max_duration_s: float = 3 * 60 * 60      # 3h duration cap (decompression-bomb bound)
