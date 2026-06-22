@@ -10,7 +10,13 @@
    2026-06-22 to PyPI (https://pypi.org/project/audel/) and TestPyPI
    (https://test.pypi.org/project/audel/). Tokens: `~/.config/PyPi/token` (PyPI),
    `~/.config/TestPyPi/token` (TestPyPI). Git repo: github.com/amitpatole/audel (private).
-2. **Shared contract:** extract **`agentsense`**; `agentvision.models` re-exports for back-compat.
+2. **Shared contract:** **`agentsensory`** (was `agentsense` — blocked on PyPI as too-similar).
+   Reserved on PyPI + TestPyPI (0.0.1 placeholder, 2026-06-22). Real 0.1.0 stays **local/editable**;
+   `agentvision.models` re-exports for back-compat. Repo at `/home/amitpatole/WORKSPACE/agentsensory`.
+
+> **Standing constraints (2026-06-22):** (a) keep **AgentVision + agentsensory commits LOCAL** (no
+> remote push) until the trio is proven end-to-end; (b) **all repos stay PRIVATE** until every
+> security cadence passes; (c) only **Audel** pushes to its private remote during the build.
 3. **Default `analyze` backend:** transcript + text-LLM. **Primary text critique = Ollama Cloud**
    (user has a Max plan = flat-rate, no per-token cost) via OpenAI-compatible `https://ollama.com/v1`,
    key at `~/.config/ollama/key`. Good models verified 2026-06-22: `gemma4:31b` (clean JSON, ~1.8s),
