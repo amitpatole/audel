@@ -10,6 +10,7 @@ range checks.
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import socket
 from urllib.parse import urlparse
@@ -82,3 +83,36 @@ def assert_safe_url(url: str) -> None:
     if parsed.scheme not in ALLOWED_SCHEMES:
         raise UnsafeSourceError(f"backend URL scheme {parsed.scheme!r} not allowed (http/https only)")
     assert_host_safe(parsed.hostname, parsed.port)
+
+
+async def host_is_safe(host: str | None, port: int | None) -> bool:
+    """Fetch-time SSRF check (async). Re-resolves so a DNS flip / redirect to internal is blocked.
+    Fail closed (False) on any resolution error."""
+    if not host:
+        return False
+    if _is_literal_ip(host):
+        return not ip_is_blocked(host)
+    try:
+        loop = asyncio.get_running_loop()
+        infos = await loop.getaddrinfo(host, port or 443, proto=socket.IPPROTO_TCP)
+    except (socket.gaierror, OSError):
+        return False
+    return all(not ip_is_blocked(str(info[4][0])) for info in infos)
+
+
+async def resolve_safe_ip(host: str | None, port: int | None) -> str | None:
+    """Resolve+vet ONCE and return a safe IP to PIN the connection to (defeats DNS rebinding: the
+    proxy connects to this exact vetted IP rather than re-resolving). None if internal/unresolvable."""
+    if not host:
+        return None
+    if _is_literal_ip(host):
+        return None if ip_is_blocked(host) else host
+    try:
+        loop = asyncio.get_running_loop()
+        infos = await loop.getaddrinfo(host, port or 443, proto=socket.IPPROTO_TCP)
+    except (socket.gaierror, OSError):
+        return None
+    ips = [str(info[4][0]) for info in infos]
+    if not ips or any(ip_is_blocked(ip) for ip in ips):
+        return None
+    return ips[0]

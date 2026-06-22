@@ -86,9 +86,16 @@ def analyze(
 
 
 @app.command()
-def watch(source: str) -> None:
-    """Temporal/playback liveness — Phase 4."""
-    typer.secho(f"watch {source}: {_SOON}", fg=typer.colors.YELLOW)
+def watch(
+    source: str,
+    click: str = typer.Option(None, help="CSS selector to click (URL mode) — check its sound fires."),
+) -> None:
+    """Temporal grade: plays-through / dropouts / A/V desync (file) or sound-fires (http(s) URL)."""
+    from ..core import watch as _watch
+
+    report = asyncio.run(_watch(source, click_selector=click))
+    _print_report(report)
+    raise typer.Exit(0 if report.verdict.value != "fail" else 1)
 
 
 @app.command()

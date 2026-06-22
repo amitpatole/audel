@@ -181,6 +181,31 @@ def probe(path: Path, settings: Settings) -> MediaInfo:
                      codec=codec, has_audio=has_audio)
 
 
+def probe_streams(path: Path, settings: Settings) -> dict:
+    """Per-stream durations/start times (audio + video) for A/V desync analysis. Best-effort."""
+    ffprobe = _tool("ffprobe", settings.ffmpeg_path and str(Path(settings.ffmpeg_path).with_name("ffprobe")))
+    argv = [ffprobe, "-v", "error", "-print_format", "json",
+            "-show_entries", "stream=codec_type,duration,start_time", "-i", str(path)]
+    proc = run(argv, timeout_s=min(30.0, settings.decode_timeout_s))
+    out: dict = {"audio": None, "video": None}
+    if proc.returncode != 0:
+        return out
+    try:
+        meta = json.loads(proc.stdout or b"{}")
+    except json.JSONDecodeError:
+        return out
+    for s in meta.get("streams", []):
+        kind = s.get("codec_type")
+        if kind in ("audio", "video") and out.get(kind) is None:
+            def _f(v):
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    return None
+            out[kind] = {"duration": _f(s.get("duration")), "start": _f(s.get("start_time"))}
+    return out
+
+
 def decode_to_wav(path: Path, settings: Settings, *, sample_rate: int = 16000) -> Path:
     """Decode a validated file to a DURATION-BOUNDED 16 kHz mono WAV in a temp file (caller deletes).
 

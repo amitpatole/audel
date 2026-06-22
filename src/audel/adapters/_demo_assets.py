@@ -57,6 +57,35 @@ def make_video_no_audio(d: Path) -> Path:
     return _synth(d / "noaudio.mp4", "testsrc=size=64x64:rate=5:duration=1")
 
 
+def make_dropout(d: Path) -> Path:
+    # An active tone with a 0.6s muted interior gap (a mid-playback dropout; >= silencedetect's
+    # 0.5s floor so it registers, but < check()'s 1.5s plain-silence threshold).
+    return _synth(d / "dropout.wav", "sine=frequency=440:duration=2:sample_rate=16000",
+                  af="volume=0:enable='between(t,0.7,1.3)'")
+
+
+def make_silent_video(d: Path) -> Path:
+    # A video that "plays" but whose audio track is silent.
+    p = d / "silentvideo.mp4"
+    argv = [_ffmpeg(), "-y", "-hide_banner", "-loglevel", "error",
+            "-f", "lavfi", "-i", "testsrc=size=64x64:rate=5:duration=1",
+            "-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono", "-shortest", str(p)]
+    subprocess.run(argv, check=True, stdin=subprocess.DEVNULL,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=60)
+    return p
+
+
+def make_desync_video(d: Path) -> Path:
+    # Video ~2s, audio ~1s (no -shortest) → audio/video duration mismatch (A/V desync).
+    p = d / "desync.mp4"
+    argv = [_ffmpeg(), "-y", "-hide_banner", "-loglevel", "error",
+            "-f", "lavfi", "-i", "testsrc=size=64x64:rate=10:duration=2",
+            "-f", "lavfi", "-i", "sine=frequency=440:duration=1:sample_rate=16000", str(p)]
+    subprocess.run(argv, check=True, stdin=subprocess.DEVNULL,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=60)
+    return p
+
+
 def make_broken(d: Path) -> Path:
     """The deliberately-broken demo clip (clipping → deterministic FAIL)."""
     return make_clipping(d)

@@ -31,7 +31,7 @@ from .render import _render_sync
 DSP_CAPABILITIES = [
     IssueKind.SILENCE, IssueKind.CLIPPING, IssueKind.LOUDNESS, IssueKind.TRUNCATION,
     IssueKind.MISSING_AUDIO, IssueKind.DECODE_ERROR, IssueKind.DURATION,
-    IssueKind.TRANSCRIPT_MISMATCH, IssueKind.WRONG_LANGUAGE,
+    IssueKind.TRANSCRIPT_MISMATCH, IssueKind.WRONG_LANGUAGE, IssueKind.DROPOUT, IssueKind.DESYNC,
 ]
 
 
