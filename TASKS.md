@@ -91,6 +91,12 @@
   a schema-compat test asserts `audel`'s `Handoff` is schema-identical to AgentVision's;
   AgentVision's own tests still pass after the 0a refactor.
 
+> ✅ **Phase 0b DONE:** real scaffold (config/errors/logging/models/doctor/CLI), torch-free import,
+> 7 scaffold tests (incl. no-default-token + secret-redaction), ruff+mypy clean. Pushed to audel main.
+> ✅ **Phase 1 DONE:** mediaguard + ffmpeg-filter signals + render()/check() + `audel demo`
+> (FAIL→PASS, no key). 31 tests incl. exploit proofs; red-team 3 fix-rounds + clean round.
+> Pushed to audel main (commit 0a351fb).
+
 ## Phase 1 — render() + deterministic check()
 - [ ] `signals/decode.py` (ffmpeg subprocess, **argv form**, bounded: max-duration / max-bytes
       cap before decode, timeout) → `Waveform` (numpy) + base metrics.
