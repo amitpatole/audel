@@ -32,20 +32,29 @@ def register_secret(value: str | None) -> None:
         _KNOWN_SECRETS.add(value)
 
 
+def scrub_text(text: str) -> str:
+    """Redact known secret values (and shape-matched ones) from arbitrary text.
+
+    Value-based redaction is sound (config registers every key it resolves); the regex is a
+    backstop. Used by the workspace so a credential can never reach disk via persisted session
+    state, and by the log filter below."""
+    for secret in _KNOWN_SECRETS:
+        if secret in text:
+            text = text.replace(secret, "[REDACTED]")
+    if _SECRET_RE.search(text):
+        text = _SECRET_RE.sub("[REDACTED]", text)
+    return text
+
+
 class _SecretScrubber(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003
         try:
             msg = record.getMessage()
         except Exception:
             return True
-        original = msg
-        for secret in _KNOWN_SECRETS:
-            if secret in msg:
-                msg = msg.replace(secret, "[REDACTED]")
-        if _SECRET_RE.search(msg):
-            msg = _SECRET_RE.sub("[REDACTED]", msg)
-        if msg != original:
-            record.msg = msg
+        scrubbed = scrub_text(msg)
+        if scrubbed != msg:
+            record.msg = scrubbed
             record.args = ()
         return True
 

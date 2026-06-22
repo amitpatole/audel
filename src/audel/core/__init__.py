@@ -4,7 +4,14 @@ from __future__ import annotations
 
 from .analyze import analyze
 from .check import check
+from .diff import AudioDiff, compute_diff
+from .generate import GenerationStep, GenerativeLoopSession
+from .loop import IterationResult, LoopSession
 from .render import RenderResult, render
 from .watch import watch
 
-__all__ = ["check", "render", "analyze", "watch", "RenderResult"]
+__all__ = [
+    "check", "render", "analyze", "watch", "RenderResult",
+    "compute_diff", "AudioDiff",
+    "LoopSession", "IterationResult", "GenerativeLoopSession", "GenerationStep",
+]

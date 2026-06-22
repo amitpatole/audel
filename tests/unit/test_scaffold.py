@@ -68,7 +68,16 @@ def test_secret_scrubber_redacts_registered_value():
     assert "[REDACTED]" in rec.getMessage()
 
 
-def test_lazy_core_not_wired_yet_errors_clearly():
+def test_lazy_core_is_wired():
+    # The high-level API is lazy but now fully wired (Phase 5 landed the loops).
+    from audel.core.generate import GenerativeLoopSession
+    from audel.core.loop import LoopSession
+    assert audel.LoopSession is LoopSession
+    assert audel.GenerativeLoopSession is GenerativeLoopSession
+    assert callable(audel.analyze) and callable(audel.compute_diff)
+
+
+def test_unknown_attribute_still_raises():
     import pytest
-    with pytest.raises(NotImplementedError):
-        _ = audel.LoopSession
+    with pytest.raises(AttributeError):
+        _ = audel.does_not_exist

@@ -53,7 +53,8 @@ __all__ = [
     "LoopSession", "GenerativeLoopSession",
 ]
 
-_LAZY_CORE = {"analyze", "check", "watch", "render", "compute_diff"}
+_LAZY_CORE = {"analyze", "check", "watch", "render", "compute_diff",
+              "LoopSession", "GenerativeLoopSession"}
 
 
 def __getattr__(name: str):
@@ -64,9 +65,7 @@ def __getattr__(name: str):
             from . import core
         except ImportError as e:  # pragma: no cover - until Phase 1
             raise NotImplementedError(
-                f"audel.{name}() lands in a later build; core is not wired yet."
+                f"audel.{name} lands in a later build; core is not wired yet."
             ) from e
         return getattr(core, name)
-    if name in {"LoopSession", "GenerativeLoopSession"}:
-        raise NotImplementedError(f"audel.{name} lands in Phase 5.")
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
