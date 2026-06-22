@@ -1,1 +1,7 @@
-"""audel.acoustic — wired in a later phase (see TASKS.md)."""
+"""audel.acoustic — non-speech (CLAP) conformance."""
+
+from __future__ import annotations
+
+from . import clap
+
+__all__ = ["clap"]

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 
-from ..backends.registry import resolve_backend
+from ..backends.local import LocalBackend
 from ..config import Settings, load_settings
 from ..errors import AudelError
 from ..models import (
@@ -52,8 +52,9 @@ def _summarize(rr, issues) -> str:
     return f"{len(issues)} issue(s): {kinds}"
 
 
-async def check(source, *, settings: Settings | None = None, brief=None, backend=None) -> Report:
-    """Deterministically grade ``source``; with ``brief``, also grade transcript claims (local ASR)."""
+async def check(source, *, settings: Settings | None = None, brief=None) -> Report:
+    """Deterministically grade ``source``; with ``brief``, also grade transcript claims via the
+    OFFLINE local ASR only. This path never constructs a network backend — no egress, ever."""
     settings = settings or load_settings()
     try:
         rr = await asyncio.to_thread(_render_sync, source, settings)
@@ -66,7 +67,7 @@ async def check(source, *, settings: Settings | None = None, brief=None, backend
 
     if brief is not None and getattr(brief, "claims", None):
         transcript = None
-        be = resolve_backend(backend, settings)
+        be = LocalBackend(settings)  # check is offline by construction — local ASR only
         if be.available():
             transcript = await be.transcribe(rr.path or rr.source)
             used = f"dsp+{be.name}"

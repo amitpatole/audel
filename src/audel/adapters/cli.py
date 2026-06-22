@@ -66,9 +66,23 @@ def render(source: str) -> None:
 
 
 @app.command()
-def analyze(source: str) -> None:
-    """Full grade with backend critique — Phase 3."""
-    typer.secho(f"analyze {source}: {_SOON}", fg=typer.colors.YELLOW)
+def analyze(
+    source: str,
+    brief: str = typer.Option(None, help="Free-text description of the intended audio."),
+    expect: list[str] = typer.Option(None, "--expect", help="Repeatable claim, e.g. 'must: language is en'."),
+    backend: str = typer.Option(None, help="ollama|anthropic|gemini-audio|local (default: ollama)."),
+) -> None:
+    """Full grade: deterministic signals + ASR + backend LLM/CLAP critique (egress on this path)."""
+    from ..core import analyze as _analyze
+    from ..models import Brief
+
+    b = Brief.from_inputs(text=brief, expect=expect) if (brief or expect) else None
+    report = asyncio.run(_analyze(source, brief=b, backend=backend))
+    _print_report(report)
+    if report.conformance:
+        for c in report.conformance.claims:
+            typer.echo(f"    [{c.importance.value}] {c.status.value}: {c.text}")
+    raise typer.Exit(0 if report.verdict.value != "fail" else 1)
 
 
 @app.command()

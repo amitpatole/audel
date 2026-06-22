@@ -14,6 +14,18 @@ def resolve_backend(name: str | None, settings: Settings | None = None) -> Audio
     name = name or settings.audio_backend or "local"
     if name == "local":
         return LocalBackend(settings)
+    if name == "ollama":
+        from .ollama import OllamaBackend
+
+        return OllamaBackend(settings)
+    if name == "anthropic":
+        from .anthropic_backend import AnthropicBackend
+
+        return AnthropicBackend(settings)
+    if name in ("gemini-audio", "gemini_audio"):
+        from .gemini_audio import GeminiAudioBackend
+
+        return GeminiAudioBackend(settings)
 
     # Third-party backends registered under the `audel.backends` entry-point group (py>=3.11
     # supports the `group=` selection form directly).

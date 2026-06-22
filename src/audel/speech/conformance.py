@@ -38,8 +38,13 @@ _RE_LANG = re.compile(r"\blanguage\b\s*(?:is|=|:|in)?\s*([a-z]{2}|[a-z]{4,})\b",
 _RE_DUR = re.compile(r"\bduration\b\s*([<>]=?|==?)\s*(\d+(?:\.\d+)?)\s*(ms|s|sec|seconds)?",
                      re.IGNORECASE)
 _RE_QUOTED = re.compile(r"[\"“]([^\"”]+)[\"”]")
-_RE_PHRASE_KW = re.compile(r"\b(?:says?|said|narrat\w*|reads?|speaks?|contains?(?:\s+the\s+"
-                           r"(?:phrase|text|words?))?)\b\s*[:\-]?\s*(.+)$", re.IGNORECASE)
+# Speech-CONTENT verbs only — "<says> X" asserts the narration content is X. The bare noun
+# "narration"/"audio" must NOT trigger this (e.g. "the narration is clear" is a quality claim for
+# the LLM, not a transcript match). Bare "contains a chime" is a non-speech acoustic claim (CLAP);
+# only "contains the phrase/text/words ..." is a speech claim.
+_RE_PHRASE_KW = re.compile(r"\b(?:says?|said|states?|reads?|speaks?|utters?|"
+                           r"contains?\s+the\s+(?:phrase|text|words?))\b\s*[:\-]?\s*(.+)$",
+                           re.IGNORECASE)
 
 
 def _expected_language(text: str) -> str | None:

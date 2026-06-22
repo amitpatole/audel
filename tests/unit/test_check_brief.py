@@ -36,8 +36,8 @@ class _FakeBackend:
 
 
 def _patch(monkeypatch, text, lang="en"):
-    monkeypatch.setattr(check_mod, "resolve_backend",
-                        lambda name, settings: _FakeBackend(text, lang))
+    # check() transcribes via the offline LocalBackend by construction; swap it for the stub.
+    monkeypatch.setattr(check_mod, "LocalBackend", lambda settings: _FakeBackend(text, lang))
 
 
 def test_check_brief_passes_when_narration_matches(media, monkeypatch):
