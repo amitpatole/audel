@@ -100,6 +100,7 @@ class Settings(BaseSettings):
     max_media_bytes: int = 200_000_000      # 200 MB byte cap before handing a file to ffmpeg
     max_duration_s: float = 3 * 60 * 60      # 3h duration cap (decompression-bomb bound)
     max_sample_rate: int = 192_000           # reject absurd sample rates
+    max_channels: int = 64                    # reject channel-count bombs (broadcast tops out ~16)
     decode_timeout_s: float = 120.0          # hard timeout on the ffmpeg subprocess
     ffmpeg_path: str | None = None           # explicit ffmpeg binary; else auto-detected
 
