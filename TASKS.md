@@ -6,8 +6,8 @@
 
 ## Locked decisions
 
-1. **Dist/import/CLI name:** `audel`. ✅ Confirmed free on PyPI (2026-06-22, search returned
-   no results). Still TODO: confirm free on TestPyPI, then claim/upload a placeholder to reserve it.
+1. **Dist/import/CLI name:** `audel`. ✅ **Reserved** — skeleton `0.0.1` published to PyPI
+   2026-06-22 (https://pypi.org/project/audel/). Git repo: github.com/amitpatole/audel (private).
 2. **Shared contract:** extract **`agentsense`**; `agentvision.models` re-exports for back-compat.
 3. **Default `analyze` backend:** transcript + text-LLM via AgentVision's existing Anthropic
    (Haiku) backend. Gemini-audio is the opt-in audio-native upgrade.
