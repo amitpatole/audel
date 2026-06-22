@@ -15,6 +15,7 @@ import os
 import resource
 import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -178,3 +179,23 @@ def probe(path: Path, settings: Settings) -> MediaInfo:
         raise UnsafeSourceError(f"channel count {channels} exceeds the {settings.max_channels} cap")
     return MediaInfo(duration_s=duration_s, sample_rate=sample_rate, channels=channels,
                      codec=codec, has_audio=has_audio)
+
+
+def decode_to_wav(path: Path, settings: Settings, *, sample_rate: int = 16000) -> Path:
+    """Decode a validated file to a DURATION-BOUNDED 16 kHz mono WAV in a temp file (caller deletes).
+
+    This is what the ASR path transcribes — never the raw input — so whisper can never be made to
+    process more than ``max_duration_s`` of audio even if the container lies about its length.
+    """
+    ffmpeg = _tool("ffmpeg", settings.ffmpeg_path)
+    fd, name = tempfile.mkstemp(suffix=".wav", prefix="audel-asr-")
+    os.close(fd)
+    out = Path(name)
+    argv = [ffmpeg, "-nostdin", "-hide_banner", "-threads", "1", "-i", str(path),
+            "-map", "0:a:0?", "-t", str(settings.max_duration_s),
+            "-ar", str(sample_rate), "-ac", "1", "-f", "wav", "-y", str(out)]
+    proc = run(argv, timeout_s=settings.decode_timeout_s)
+    if proc.returncode != 0 or out.stat().st_size == 0:
+        out.unlink(missing_ok=True)
+        raise DecodeError(f"could not decode audio for ASR: {proc.stderr.decode('utf-8', 'replace')[-200:]}")
+    return out

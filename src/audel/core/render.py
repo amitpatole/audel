@@ -19,6 +19,7 @@ from ..signals.measure import Measurements, measure
 class RenderResult:
     source: str
     has_audio: bool
+    path: str = ""  # resolved, mediaguard-validated local path (reused for ASR)
     codec: str = ""
     sample_rate: int | None = None
     channels: int | None = None
@@ -37,7 +38,7 @@ def _render_sync(source, settings: Settings) -> RenderResult:
     info = probe(path, settings)
     m = measure(path, info, settings)
     return RenderResult(
-        source=str(source), has_audio=info.has_audio, codec=info.codec,
+        source=str(source), has_audio=info.has_audio, path=str(path), codec=info.codec,
         sample_rate=info.sample_rate or None, channels=info.channels or None,
         duration_ms=int(info.duration_s * 1000) if info.duration_s else None,
         integrated_lufs=m.integrated_lufs, lra=m.lra, true_peak_dbtp=m.true_peak_dbtp,
