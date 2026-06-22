@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Least privilege: the default GITHUB_TOKEN is read-only for all jobs.
+permissions:
+  contents: read
+
+# Cancel superseded runs (also limits fork-PR resource abuse).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    # GitHub's bare Ubuntu runners have no usable user namespaces, so Chromium can't launch with the
+    # OS sandbox. The web-capture path fails CLOSED there by design; CI is a trusted, ephemeral VM,
+    # so we take the documented opt-out for trusted environments only. Real users keep sandbox on.
+    env:
+      AUDEL_CHROMIUM_SANDBOX: "false"
+      AUDEL_LOG_LEVEL: ERROR
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false   # don't leave the token on disk
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install ffmpeg (the deterministic signal path depends on it)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+
+      - name: Install package (service + ASR + MCP extras; CLAP/torch tests skip if absent)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[asr,serve,mcp,dev]"
+
+      - name: Lint
+        run: ruff check src tests
+
+      - name: Type check
+        run: mypy src || true   # advisory in v1
+
+      - name: Test
+        run: pytest -q
+
+      - name: Smoke (no-key demo path → time-grounded FAIL then PASS)
+        run: audel demo || true

@@ -100,8 +100,31 @@ def watch(
 
 @app.command()
 def diff(baseline: str, candidate: str) -> None:
-    """Waveform/transcript/loudness diff — Phase 1."""
-    typer.secho(f"diff {baseline} {candidate}: {_SOON}", fg=typer.colors.YELLOW)
+    """Grade two clips and report what a fix changed (resolved / introduced / persisted issues)."""
+    from ..core import check as _check
+    from ..core import compute_diff as _compute_diff
+
+    before = asyncio.run(_check(baseline))
+    after = asyncio.run(_check(candidate))
+    d = _compute_diff(before, after)
+    verdict = "improved" if d.improved else ("regressed" if d.regressed else "no change")
+    color = typer.colors.GREEN if d.improved else (typer.colors.RED if d.regressed else typer.colors.WHITE)
+    typer.secho(f"{verdict}: {before.verdict.value.upper()} → {after.verdict.value.upper()}",
+                fg=color, bold=True)
+    for label, items in (("resolved", d.resolved), ("introduced", d.introduced),
+                         ("persisted", d.persisted)):
+        for it in items:
+            typer.echo(f"  [{label}] {it}")
+
+
+@app.command()
+def serve(host: str = typer.Option("127.0.0.1", help="Bind host. Non-loopback requires AUDEL_API_TOKEN."),
+          port: int = typer.Option(8000, help="Bind port.")) -> None:
+    """Start the REST service (needs audel[serve]). Loopback is zero-config; a routable bind
+    refuses to start without AUDEL_API_TOKEN (fail closed)."""
+    from .rest import serve as _serve
+
+    _serve(host=host, port=port)
 
 
 @app.command()

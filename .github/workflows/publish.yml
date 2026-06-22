@@ -1,0 +1,63 @@
+name: Publish
+
+# Tag-triggered release: build once, publish to TestPyPI, then PyPI — via OIDC Trusted Publishing
+# (no long-lived API tokens stored as secrets). Configure the trusted publisher for `audel` on both
+# indexes first (PyPI/TestPyPI → project → Publishing → add this repo + workflow `publish.yml`).
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read   # tightened per-job; publish jobs add id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build sdist + wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+      - name: Check metadata
+        run: |
+          pip install twine
+          twine check dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish-testpypi:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: testpypi
+    permissions:
+      id-token: write   # OIDC: mint a short-lived token for this run only
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: true
+
+  publish-pypi:
+    needs: publish-testpypi
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1

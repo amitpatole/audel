@@ -70,6 +70,8 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
+        populate_by_name=True,  # aliased fields (api_token, provider keys) settable by name too,
+        #                         so programmatic callers/tests can set them, not only via env.
     )
 
     # Backend selection
@@ -122,6 +124,10 @@ class Settings(BaseSettings):
     max_request_bytes: int = 50_000_000      # cap request bodies before buffering/decoding
     max_concurrent_jobs: int = 4
     request_timeout_s: float = 180.0
+    # Backends a REMOTE caller may name per-request. Empty = none selectable, so analyze() over REST
+    # uses only the server's configured default (a remote caller can't redirect egress or pick a
+    # paid model). Loopback/CLI is unaffected. Set e.g. ["local"] to permit explicit offline ASR.
+    rest_enabled_backends: list[str] = Field(default_factory=list)
 
     # Workspace
     cache_dir: Path = Field(default_factory=default_cache_dir)

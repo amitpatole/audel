@@ -75,8 +75,9 @@ select = ["E", "F", "I", "UP", "B", "W"]
 ignore = ["E501", "UP042"]
 
 [tool.ruff.lint.flake8-bugbear]
-# Typer puts callables in arg defaults by design (incl. list[str] options).
-extend-immutable-calls = ["typer.Option", "typer.Argument"]
+# Typer and FastAPI put callables in arg defaults by design (Option/Argument, Depends/File/Form).
+extend-immutable-calls = ["typer.Option", "typer.Argument",
+                          "fastapi.Depends", "fastapi.File", "fastapi.Form"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
