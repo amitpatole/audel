@@ -9,8 +9,17 @@
 1. **Dist/import/CLI name:** `audel`. ✅ **Reserved** — skeleton `0.0.1` published to PyPI
    2026-06-22 (https://pypi.org/project/audel/). Git repo: github.com/amitpatole/audel (private).
 2. **Shared contract:** extract **`agentsense`**; `agentvision.models` re-exports for back-compat.
-3. **Default `analyze` backend:** transcript + text-LLM via AgentVision's existing Anthropic
-   (Haiku) backend. Gemini-audio is the opt-in audio-native upgrade.
+3. **Default `analyze` backend:** transcript + text-LLM. **Primary text critique = Ollama Cloud**
+   (user has a Max plan = flat-rate, no per-token cost) via OpenAI-compatible `https://ollama.com/v1`,
+   key at `~/.config/ollama/key`. Good models verified 2026-06-22: `gemma4:31b` (clean JSON, ~1.8s),
+   `qwen3.5:397b`, `glm-5`, `deepseek-v3.2`; `gpt-oss:*` need reasoning-channel parsing (empty
+   `content` field). Anthropic-Haiku stays as a fallback `complete_text` backend.
+   - **AUDIO-NATIVE critique:** Ollama Cloud **cannot** do it — empirically, its API rejects audio
+     input even for `gemini-3-flash-preview` (`"expected image mime type, got audio/wave"`); it only
+     accepts `images`. So raw-waveform tone/naturalness critique still needs a true audio model
+     (Gemini-audio / GPT-4o-audio) as an opt-in `[cloud]` backend. Most `must:`/`should:` claims are
+     transcript-graded (Ollama, free) — reserve the paid audio model for prosody/naturalness claims.
+   - ASR stays local faster-whisper (Ollama serves no ASR model).
 4. **Loudness presets:** `LoudnessTarget` = streaming −14 / **podcast −16 (default)** /
    broadcast_ebu −23 / broadcast_us −24. Env: `AUDEL_LOUDNESS_TARGET`.
 5. **Issue grounding:** add strict-schema-safe `Span{start_ms:int, end_ms:int}`;
