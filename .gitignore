@@ -8,6 +8,9 @@ dist/
 .venv/
 venv/
 
+# Docs build output (MkDocs)
+site/
+
 # Tooling
 .mypy_cache/
 .ruff_cache/

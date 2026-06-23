@@ -1,0 +1,25 @@
+/* Trio Design System — "Warm Paper" shared tokens.
+   Light-first, printed-document calm. No gradients, no glows. One accent per view.
+   Per-sense accent is set by adding data-sense="eyes|ears|brain" on <html> (default: ears/Audel). */
+
+:root {
+  --bg:        #f7f5f1;
+  --surface:   #fffdf9;
+  --panel:     #efece4;
+  --ink:       #1b1a17;
+  --ink-muted: #6b6862;
+  --ink-faint: #918d84;
+  --rule:      #e3ded4;
+
+  /* default = ears (Audel) */
+  --accent:     #c4943f;
+  --accent-ink: #90641a;
+
+  --serif: "Source Serif 4", Georgia, "Times New Roman", serif;
+  --sans:  "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --mono:  ui-monospace, "JetBrains Mono", Menlo, Consolas, monospace;
+}
+
+:root[data-sense="eyes"]  { --accent: #3a8a99; --accent-ink: #256b78; }
+:root[data-sense="ears"]  { --accent: #c4943f; --accent-ink: #90641a; }
+:root[data-sense="brain"] { --accent: #7a72b5; --accent-ink: #564f8c; }

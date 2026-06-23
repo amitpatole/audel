@@ -15,25 +15,28 @@ it claims done.
 
 ## Status
 
-🚧 **Early development.** This `0.0.1` release reserves the name on PyPI. The graded API is
-landing incrementally:
+**`0.1.0` — live on [PyPI](https://pypi.org/project/audel/).** Grade an audio/media artifact and
+get a machine verdict back:
 
 ```python
 import asyncio
-from audel import analyze, load_settings   # coming soon
+from audel import check, load_settings
 
 async def main():
-    report = await analyze("dist/intro.mp4", settings=load_settings(audio_backend="local"))
-    print(report.verdict, [i.message for i in report.issues])
+    report = await check("dist/intro.mp4", settings=load_settings())
+    print(report.verdict, [i.message for i in report.issues])   # pass|warn|fail + time-grounded
 
 asyncio.run(main())
 ```
 
-Planned surface mirrors AgentVision one-to-one: async `analyze` / `check` / `watch` /
-`render` / `compute_diff`, `Brief` / `IntentClaim`, `Report` / `Issue` (time-grounded via
-`span`) / `Conformance` / `Handoff`, an `AudioBackend` protocol, and CLI / MCP / REST
-adapters. Light base install (ffmpeg + DSP, no torch); ML behind extras
+The surface mirrors AgentVision one-to-one: async `analyze` / `check` / `watch` / `render` /
+`compute_diff`, `Brief` / `IntentClaim`, `Report` / `Issue` (time-grounded via `span`) /
+`Conformance` / `Handoff`, an `AudioBackend` protocol, live `StreamMonitor`, and CLI / MCP / REST
+adapters. `check` is **offline by construction** (local DSP + faster-whisper ASR); egress happens
+only on `analyze`. Light base install (ffmpeg + DSP, no torch); ML behind extras
 (`[render]`, `[asr]`, `[cloud]`, `[clap]`).
+
+📖 **Docs:** [amitpatole.github.io/audel](https://amitpatole.github.io/audel/)
 
 ## Install
 
