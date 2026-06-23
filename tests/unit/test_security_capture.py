@@ -40,7 +40,11 @@ def test_watch_internal_url_grades_fail_not_crash():
     assert r.verdict == Verdict.FAIL  # UnsafeSourceError -> graded decode_error, not an exception
 
 
-def test_sandbox_on_by_default_no_silent_no_sandbox():
+def test_sandbox_on_by_default_no_silent_no_sandbox(monkeypatch):
+    # The secure default is sandbox-ON. Isolate from any ambient AUDEL_CHROMIUM_SANDBOX
+    # (CI sets it false so headless render tests can run on the runner) so this asserts
+    # the genuine in-code default, not the environment.
+    monkeypatch.delenv("AUDEL_CHROMIUM_SANDBOX", raising=False)
     on = _launch_args(Settings())
     assert on["chromium_sandbox"] is True and "--no-sandbox" not in on["args"]
     off = _launch_args(Settings(chromium_sandbox=False))  # explicit opt-out only
