@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en" data-sense="ears"><head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Audel — Ears for AI Agents</title>
+<meta name="description" content="A machine-graded audio feedback loop coding agents consume to hear their own output and self-correct before claiming done."/>
+<meta property="og:type" content="website"/>
+<meta property="og:site_name" content="Audel"/>
+<meta property="og:title" content="Audel — Ears for AI Agents"/>
+<meta property="og:description" content="Machine-graded audio feedback a coding agent consumes to hear its own output — and self-correct before it claims done."/>
+<meta property="og:url" content="https://huggingface.co/spaces/amitpatole/audel"/>
+<meta property="og:image" content="https://raw.githubusercontent.com/amitpatole/audel/main/brand/og-audel.png"/>
+<meta property="og:image:width" content="1280"/>
+<meta property="og:image:height" content="640"/>
+<meta name="twitter:card" content="summary_large_image"/>
+<meta name="twitter:title" content="Audel — Ears for AI Agents"/>
+<meta name="twitter:description" content="Play → hear → report → fix. A machine verdict (pass/warn/fail) with time-grounded issues."/>
+<meta name="twitter:image" content="https://raw.githubusercontent.com/amitpatole/audel/main/brand/og-audel.png"/>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,500;8..60,600;8..60,700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet"/>
+<style>
+  /* Trio "Warm Paper" — light, editorial. No gradients, no glows. Amber = ears. */
+  :root{
+    --bg:#f7f5f1; --surface:#fffdf9; --panel:#efece4;
+    --ink:#1b1a17; --mut:#6b6862; --faint:#918d84; --rule:#e3ded4;
+    --accent:#c4943f; --accent-ink:#90641a;
+    --serif:"Source Serif 4",Georgia,serif; --sans:"Inter",system-ui,sans-serif;
+    --mono:"JetBrains Mono",ui-monospace,Menlo,monospace;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html{scroll-behavior:smooth}
+  body{background:var(--bg);color:var(--ink);font-family:var(--sans);line-height:1.62;
+       -webkit-font-smoothing:antialiased}
+  a{color:var(--accent-ink);text-decoration:none}
+  a:hover{text-decoration:underline;text-underline-offset:3px}
+  .wrap{max-width:1080px;margin:0 auto;padding:0 28px}
+
+  nav{position:sticky;top:0;z-index:20;background:rgba(247,245,241,.86);
+      backdrop-filter:blur(8px);border-bottom:1px solid var(--rule)}
+  nav .wrap{display:flex;align-items:center;justify-content:space-between;height:62px}
+  .brand{display:flex;align-items:center;gap:11px;font-family:var(--serif);
+         font-weight:600;font-size:21px;letter-spacing:-.01em;color:var(--ink)}
+  .brand .dot{width:9px;height:9px;border-radius:50%;background:var(--accent)}
+  .nlinks{display:flex;gap:24px;font-size:15px;color:var(--mut)}
+  .nlinks a{color:var(--mut)}
+  .nlinks a:hover{color:var(--ink);text-decoration:none}
+  .pill{background:var(--accent-ink);color:var(--surface)!important;padding:8px 16px;
+        border-radius:9px;font-weight:600;font-size:14px}
+  .pill:hover{background:var(--ink);text-decoration:none}
+
+  header.hero{border-bottom:1px solid var(--rule)}
+  .hero .wrap{padding:78px 28px 70px}
+  .eyebrow{display:flex;align-items:center;gap:12px;letter-spacing:.22em;text-transform:uppercase;
+           font-size:14px;color:var(--accent-ink);font-weight:600}
+  .eyebrow .dot{width:7px;height:7px;border-radius:50%;background:var(--accent)}
+  h1{font-family:var(--serif);font-size:82px;line-height:.98;letter-spacing:-.02em;
+     font-weight:600;margin:20px 0 10px}
+  .tick{width:54px;height:1px;background:var(--accent);margin:0 0 22px}
+  .lede{font-family:var(--serif);font-size:25px;line-height:1.42;color:var(--mut);max-width:660px}
+  .lede b{color:var(--ink);font-weight:600}
+  .cmd{margin:30px 0 16px;display:inline-flex;align-items:center;gap:12px;background:var(--panel);
+       border:1px solid var(--rule);border-radius:10px;padding:13px 18px;
+       font-family:var(--mono);font-size:16px;color:var(--ink)}
+  .cmd .d{color:var(--accent-ink)}
+  .btns{display:flex;gap:12px;flex-wrap:wrap;margin-top:10px}
+  .btn{padding:11px 19px;border-radius:9px;font-weight:600;font-size:15px;
+       border:1px solid var(--rule);background:var(--surface);color:var(--ink)}
+  .btn:hover{border-color:var(--accent);text-decoration:none}
+  .btn.primary{background:var(--accent-ink);color:var(--surface);border-color:var(--accent-ink)}
+  .btn.primary:hover{background:var(--ink);border-color:var(--ink)}
+
+  section{padding:66px 0;border-bottom:1px solid var(--rule)}
+  .sech{margin-bottom:34px}
+  .sech .k{letter-spacing:.2em;text-transform:uppercase;font-size:13px;color:var(--accent-ink);font-weight:600}
+  .sech h2{font-family:var(--serif);font-size:36px;letter-spacing:-.01em;font-weight:600;margin-top:8px}
+  .grid{display:grid;grid-template-columns:repeat(2,1fr);gap:18px}
+  .card{background:var(--surface);border:1px solid var(--rule);border-left:2px solid var(--accent);
+        border-radius:10px;padding:22px 24px}
+  .card h3{font-family:var(--serif);font-size:21px;font-weight:600;margin-bottom:6px}
+  .card p{color:var(--mut);font-size:15.5px}
+  .card code{font-family:var(--mono);font-size:13.5px;background:var(--panel);padding:1px 6px;border-radius:5px;color:var(--ink)}
+
+  .trio{display:grid;grid-template-columns:repeat(3,1fr);gap:18px;margin-top:8px}
+  .sense{border:1px solid var(--rule);border-radius:10px;padding:24px;background:var(--surface)}
+  .sense .s{font-family:var(--mono);font-size:12.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--faint)}
+  .sense h3{font-family:var(--serif);font-size:24px;font-weight:600;margin:6px 0 4px}
+  .sense p{color:var(--mut);font-size:15px}
+  .sense.eyes{border-top:3px solid #3a8a99}
+  .sense.ears{border-top:3px solid #c4943f}
+  .sense.brain{border-top:3px solid #7a72b5}
+
+  footer{padding:44px 0 60px}
+  footer .wrap{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:16px}
+  .foot-links{display:flex;gap:22px;font-size:15px;color:var(--mut)}
+  .sig{font-family:var(--serif);font-style:italic;font-size:19px;color:var(--accent-ink)}
+  @media(max-width:760px){.grid,.trio{grid-template-columns:1fr}h1{font-size:58px}}
+</style></head>
+<body>
+<nav><div class="wrap">
+  <a class="brand" href="#"><span class="dot"></span>Audel</a>
+  <div class="nlinks">
+    <a href="#what">What it does</a>
+    <a href="#start">Quickstart</a>
+    <a href="#trio">The trio</a>
+    <a href="https://amitpatole.github.io/audel/">Docs</a>
+    <a class="pill" href="https://github.com/amitpatole/audel">GitHub</a>
+  </div>
+</div></nav>
+
+<header class="hero"><div class="wrap">
+  <div class="eyebrow"><span class="dot"></span>Ears · The audio sense</div>
+  <h1>Audel</h1>
+  <div class="tick"></div>
+  <div class="lede">Machine-graded <b>audio feedback</b> a coding agent consumes to hear its own
+    output — and self-correct before it claims <b>done</b>.</div>
+  <div class="cmd"><span class="d">$</span> pip install audel</div>
+  <div class="btns">
+    <a class="btn primary" href="https://amitpatole.github.io/audel/">Read the docs</a>
+    <a class="btn" href="https://github.com/amitpatole/audel">Source on GitHub</a>
+    <a class="btn" href="https://pypi.org/project/audel/">PyPI</a>
+  </div>
+</div></header>
+
+<section id="what"><div class="wrap">
+  <div class="sech"><div class="k">What it does</div><h2>Play → hear → report → fix</h2></div>
+  <div class="grid">
+    <div class="card"><h3>Hear &amp; report</h3><p>A machine verdict (<code>pass</code>/<code>warn</code>/<code>fail</code>) with <b>time-grounded</b> issues — loudness (EBU R128), clipping, silence, dropouts, A/V desync. DSP-grounded, no key needed.</p></div>
+    <div class="card"><h3>Match intent</h3><p>Grade what the audio <i>says</i> against a brief — language, required phrases, duration — via local faster-whisper ASR.</p></div>
+    <div class="card"><h3>Listen &amp; critique</h3><p><code>analyze</code> adds acoustic + LLM judgment for subjective claims. Egress happens only here; <code>check</code> stays offline by construction.</p></div>
+    <div class="card"><h3>Streaming &amp; temporal</h3><p><code>watch</code> grades behaviour over time; <code>StreamMonitor</code> grades live PCM chunks — playthrough, dropouts, liveness — bounded by construction.</p></div>
+  </div>
+</div></section>
+
+<section id="start"><div class="wrap">
+  <div class="sech"><div class="k">Quickstart</div><h2>One verdict away</h2></div>
+  <div class="cmd"><span class="d">$</span> pip install audel &amp;&amp; audel demo</div>
+  <p style="color:var(--mut);margin-top:16px;max-width:680px"><code style="font-family:var(--mono)">audel demo</code> grades a deliberately silent render, prints a <b>FAIL</b> report (missing audio — no LLM key), then loops against the fixed version and prints <i>"what changed: issues resolved → PASS."</i></p>
+</div></section>
+
+<section id="trio"><div class="wrap">
+  <div class="sech"><div class="k">One ecosystem</div><h2>Eyes, ears &amp; brain</h2></div>
+  <div class="trio">
+    <a class="sense eyes" href="https://huggingface.co/spaces/amitpatole/AgentVision"><div class="s">Eyes</div><h3>AgentVision</h3><p>It renders — visual feedback, grounded.</p></a>
+    <div class="sense ears"><div class="s">Ears</div><h3>Audel</h3><p>It sounds — audio feedback, time-grounded.</p></div>
+    <a class="sense brain" href="https://huggingface.co/spaces/amitpatole/verel"><div class="s">Brain</div><h3>Verel</h3><p>It's done — decide, compound verified work.</p></a>
+  </div>
+  <p style="color:var(--mut);margin-top:22px"><code style="font-family:var(--mono)">pip install "verel[hearing]"</code> pulls the whole stack. All three share one contract, <a href="https://pypi.org/project/agentsensory/">agentsensory</a>.</p>
+</div></section>
+
+<footer><div class="wrap">
+  <div class="foot-links">
+    <a href="https://github.com/amitpatole/audel">GitHub</a>
+    <a href="https://pypi.org/project/audel/">PyPI</a>
+    <a href="https://amitpatole.github.io/audel/">Docs</a>
+    <span style="color:var(--faint)">MIT</span>
+  </div>
+  <div class="sig">— amitpatole</div>
+</div></footer>
+</body></html>
