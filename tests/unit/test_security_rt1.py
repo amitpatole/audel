@@ -3957,7 +3957,7 @@ def test_asr_decode_keeps_an_unlabelled_lcr_centre(tmp_path):
         w.unlink()
         return 20 * np.log10(np.sqrt(np.mean(a ** 2)) / 32768 + 1e-12)
 
-    assert abs(level(m0) - level(lab)) < 1.0        # the centre isn't dropped as "LFE"
+    assert abs(level(m0) - level(lab)) < 3.0        # the centre isn't dropped (was ~15 dB low)
 
 
 # ==== round 16, auth surface ==================================================================
@@ -4001,3 +4001,61 @@ def test_access_log_redacts_secret_key_queries():
     out = _emit('%s - "%s %s HTTP/%s" %d', "1.2.3.4", "GET", "/specs?SECRET_KEY=CANARY6x", "1.1",
                 401, name="uvicorn.access")
     assert "CANARY6x" not in out and "/specs?SECRET_KEY=" in out
+
+
+# ==== round 16, decode surface (mono mix by layout type) ======================================
+
+def _st(layout, n):
+    from audel.mediaguard import StreamInfo
+
+    return StreamInfo(index=0, codec="pcm_s16le", sample_rate=48000, channels=n, layout=layout)
+
+
+def test_mono_mix_is_chosen_by_layout_type():
+    from audel.mediaguard import mono_filter
+
+    assert mono_filter(_st("ambisonic 1", 4)) == "pan=mono|c0=c0"          # W only
+    assert mono_filter(_st("5.1", 6)) == "aformat=channel_layouts=mono"     # ffmpeg's downmix
+    custom = mono_filter(_st("3 channels (FC+FL+FR)", 3))
+    assert custom.startswith("pan=mono|") and "c0" in custom                # label weights
+    plain = mono_filter(_st("", 5), power=True)
+    assert plain.startswith("pan=mono|") and "0.447214" in plain            # 1/sqrt(5)
+
+
+def test_phase_checks_use_the_real_left_right_pair():
+    from audel.mediaguard import lr_pair
+
+    assert lr_pair(_st("3 channels (FC+FL+FR)", 3)) == (1, 2)
+    assert lr_pair(_st("ambisonic 1", 4)) is None
+    assert lr_pair(_st("", 5)) == (0, 1)                 # plain channels: L/R first
+    assert lr_pair(_st("stereo", 2)) == (0, 1)
+
+
+@requires_ffmpeg
+def test_right_side_ambisonic_source_is_not_a_polarity_fault(tmp_path):
+    from audel import check
+
+    _ff("-f", "lavfi", "-i", "sine=f=440:d=6", "-f", "lavfi", "-i", "anoisesrc=d=6:c=pink:a=0.01",
+        "-filter_complex", "[0]volume=0.3[s];[s][1]amix=normalize=0,asplit=4[w][y][z][x];"
+        "[y]volume=-1[yn];[z]volume=0[zn];[x]volume=0.01[xn];[w][yn][zn][xn]amerge=inputs=4[out]",
+        "-map", "[out]", "-c:a", "libopus", "-mapping_family", "2", tmp_path / "r.opus")
+    r = asyncio.run(check(str(tmp_path / "r.opus")))
+    checks = {i.detail.get("check") for i in r.issues}
+    assert not {"polarity_inversion", "phase", "dead_channel"} & checks, checks
+
+
+@requires_ffmpeg
+@pytest.mark.parametrize("order", ["FC+FL+FR", "LFE+FL+FR+FC+BL+BR"])
+def test_inverted_left_right_is_caught_in_any_channel_order(tmp_path, order):
+    from audel import check
+
+    n = order.count("+") + 1
+    names = order.split("+")
+    mapping = "|".join(f"c{i}=" + ("c0" if nm == "FL" else "-1*c0" if nm == "FR" else "0*c0")
+                       for i, nm in enumerate(names))
+    f = tmp_path / "x.mov"
+    _ff("-f", "lavfi", "-i", "anoisesrc=d=6:c=pink:a=0.1", "-af",
+        f"pan={order}|{mapping}", "-c:a", "pcm_s16le", f)
+    del n
+    checks = {i.detail.get("check") for i in asyncio.run(check(str(f))).issues}
+    assert "polarity_inversion" in checks, checks

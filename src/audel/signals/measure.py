@@ -190,19 +190,22 @@ def _spectral_pass(ffmpeg: str, path, idx: int, tm: TrackMeasurements, settings:
     def band(f: int) -> str:  # two cascaded high-Q band-passes isolate the mains fundamental
         return f"bandpass=f={f}:width_type=q:w=15,bandpass=f={f}:width_type=q:w=15"
 
-    from ..mediaguard import mono_pan
+    from ..mediaguard import lr_pair, mono_filter
 
-    stereo = tm.stream.channels >= 2
+    pair = lr_pair(tm.stream)
+    stereo = pair is not None
     # Mono by channel index (any layout: ffmpeg's layout-based downmix rejects plain-channel
     # layouts, which silently skipped hum / phase / polarity on unlabelled files).
     graph = ["[0:a:0]asplit=2[r1][r2]" if stereo else "[0:a:0]anull[r1]",
-             f"[r1]{mono_pan(tm.stream.channel_labels())},aresample={_SERIES_RATE},"
+             f"[r1]{mono_filter(tm.stream, power=True)},aresample={_SERIES_RATE},"
              f"asetnsamples=n={n}:p=0,asplit=3[t][a][b]",
              f"[t]{series}[ot]", f"[a]{band(50)},{series}[o50]", f"[b]{band(60)},{series}[o60]"]
     outs = ["[ot]", "[o50]", "[o60]"]
-    if stereo:
-        # Mid = (L+R)/2, Side = (L-R)/2 over the first channel pair. Side >> mid = polarity problem.
-        graph.append("[r2]pan=stereo|c0=0.5*c0+0.5*c1|c1=0.5*c0-0.5*c1,"
+    if pair is not None:
+        # Mid = (L+R)/2, Side = (L-R)/2 over the real FL / FR pair, wherever it sits in the
+        # channel order. Side >> mid = polarity problem.
+        a, b = pair
+        graph.append(f"[r2]pan=stereo|c0=0.5*c{a}+0.5*c{b}|c1=0.5*c{a}-0.5*c{b},"
                      "astats=metadata=0:measure_perchannel=RMS_level:measure_overall=none[oms]")
         outs.append("[oms]")
     analysis = ["-filter_complex", ";".join(graph)]

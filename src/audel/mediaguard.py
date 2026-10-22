@@ -1218,6 +1218,55 @@ def _fixed_order_layout(codec: str, layout: str, channels: int) -> str:
     return layout
 
 
+def is_ambisonic(st: StreamInfo | None) -> bool:
+    return bool(st is not None and (st.layout or "").lower().startswith("ambisonic"))
+
+
+def mono_filter(st: StreamInfo | None, *, power: bool = False) -> str:
+    """The mono mix a single-channel analysis hears, chosen by layout type:
+
+    * ambisonic: the W (omni) component only. A mean of W/Y/Z/X cancels a source to the right
+      or behind (Y or X = -W).
+    * a named layout (5.1, 7.1.4, a custom FL+FR+FC order...): ffmpeg's own downmix, which
+      weights a centre and its beds as a listener hears them (a flat mean dilutes dialogue).
+    * plain unlabelled channels: the mean by index (``power``: 1/sqrt(N) weights, so a hum or
+      hiss in one channel isn't read 20*log10(N) dB low)."""
+    if st is None or st.channels <= 1:
+        return "anull"
+    if is_ambisonic(st):
+        return "pan=mono|c0=c0"
+    lay = channel_layout_arg(st.layout, st.channels)
+    labels = st.channel_labels()
+    if not lay.startswith("USR"):
+        if "+" not in lay:
+            return "aformat=channel_layouts=mono"  # a native layout: ffmpeg's own downmix
+        # A custom order (FC+FL+FR, LFE-first...): ffmpeg's resampler rejects it, so the same
+        # downmix weights by label: fronts 1.0, centre and everything else -3 dB, LFE out.
+        weights = [0.0 if lab.upper().startswith("LFE") else
+                   1.0 if lab.upper() in ("FL", "FR") else 0.7071 for lab in labels]
+        total = sum(weights) or 1.0
+        return "pan=mono|c0=" + "+".join(f"{w / total:.6f}*c{i}"
+                                         for i, w in enumerate(weights) if w > 0)
+    if not power:
+        return mono_pan(labels)
+    use = [i for i, lab in enumerate(labels) if not lab.upper().startswith("LFE")] or [0]
+    w = 1.0 / (len(use) ** 0.5)
+    return "pan=mono|c0=" + "+".join(f"{w:.6f}*c{i}" for i in use)
+
+
+def lr_pair(st: StreamInfo | None) -> tuple[int, int] | None:
+    """Indexes of the real front-left / front-right pair, for mid/side (phase, polarity) checks;
+    ``None`` for ambisonics (W/Y are not a stereo pair)."""
+    if st is None or is_ambisonic(st) or st.channels < 2:
+        return None
+    labels = [lab.upper() for lab in st.channel_labels()]
+    if "FL" in labels and "FR" in labels:
+        return labels.index("FL"), labels.index("FR")
+    # Plain unlabelled channels: L/R come first in practically every unlabelled multichannel
+    # file (WAV channel order, DAW exports), and zeroing a mask must not hide an inverted pair.
+    return (0, 1)
+
+
 def mono_pan(labels: list[str]) -> str:
     """A mono mix by channel INDEX: the mean of every non-LFE channel. Works for any layout
     (ffmpeg's layout-based downmix rejects plain-channel layouts and guesses unlabelled ones,
@@ -1254,10 +1303,10 @@ def decode_to_wav(path: Path, settings: Settings, *, sample_rate: int = 16000,
     process more than ``max_duration_s`` of audio even if the container lies about its length.
     """
     ffmpeg = _tool("ffmpeg", settings.ffmpeg_path)
-    # What ASR hears: the mean of every non-LFE channel, by index (see mono_pan). Probed BEFORE
-    # the temp file exists, so a probe failure can't leave one behind.
+    # What ASR hears (see mono_filter). Probed BEFORE the temp file exists, so a probe failure
+    # can't leave one behind.
     st = _stream_info(path, settings, stream)
-    pan = mono_pan(st.channel_labels()) if st is not None else "pan=mono|c0=c0"
+    pan = mono_filter(st)
     fd, name = _mkstemp("audel-asr-", settings)
     os.close(fd)
     out = Path(name)
@@ -1285,7 +1334,7 @@ def excerpt_wav(path: Path, settings: Settings, *, start_s: float, dur_s: float,
     ffmpeg = _tool("ffmpeg", settings.ffmpeg_path)
     dur = max(0.5, min(60.0, float(dur_s)))
     st = _stream_info(path, settings, stream)
-    pan = mono_pan(st.channel_labels()) if st is not None else "pan=mono|c0=c0"
+    pan = mono_filter(st)
     fd, name = _mkstemp("audel-excerpt-", settings)
     os.close(fd)
     out = Path(name)

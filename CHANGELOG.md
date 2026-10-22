@@ -121,6 +121,20 @@ All notable changes to Audel are recorded here. The format follows
     at most 2 fetches, in a pool of 8.
   - **Low-Medium.** Work abandoned while waiting on its tenant share still ran later. Abandonment now
     propagates through both waits.
+- Red-team round 16 fixes (multichannel mono mix), each pinned by a regression test. The 416-entry
+  battery is unchanged apart from the fixes below.
+  - **Medium.** The round-15 index mix was used everywhere a single channel is analysed, and a
+    flat mean is wrong for some layouts: first-order ambisonics with a source to the right got a
+    false polarity FAIL and transcribed as silence; centre dialogue in ordinary 5.1 and wider was
+    diluted against the beds (transcription error rate up sharply); single-channel hum and hiss on
+    wide layouts were read 10-20 dB low. The mono mix is now chosen by layout type: ambisonics use
+    W, named layouts use ffmpeg's own downmix (a custom channel order gets the same weights by
+    label), and only plain unlabelled channels use the index mix (power-preserving for the hum and
+    noise checks).
+  - **Low-Medium.** Phase and polarity checks use the real front-left / front-right pair, wherever
+    it sits in the channel order (an LCR-first or LFE-first file no longer hides an inverted pair),
+    and are skipped where there is none. A silent directional component in an ambisonic mix (a
+    horizontal-only Z) is not a dead channel.
 - Red-team round 16 fixes (auth surface), each pinned by a regression test. No bypass,
   escalation or ReDoS was found; a differential fuzz of 80,000 cases found no new leaks.
   - **Low-Medium.** Common credential names (`SECRET_KEY`, `signing_key`, `encryption_key`,

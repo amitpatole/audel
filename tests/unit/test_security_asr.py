@@ -33,7 +33,7 @@ def test_asr_transcribes_a_duration_bounded_decode_not_raw_file():
     # and decode_to_wav passes -t max_duration_s + mono 16k resample to ffmpeg
     dsrc = inspect.getsource(MG.decode_to_wav)
     assert "max_duration_s" in dsrc and '"-t"' in dsrc
-    assert '"-ar"' in dsrc and "mono_pan" in dsrc and "sample_rate" in dsrc
+    assert '"-ar"' in dsrc and "mono_filter" in dsrc and "sample_rate" in dsrc
 
 
 def test_transcript_size_is_capped():
