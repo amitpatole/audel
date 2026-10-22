@@ -72,6 +72,7 @@ class TrackMeasurements:
     gap_scan_incomplete: bool = False        # the packet timeline couldn't be read in full
     dialogue_lufs: float | None = None       # speech-gated integrated loudness, when computed
     dialogue_coverage: float | None = None   # fraction of the programme that is speech
+    dialogue_status: str | None = None       # ok / failed / no_speech (dialogue-gated specs)
     seek_base_s: float = 0.0                 # programme time -> ffmpeg input -ss offset
     gap_total_s: float = 0.0                 # ALL missing-packet time (gaps lists the first ones)
     extent_s: float = 0.0                    # how long the packet timeline says the track runs
@@ -110,6 +111,7 @@ class Measurements:
     flat_factor: float | None = None
     tail_rms_dbfs: float | None = None
     silences: list[tuple[float, float]] = field(default_factory=list)  # (start_s, end_s)
+    deadline: float | None = None  # the per-file deadline (later passes stay inside it)
     tracks: list[TrackMeasurements] = field(default_factory=list)
     declared_s: float | None = None          # set when the container's duration was wrong
 
@@ -373,6 +375,7 @@ def measure(path, info: MediaInfo, settings: Settings) -> Measurements:
         return placed[st.index]
 
     m.tracks = []
+    m.deadline = deadline
     try:
         for st in streams:
             try:

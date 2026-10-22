@@ -214,34 +214,39 @@ def build_app(settings: Settings | None = None):
 
     async def _shielded(coro_factory, timeout: float, tenant: str | None = None):
         """Global work slots plus a per-tenant share of them, both held until the work REALLY
-        ends (a cancelled or timed-out request cannot free its tenant's share early). Work
-        abandoned before it acquires its slots never runs."""
+        ends (a cancelled or timed-out request cannot free its tenant's share early).
+
+        The slots are acquired FIRST, within ``queue_wait_s`` (else 429), and only then does the
+        request's time limit start: work another tenant abandoned can make a request wait or
+        retry, never fail as "grading exceeded" without having run."""
         if tenant is None:
             return await run_shielded(_work_sem, coro_factory, timeout)
         sem = _tenant_work.get(tenant)
-        abandoned = asyncio.Event()
-        started = {"v": False}
+        held: list[asyncio.Semaphore] = []
+        try:
+            for s_ in (sem, _work_sem):
+                try:
+                    await asyncio.wait_for(s_.acquire(), timeout=settings.queue_wait_s)
+                except TimeoutError:
+                    raise BusyError("Server busy; retry later.") from None
+                held.append(s_)
+        except BaseException:
+            for s_ in reversed(held):
+                s_.release()
+            _tenant_work.done(tenant)
+            raise
 
         async def guarded():
-            async with sem:
-                if abandoned.is_set():
-                    return None
-                async with _work_sem:
-                    if abandoned.is_set():
-                        return None
-                    started["v"] = True
-                    return await coro_factory()
+            try:
+                return await coro_factory()
+            finally:
+                _work_sem.release()
+                sem.release()
 
         task = asyncio.ensure_future(guarded())
         task.add_done_callback(lambda _t: _tenant_work.done(tenant))  # cleanup when work ENDS
         task.add_done_callback(_retrieve)
-        try:
-            return await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
-        except (TimeoutError, asyncio.CancelledError):
-            abandoned.set()
-            if not started["v"]:
-                task.cancel()  # not started: drop it now (and the request payload it holds)
-            raise
+        return await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
 
     _tenant_fetch = TenantSemaphores(2)  # concurrent URL fetches per tenant
 
@@ -306,6 +311,22 @@ def build_app(settings: Settings | None = None):
     async def _job_slot(request: Request):
         async with _slot_for(_principal(request).tenant):
             yield
+
+    @app.exception_handler(OSError)
+    @app.exception_handler(MemoryError)
+    @app.exception_handler(RuntimeError)
+    async def _host_failure(request: Request, exc: Exception):
+        """A host at its limits (no fds, no memory, no threads, disk full) is a retry, not a 500.
+        Anything else still surfaces as an internal error."""
+        from fastapi.responses import JSONResponse
+
+        host = isinstance(exc, (OSError, MemoryError)) or "can't start new thread" in str(exc)
+        if not host:
+            log.warning("request failed: %s", type(exc).__name__)
+            return JSONResponse({"detail": "Internal Server Error"}, status_code=500)
+        log.warning("host at capacity: %s", type(exc).__name__)
+        return JSONResponse({"detail": "Server busy; retry later."}, status_code=429,
+                            headers={"Retry-After": "30"})
 
     def _http_error(e: Exception) -> HTTPException:
         if isinstance(e, BusyError):

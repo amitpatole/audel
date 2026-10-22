@@ -121,6 +121,23 @@ All notable changes to Audel are recorded here. The format follows
     at most 2 fetches, in a pool of 8.
   - **Low-Medium.** Work abandoned while waiting on its tenant share still ran later. Abandonment now
     propagates through both waits.
+- Red-team round 11 fixes (network surface), each pinned by a regression test. A real-media leak
+  stress (with `netflix` grades, disconnects, deletes and timeouts) returned processes, fds, temp
+  files and counters to baseline.
+  - **Medium.** On a dialogue-gated spec, a host failure or timeout in speech detection fell back
+    to programme loudness silently, which could turn a FAIL into a PASS. Host failures are now a
+    retry (429), the deadline refuses, and a track whose dialogue can't be measured is reported
+    (`dialogue_unmeasured`).
+  - **Medium.** Dialogue in antiphase (one channel inverted) cancelled in the mono mix the speech
+    detector hears, so it found no speech and the file passed. Stereo tracks are also heard as
+    their side signal, and the regions are united.
+  - **Low-Medium.** Work another tenant abandoned could make a request fail as "grading exceeded"
+    before it ran. Work slots are now acquired within the queue wait (429), before the request's
+    time limit starts.
+  - **Low.** File-descriptor, memory or thread exhaustion at the remaining sites (temp files,
+    upload spooling, hashing, the header check, URL ingest) is a retry (429) instead of a 500 or a
+    silently skipped check. The speech gate runs inside the file's deadline, and pipe handles are
+    closed on every error path.
 - Red-team round 11 fixes (auth and decode surfaces), each pinned by a regression test:
   - **Medium.** Round 10's narrower log filter skipped messages and arguments that weren't strings
     (an exception, a dict), registered secrets included. Every record except uvicorn's access

@@ -61,8 +61,14 @@ def summarize_track(tm: TrackMeasurements) -> TrackSummary:
 
 
 def _dialogue_gate(path, m: Measurements, settings: Settings) -> None:
-    """Speech-gated loudness for every track (VAD approximation of dialogue gating)."""
-    from ..errors import AudelError, BusyError
+    """Speech-gated loudness for every track (VAD approximation of dialogue gating).
+
+    Inside the file's own deadline. A host failure or the deadline propagates (retry / refuse);
+    a track whose speech can't be measured is marked, so the grade says so instead of silently
+    using programme loudness."""
+    import time
+
+    from ..errors import AudelError, BusyError, UnsafeSourceError
     from ..signals.vad import speech_gated_lufs, speech_regions
 
     if 0 < m.info.decode_cap_s < settings.max_duration_s:  # the same per-stream cap as measure()
@@ -71,17 +77,27 @@ def _dialogue_gate(path, m: Measurements, settings: Settings) -> None:
     for tm in m.tracks:
         if tm.failed:
             continue  # already reported as track_decode_error; the others are still graded
+        left = (m.deadline - time.monotonic()) if m.deadline is not None else None
+        if left is not None and left <= 1:
+            raise UnsafeSourceError("analysis exceeded the per-file time budget")
         try:
-            regions = speech_regions(path, settings, stream=tm.stream.index)
+            regions = speech_regions(path, settings, stream=tm.stream.index,
+                                     channels=tm.stream.channels, timeout_s=left)
             if regions is None:
                 return  # no VAD installed: graders fall back to programme loudness
             speech_s = sum(b - a for a, b in regions)
             tm.dialogue_coverage = (speech_s / dur) if dur > 0 else None
-            tm.dialogue_lufs = speech_gated_lufs(path, settings, regions, stream=tm.stream.index)
-        except BusyError:
+            if not regions:
+                tm.dialogue_status = "no_speech"
+                continue
+            left = (m.deadline - time.monotonic()) if m.deadline is not None else None
+            tm.dialogue_lufs = speech_gated_lufs(path, settings, regions, stream=tm.stream.index,
+                                                 timeout_s=left)
+            tm.dialogue_status = "ok" if tm.dialogue_lufs is not None else "failed"
+        except (BusyError, UnsafeSourceError):
             raise
         except AudelError:
-            continue  # this track falls back to programme loudness; the grade is kept
+            tm.dialogue_status = "failed"  # graded on programme loudness, and the grade says so
 
 
 def _render_sync(source, settings: Settings, spec: DeliverySpec | str | None = None) -> RenderResult:

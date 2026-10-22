@@ -240,6 +240,8 @@ def run(argv: list[str], *, timeout_s: float, max_stdout_bytes: int | None = Non
     except RuntimeError:  # no thread to drain the pipes: never leave an unread, unwaited child
         p.kill()
         p.wait()
+        for pipe in (p.stdout, p.stderr):
+            pipe.close()
         raise BusyError("could not start the decoder: the host is at capacity; retry later") from None
     try:
         p.wait(timeout=timeout_s)
@@ -348,6 +350,9 @@ def pcm_pipeline(path: Path, settings: Settings, *, stream: int, channels: int,
     except BaseException:
         p1.kill()
         p1.wait()
+        for pipe in (p1.stdout, p1.stderr):
+            if pipe is not None:
+                pipe.close()
         raise
     assert p1.stdout is not None and p1.stderr is not None and p2.stderr is not None
     p1.stdout.close()  # p2 owns the read end now (so p1 gets SIGPIPE if p2 exits)
@@ -358,6 +363,8 @@ def pcm_pipeline(path: Path, settings: Settings, *, stream: int, channels: int,
         for proc in (p1, p2):
             proc.kill()
             proc.wait()
+        for pipe in (p1.stderr, p2.stderr):
+            pipe.close()
         raise BusyError("could not start the decoder: the host is at capacity; retry later") from None
     deadline = time.monotonic() + timeout_s
     try:
@@ -916,7 +923,10 @@ def container_shortfall_s(path: Path, max_s: float) -> float:
                 got = _caf(fh, size)
             else:
                 return 0.0
-    except (OSError, struct.error, ValueError, OverflowError):
+    except OSError:  # couldn't read the header (no fds?): never silently skip the check
+        raise BusyError("could not read the file header: the host is at capacity; retry later") \
+            from None
+    except (struct.error, ValueError, OverflowError):
         return 0.0
     if got is None:
         return 0.0
@@ -1117,24 +1127,34 @@ def probe_streams(path: Path, settings: Settings) -> dict:
     return out
 
 
+def _mkstemp(prefix: str, settings: Settings) -> tuple[int, str]:
+    try:
+        return tempfile.mkstemp(suffix=".wav", prefix=prefix, dir=_tmp_dir(settings))
+    except OSError:  # no fds / disk full: the host, not the media
+        raise BusyError("could not create a temp file: the host is at capacity; retry later") from None
+
+
 def decode_to_wav(path: Path, settings: Settings, *, sample_rate: int = 16000,
-                  stream: int = 0) -> Path:
+                  stream: int = 0, mix: str = "mono", timeout_s: float | None = None) -> Path:
     """Decode a validated file to a DURATION-BOUNDED 16 kHz mono WAV in a temp file (caller deletes).
 
     This is what the ASR path transcribes — never the raw input — so whisper can never be made to
     process more than ``max_duration_s`` of audio even if the container lies about its length.
     """
     ffmpeg = _tool("ffmpeg", settings.ffmpeg_path)
-    fd, name = tempfile.mkstemp(suffix=".wav", prefix="audel-asr-", dir=_tmp_dir(settings))
+    fd, name = _mkstemp("audel-asr-", settings)
     os.close(fd)
     out = Path(name)
+    # "side" (L minus R) hears what a mono downmix cancels: speech in antiphase.
+    chain = "asetpts=N/SR/TB" if mix == "mono" else "pan=mono|c0=0.5*c0-0.5*c1,asetpts=N/SR/TB"
     argv = [ffmpeg, "-nostdin", "-hide_banner", "-threads", "1", "-reinit_filter", "0",
             *safe_input(path),
-            "-map", f"0:a:{int(stream)}?", "-af", "asetpts=N/SR/TB",
+            "-map", f"0:a:{int(stream)}?", "-af", chain,
             "-t", str(settings.max_duration_s),
             "-ar", str(sample_rate), "-ac", "1", "-f", "wav", "-y", str(out)]
+    limit = pass_timeout(settings, settings.max_duration_s)
     try:
-        proc = run(argv, timeout_s=pass_timeout(settings, settings.max_duration_s))
+        proc = run(argv, timeout_s=min(limit, timeout_s) if timeout_s else limit)
     except BaseException:
         out.unlink(missing_ok=True)
         raise
@@ -1150,7 +1170,7 @@ def excerpt_wav(path: Path, settings: Settings, *, start_s: float, dur_s: float,
     hears. Duration is clamped to 60 s whatever the caller asks for."""
     ffmpeg = _tool("ffmpeg", settings.ffmpeg_path)
     dur = max(0.5, min(60.0, float(dur_s)))
-    fd, name = tempfile.mkstemp(suffix=".wav", prefix="audel-excerpt-", dir=_tmp_dir(settings))
+    fd, name = _mkstemp("audel-excerpt-", settings)
     os.close(fd)
     out = Path(name)
     argv = [ffmpeg, "-nostdin", "-hide_banner", "-threads", "1", "-reinit_filter", "0",

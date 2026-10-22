@@ -1647,8 +1647,10 @@ def test_abandoned_requests_never_run_their_grading(tmp_path, media, monkeypatch
 
     runs: list = []
     _stub_grade(monkeypatch, 2.0, runs)
+    # Round 11: work slots are taken within queue_wait_s before the request's time limit starts.
+    # A request that can't get one in time is refused (429) and never runs its grading.
     s = Settings(cache_dir=tmp_path / "ws", allow_local_files=False, request_timeout_s=0.5,
-                 max_concurrent_jobs=2, max_inflight_per_tenant=20)
+                 max_concurrent_jobs=2, max_inflight_per_tenant=20, queue_wait_s=0.3)
     body = media["good"].read_bytes()
     with TestClient(build_app(settings=s)) as c:
         def hit():
@@ -3040,7 +3042,7 @@ def test_dialogue_gate_skips_failed_tracks_and_keeps_the_grade(monkeypatch):
     m.tracks = [TrackMeasurements(stream=st[0]), TrackMeasurements(stream=st[1], failed="x"),
                 TrackMeasurements(stream=st[2])]
 
-    def regions(path, settings, stream=0):
+    def regions(path, settings, stream=0, **kw):
         if stream == 1:
             raise AssertionError("failed track must be skipped")
         if stream == 2:
@@ -3270,3 +3272,129 @@ def test_listed_gaps_over_ten_percent_are_an_error():
     m.tracks = [tm]
     sev = {i.severity.value for i in evaluate(m, Settings()) if i.detail.get("check") == "packet_gap"}
     assert sev == {"error"}
+
+
+# ==== round 11, network surface ===============================================================
+
+def _speech_like(path, *, invert_right=False, gain=0.05):
+    """A syllabic tone train (speech-like envelope) over a quiet in-phase noise bed."""
+    right = "-" if invert_right else ""
+    _ff("-f", "lavfi", "-i",
+        f"aevalsrc='{gain}*sin(2*PI*220*t)*(0.5+0.5*sin(2*PI*4*t))*lt(mod(t\\,1.2)\\,0.8)|"
+        f"{right}{gain}*sin(2*PI*220*t)*(0.5+0.5*sin(2*PI*4*t))*lt(mod(t\\,1.2)\\,0.8)':d=20:s=48000",
+        "-f", "lavfi", "-i", "anoisesrc=d=20:c=pink:a=0.02", "-filter_complex",
+        "[1]aformat=channel_layouts=stereo[n];[0][n]amix=inputs=2:normalize=0", path)
+
+
+def test_speech_regions_hear_antiphase_dialogue(tmp_path):
+    pytest.importorskip("faster_whisper")
+    from audel.signals.vad import speech_regions
+
+    f = tmp_path / "phase.flac"
+    _speech_like(f, invert_right=True, gain=0.3)
+    mono_only = speech_regions(f, Settings(), stream=0, channels=1) or []
+    both = speech_regions(f, Settings(), stream=0, channels=2) or []
+    assert sum(b - a for a, b in both) > sum(b - a for a, b in mono_only)
+
+
+def test_a_vad_host_failure_is_busy_not_a_silent_fallback(tmp_path, monkeypatch):
+    pytest.importorskip("faster_whisper")
+    import wave
+
+    from audel.errors import BusyError
+    from audel.signals.vad import speech_regions
+
+    f = tmp_path / "a.flac"
+    _speech_like(f)
+
+    def emfile(*a, **k):
+        raise OSError(24, "Too many open files")
+
+    monkeypatch.setattr(wave, "open", emfile)
+    with pytest.raises(BusyError):
+        speech_regions(f, Settings(), stream=0, channels=2)
+
+
+def test_unmeasurable_dialogue_is_reported_on_a_dialogue_gated_spec():
+    from audel.mediaguard import MediaInfo, StreamInfo
+    from audel.signals.checks import evaluate
+    from audel.signals.measure import Measurements, TrackMeasurements
+
+    st = StreamInfo(index=0, codec="flac", sample_rate=48000, channels=2)
+    m = Measurements(info=MediaInfo(duration_s=20, sample_rate=48000, channels=2, codec="flac",
+                                    has_audio=True, streams=(st,)))
+    for status in ("failed", "no_speech"):
+        m.tracks = [TrackMeasurements(stream=st, integrated_lufs=-27.0, decoded_s=20.0,
+                                      frames=[(0.1, -27.0, -27.0, -3.0)], rms_dbfs=-30.0,
+                                      dialogue_status=status)]
+        found = [i for i in evaluate(m, Settings(), "netflix")
+                 if i.detail.get("check") == "dialogue_unmeasured"]
+        assert found and found[0].detail["reason"] == status
+
+
+def test_the_dialogue_gate_stays_inside_the_file_deadline(monkeypatch):
+    from audel.core.render import _dialogue_gate
+    from audel.errors import UnsafeSourceError
+    from audel.mediaguard import MediaInfo, StreamInfo
+    from audel.signals.measure import Measurements, TrackMeasurements
+
+    st = StreamInfo(index=0, codec="flac", sample_rate=48000, channels=2)
+    m = Measurements(info=MediaInfo(duration_s=20, sample_rate=48000, channels=2, codec="flac",
+                                    has_audio=True, streams=(st,)))
+    m.tracks = [TrackMeasurements(stream=st)]
+    m.deadline = time.monotonic() - 1
+    with pytest.raises(UnsafeSourceError):
+        _dialogue_gate("x", m, Settings())
+
+
+def test_header_read_failure_is_busy_not_a_skipped_check(tmp_path, monkeypatch):
+    import builtins
+
+    from audel.errors import BusyError
+    from audel.mediaguard import container_shortfall_s
+
+    f = tmp_path / "a.wav"
+    f.write_bytes(b"RIFF" + b"\0" * 100)
+    real = builtins.open
+
+    def emfile(p, *a, **k):
+        if str(p) == str(f):
+            raise OSError(24, "Too many open files")
+        return real(p, *a, **k)
+
+    monkeypatch.setattr(builtins, "open", emfile)
+    with pytest.raises(BusyError):
+        container_shortfall_s(f, 3600)
+
+
+def test_abandoned_work_makes_others_wait_not_fail(tmp_path, media, monkeypatch):
+    import threading
+
+    import audel.core as core
+
+    def slow(*a, **k):
+        time.sleep(3)
+        raise UnsafeSourceError("stub")
+
+    async def slow_check(*a, **k):
+        await asyncio.to_thread(slow)
+
+    started = []
+    real_check = core.check
+
+    async def check_tracking(*a, **k):
+        started.append(1)
+        return await real_check(*a, **k)
+
+    s = Settings(cache_dir=tmp_path / "ws", max_concurrent_jobs=1, request_timeout_s=1.0,
+                 queue_wait_s=10)
+    with TestClient(build_app(settings=s)) as c:
+        monkeypatch.setattr(core, "check", slow_check)
+        body = media["good"].read_bytes()
+        t = threading.Thread(target=lambda: c.post("/check", files={"file": ("a.wav", body)}))
+        t.start()
+        time.sleep(1.5)                                  # the first request has timed out
+        monkeypatch.setattr(core, "check", check_tracking)
+        r = c.post("/check", files={"file": ("a.wav", body, "audio/wav")})
+        t.join()
+    assert started and r.status_code == 200, (r.status_code, r.text)  # waited, then ran

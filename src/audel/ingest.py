@@ -29,7 +29,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .config import Settings
-from .errors import UnsafeSourceError
+from .errors import BusyError, UnsafeSourceError
 from .logging import get_logger
 from .proxy import VettingProxy
 
@@ -177,15 +177,22 @@ async def fetch_to_file(url: str, tmp_dir: Path, settings: Settings) -> Path:
     proxy = VettingProxy(max_connections=settings.proxy_max_connections,
                          idle_timeout_s=settings.proxy_idle_timeout_s,
                          max_lifetime_s=settings.ingest_timeout_s + 5)
-    await proxy.start()
+    try:
+        await proxy.start()
+    except OSError:  # no fds / ports: the host, not the source
+        raise BusyError("could not start a download: the host is at capacity; retry later") \
+            from None
     stop = threading.Event()
     try:
         loop = asyncio.get_running_loop()
-        await asyncio.wait_for(
-            loop.run_in_executor(_pool(), _download, url, dest,
-                                 f"http://127.0.0.1:{proxy.port}", settings, stop),
-            timeout=settings.ingest_timeout_s + 5)
-    except UnsafeSourceError:
+        try:
+            fut = loop.run_in_executor(_pool(), _download, url, dest,
+                                       f"http://127.0.0.1:{proxy.port}", settings, stop)
+        except RuntimeError:  # the download pool can't start a thread
+            raise BusyError("could not start a download: the host is at capacity; retry later") \
+                from None
+        await asyncio.wait_for(fut, timeout=settings.ingest_timeout_s + 5)
+    except (UnsafeSourceError, BusyError):
         dest.unlink(missing_ok=True)
         raise
     except Exception as e:  # noqa: BLE001 - normalize: never leak the URL (it may be signed)

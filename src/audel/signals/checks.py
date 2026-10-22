@@ -146,6 +146,14 @@ def _loudness(tm, dur, spec, label) -> list[Issue]:
             measured, basis, conf = tm.dialogue_lufs, "speech-gated", Confidence.MEDIUM
         else:
             conf = Confidence.LOW  # gating unavailable: graded on programme loudness, flagged
+            if tm.dialogue_status in ("failed", "no_speech"):
+                why = ("no dialogue was detected" if tm.dialogue_status == "no_speech"
+                       else "the speech-gated measurement failed")
+                out.append(_issue(
+                    IssueKind.LOUDNESS, Severity.WARNING,
+                    f"{label}{spec.name} gates loudness on dialogue, but {why}; graded on "
+                    "programme loudness instead", _full_span(dur), "dialogue_unmeasured", tm,
+                    conf=Confidence.LOW, reason=tm.dialogue_status, spec=spec.name))
     if measured is not None and measured != -math.inf:
         delta = measured - spec.integrated_lufs
         if abs(delta) > spec.tolerance_lu:
