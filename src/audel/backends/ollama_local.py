@@ -50,7 +50,7 @@ class LocalLLMBackend:
         if not base:
             raise BackendAuthError("no local LLM configured (set AUDEL_LOCAL_LLM_URL)")
         url = base.rstrip("/") + "/api/chat"
-        assert_backend_url(url, self._settings.trusted_backend_hosts)
+        assert_backend_url(url, self._settings.trusted_backend_hosts, self._settings)
         return url
 
     async def transcribe(self, audio_path: str, *, language: str | None = None,

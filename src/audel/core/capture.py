@@ -63,6 +63,9 @@ async def capture_sound(url: str, *, settings: Settings, click_selector: str | N
     Returns ``{"played": int, "audio_contexts": int, "errors": int, "clicked": bool}``. Raises
     ``UnsafeSourceError`` for an internal URL and ``MissingDependencyError`` without ``[render]``.
     """
+    from ..egress import require
+
+    require(settings, "web capture")
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
         raise UnsafeSourceError("watch(url) requires an http(s) URL")

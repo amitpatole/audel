@@ -71,3 +71,4 @@ nav:
   - Hearing and listening: listening.md
   - On-prem inference: on-prem.md
   - Running as a service: deployment.md
+  - Security: security.md

@@ -47,6 +47,9 @@ def url_host(url: str) -> str:
 def validate_ingest_url(url: str, settings: Settings) -> None:
     if not settings.allow_url_ingest:
         raise UnsafeSourceError("URL ingestion is disabled on this server")
+    from .egress import require
+
+    require(settings, "URL ingestion")
     if not isinstance(url, str) or len(url) > 8192 or any(ord(c) < 33 for c in url):
         raise UnsafeSourceError("URL is empty, too long or contains whitespace/control characters")
     try:

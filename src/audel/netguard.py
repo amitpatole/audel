@@ -133,7 +133,8 @@ def _always_blocked(addr: str) -> bool:
     return bool(ip.is_link_local or ip.is_multicast or ip.is_unspecified or ip.is_reserved)
 
 
-def assert_backend_url(url: str, trusted_hosts: list[str] | tuple[str, ...] = ()) -> None:
+def assert_backend_url(url: str, trusted_hosts: list[str] | tuple[str, ...] = (),
+                       settings=None) -> None:
     """Vet a backend endpoint. Public hosts pass the normal SSRF check. A host the OPERATOR listed
     in ``trusted_backend_hosts`` (exact, case-insensitive match) may be private or loopback — that
     is how a LAN inference server is reached — but never metadata / link-local / multicast."""
@@ -144,6 +145,10 @@ def assert_backend_url(url: str, trusted_hosts: list[str] | tuple[str, ...] = ()
     if parsed.username or parsed.password:
         raise UnsafeSourceError("backend URL may not embed credentials")
     trusted = {h.strip().lower() for h in trusted_hosts if h and h.strip()}
+    if settings is not None:
+        from .egress import require
+
+        require(settings, f"backend call to {host!r}", trusted=bool(host and host in trusted))
     if host and host in trusted:
         if _is_literal_ip(host):
             if _always_blocked(host):

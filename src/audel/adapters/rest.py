@@ -26,7 +26,7 @@ import time
 import uuid
 from pathlib import Path
 
-from ..auth import Authenticator, Principal
+from ..auth import Authenticator, Principal, RateLimiter
 from ..config import Settings, load_settings
 from ..errors import AudelError, ConfigError, MissingDependencyError, UnsafeSourceError
 from ..logging import get_logger
@@ -93,6 +93,8 @@ def build_app(settings: Settings | None = None):
     # controlled), so validate_source accepts them while caller path-sources stay refused.
     grade_settings = settings.model_copy(update={"allow_local_files": True})
     auth = Authenticator(settings)
+    limiter = RateLimiter(settings.rate_limit_per_min, settings.rate_limit_burst)
+    fail_limiter = RateLimiter(settings.auth_fail_per_min)
     metrics = Metrics()
     audit = AuditLog(settings.audit_log)
     _job_sem = asyncio.Semaphore(settings.max_concurrent_jobs)
@@ -124,11 +126,22 @@ def build_app(settings: Settings | None = None):
             return resp
 
         if request.url.path != "/healthz":
+            client = request.client.host if request.client else "unknown"
+            # An address that has burned its failed-auth budget is refused BEFORE credentials are
+            # checked, so a brute-forcer cannot learn that a guess was right.
+            if auth.required and fail_limiter.blocked(client):
+                return reply(JSONResponse({"detail": "Too many failed attempts."},
+                                          status_code=429, headers={"Retry-After": "60"}))
             # Authenticate BEFORE buffering the body: an unauthenticated caller must not be able
             # to make the server read up to max_request_bytes (DoS amplification).
             principal = auth.authenticate(request.headers.get("authorization"))
             if principal is None:
+                fail_limiter.allow(client)
                 return reply(JSONResponse({"detail": "Unauthorized"}, status_code=401))
+            ok, retry = limiter.allow(principal.tenant, principal.rate_per_min)
+            if not ok:
+                return reply(JSONResponse({"detail": "Rate limit exceeded."}, status_code=429,
+                                          headers={"Retry-After": str(retry)}))
             request.state.principal = principal
         cap = settings.max_request_bytes
         cl = request.headers.get("content-length")
@@ -521,12 +534,23 @@ def serve(host: str = "127.0.0.1", port: int = 8000) -> None:
     s = load_settings()
     if not _is_loopback(host) and not Authenticator(s).required:
         raise SystemExit(
-            f"Refusing to bind non-loopback host {host!r} without auth. Set AUDEL_API_TOKEN to "
-            "expose the service (clients send 'Authorization: Bearer <token>'), or bind 127.0.0.1."
+            f"Refusing to bind non-loopback host {host!r} without auth. Set AUDEL_API_TOKEN, "
+            "AUDEL_API_TOKENS_FILE or AUDEL_JWT_JWKS_FILE to expose the service, or bind 127.0.0.1."
         )
+    if bool(s.tls_certfile) != bool(s.tls_keyfile):
+        raise SystemExit("TLS needs both AUDEL_TLS_CERTFILE and AUDEL_TLS_KEYFILE.")
+    if s.tls_client_ca and not s.tls_certfile:
+        raise SystemExit("Mutual TLS (AUDEL_TLS_CLIENT_CA) needs a server certificate too.")
+    import ssl
+
     import uvicorn
 
-    uvicorn.run(build_app(), host=host, port=port)
+    tls: dict = {}
+    if s.tls_certfile:
+        tls = {"ssl_certfile": str(s.tls_certfile), "ssl_keyfile": str(s.tls_keyfile)}
+        if s.tls_client_ca:
+            tls.update(ssl_ca_certs=str(s.tls_client_ca), ssl_cert_reqs=ssl.CERT_REQUIRED)
+    uvicorn.run(build_app(), host=host, port=port, **tls)
 
 
 def main() -> None:

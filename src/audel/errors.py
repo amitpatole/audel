@@ -34,3 +34,7 @@ class BackendAuthError(BackendError):
 
 class ConfigError(AudelError):
     """Invalid or inconsistent configuration."""
+
+
+class EgressDeniedError(UnsafeSourceError):
+    """The egress policy (``AUDEL_EGRESS``) forbids this network call."""

@@ -37,6 +37,9 @@ class GeminiAudioBackend:
         return await asyncio.to_thread(self._audio, audio_path, prompt)
 
     def _client(self):
+        from ..egress import require
+
+        require(self._settings, "Gemini API call")
         key = self._settings.key_for("gemini-audio")
         if not key:
             raise BackendAuthError("no Google key (set GOOGLE_API_KEY or ~/.config/Google/key)")

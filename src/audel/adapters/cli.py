@@ -126,6 +126,30 @@ def listen(
     raise typer.Exit(0 if report.verdict.value != "fail" else 1)
 
 
+token_app = typer.Typer(help="Manage per-tenant API tokens.")
+app.add_typer(token_app, name="token")
+
+
+@token_app.command("new")
+def token_new(tenant: str = typer.Option(..., help="Tenant name ([A-Za-z0-9._-], 1-64 chars)."),
+              rate_per_min: int = typer.Option(None, help="Optional per-tenant rate limit.")) -> None:
+    """Mint a token. Prints the token ONCE plus the hash entry for AUDEL_API_TOKENS_FILE."""
+    import json as _json
+    import secrets
+
+    from ..auth import token_hash, valid_tenant
+
+    if not valid_tenant(tenant):
+        raise typer.BadParameter("tenant must be 1-64 chars of [A-Za-z0-9._-]")
+    tok = secrets.token_urlsafe(32)
+    entry: dict = {"sha256": token_hash(tok)}
+    if rate_per_min is not None:
+        entry["rate_per_min"] = rate_per_min
+    typer.echo(f"token (give this to the tenant; it is not stored anywhere): {tok}")
+    typer.echo("add to the tenants object in AUDEL_API_TOKENS_FILE:")
+    typer.echo(_json.dumps({tenant: entry}))
+
+
 @app.command()
 def purge(hours: float = typer.Option(24.0, help="Remove temp files older than this many hours."),
           sessions: bool = typer.Option(True, help="Also reap expired loop sessions.")) -> None:

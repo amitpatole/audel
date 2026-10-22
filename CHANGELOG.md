@@ -63,6 +63,22 @@ All notable changes to Audel are recorded here. The format follows
   API, so the request now uses `output_config.effort = "low"` and handles a `refusal` stop reason.
 
 ### Security
+- **Per-tenant tokens.** `AUDEL_API_TOKENS_FILE` holds SHA-256 hashes only, and
+  `audel token new` mints a token. All tenant hashes are compared in constant time on every
+  request.
+- **OIDC JWT authentication** (`[oidc]` extra) against a local JWKS. Only asymmetric algorithms
+  are accepted. `iss`, `aud`, `exp` and `iat` are required, lifetime is capped, and the tenant is
+  read from a claim.
+- **Rate limits.** Token buckets apply per tenant (`AUDEL_RATE_LIMIT_PER_MIN`, with per-tenant
+  overrides). After `AUDEL_AUTH_FAIL_PER_MIN` failed attempts, an address gets 429 before
+  credentials are checked, so a correct guess stays hidden.
+- **Egress policy.** `AUDEL_EGRESS` is `allow`, `local-only` (trusted on-prem hosts only) or
+  `deny` (fully offline). It is enforced at every egress point, and also stops model downloads.
+- **TLS and mutual TLS** on `audel serve` (`AUDEL_TLS_CERTFILE`, `AUDEL_TLS_KEYFILE`,
+  `AUDEL_TLS_CLIENT_CA`).
+- **Bounded CLAP input.** CLAP scoring now decodes at most two minutes through mediaguard.
+  Before this it loaded the whole file into memory.
+- Published threat model: `docs/security.md`.
 - Backend HTTP calls refuse redirects and cap the response size before parsing.
 - Backend URLs with embedded credentials are refused.
 

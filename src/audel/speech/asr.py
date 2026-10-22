@@ -56,13 +56,21 @@ def _device_and_compute(device: str, compute: str) -> tuple[str, str]:
 
 @lru_cache(maxsize=2)
 def _load(model_name: str, device: str = "cpu", compute: str = "int8",
-          download_root: str | None = None):
+          download_root: str | None = None, local_only: bool = False):
     validate_model_name(model_name)
     try:
         from faster_whisper import WhisperModel
     except ImportError as e:  # pragma: no cover - exercised only without the extra
         raise MissingDependencyError("faster-whisper not installed; pip install audel[asr]") from e
-    return WhisperModel(model_name, device=device, compute_type=compute, download_root=download_root)
+    try:
+        return WhisperModel(model_name, device=device, compute_type=compute,
+                            download_root=download_root, local_files_only=local_only)
+    except Exception as e:
+        if local_only:
+            raise MissingDependencyError(
+                f"whisper model {model_name!r} is not available locally and the egress policy "
+                "forbids downloading it (pre-fetch it into AUDEL_ASR_MODEL_DIR)") from e
+        raise
 
 
 def transcribe_file(path: str, *, model_name: str = "base", language: str | None = None,
@@ -81,8 +89,10 @@ def transcribe_file(path: str, *, model_name: str = "base", language: str | None
     wav = decode_to_wav(vp, settings, stream=stream)
     try:
         device, compute = _device_and_compute(settings.asr_device, settings.asr_compute_type)
+        from ..egress import models_offline
+
         root = str(settings.asr_model_dir) if settings.asr_model_dir else None
-        model = _load(model_name, device, compute, root)
+        model = _load(model_name, device, compute, root, models_offline(settings))
         # Hand whisper the decoded samples, not a path: we already decoded a bounded 16 kHz mono
         # WAV with ffmpeg, and faster-whisper's own loader (PyAV) breaks across PyAV releases.
         audio = _read_wav_f32(wav)

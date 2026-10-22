@@ -39,6 +39,9 @@ class AnthropicBackend:
         return ""
 
     def _complete(self, key: str, system: str, user: str) -> str:
+        from ..egress import require
+
+        require(self._settings, "Anthropic API call")
         try:
             import anthropic
         except ImportError as e:  # pragma: no cover

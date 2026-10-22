@@ -89,6 +89,9 @@ class Settings(BaseSettings):
     groq_api_key: str | None = Field(default=None, validation_alias="GROQ_API_KEY")
     assemblyai_api_key: str | None = Field(default=None, validation_alias="ASSEMBLYAI_API_KEY")
 
+    # Egress policy (Phase 12): allow | local-only (trusted on-prem hosts only) | deny (offline).
+    egress: str = "allow"
+
     # On-prem / LAN inference (Phase 10): an Ollama server the OPERATOR runs and trusts. Audio and
     # transcripts sent here never leave the operator's network. ``trusted_backend_hosts`` is the
     # exact host allowlist that lets a backend URL resolve to a private/loopback address.
@@ -155,8 +158,22 @@ class Settings(BaseSettings):
     proxy_max_connections: int = 64
     proxy_idle_timeout_s: float = 30.0
 
-    # HTTP service (REST): bind + auth + DoS bounds (Phase 6)
+    # HTTP service (REST): bind + auth + DoS bounds (Phase 6, extended Phase 12)
     api_token: str | None = Field(default=None, validation_alias="AUDEL_API_TOKEN")
+    api_tokens_file: Path | None = None   # per-tenant SHA-256 token hashes (audel token new)
+    jwt_jwks_file: Path | None = None     # local JWKS; no IdP fetch at request time
+    jwt_issuer: str | None = None
+    jwt_audience: str | None = None
+    jwt_algorithms: list[str] = Field(default_factory=lambda: ["RS256", "ES256"])
+    jwt_tenant_claim: str = "tenant"
+    jwt_leeway_s: int = 30
+    jwt_max_lifetime_s: int = 24 * 3600
+    rate_limit_per_min: int = 120         # per tenant; 0 disables; tokens file may override
+    rate_limit_burst: int | None = None   # default: a quarter of the per-minute rate
+    auth_fail_per_min: int = 30           # failed authentications per client address
+    tls_certfile: Path | None = None      # serve over TLS
+    tls_keyfile: Path | None = None
+    tls_client_ca: Path | None = None     # set = mutual TLS (client certificate required)
     max_request_bytes: int = 50_000_000      # cap request bodies before buffering/decoding
     max_concurrent_jobs: int = 4
     request_timeout_s: float = 180.0

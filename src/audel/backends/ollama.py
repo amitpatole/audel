@@ -42,7 +42,7 @@ class OllamaBackend:
         if not key:
             raise BackendAuthError("no Ollama key (set OLLAMA_API_KEY or ~/.config/ollama/key)")
         url = self._settings.ollama_base_url.rstrip("/") + "/chat/completions"
-        assert_backend_url(url, self._settings.trusted_backend_hosts)  # SSRF: vet the endpoint
+        assert_backend_url(url, self._settings.trusted_backend_hosts, self._settings)  # SSRF: vet the endpoint
         return await asyncio.to_thread(self._post, url, key, system, user)
 
     async def critique_audio(self, audio_path: str, prompt: str) -> str:
