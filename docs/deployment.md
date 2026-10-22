@@ -65,7 +65,10 @@ The queue is bounded overall (`AUDEL_MAX_QUEUED_JOBS`, default 64) and per tenan
 that by default). The media held on disk is bounded too, overall (`AUDEL_MAX_SPOOL_BYTES`,
 default 2 GB) and per tenant (a quarter of that by default): every upload in flight or queued
 counts its declared request size (the full request cap when undeclared) from before the body is
-read, and every fetched URL counts `AUDEL_MAX_MEDIA_BYTES` until its file is removed. A request
+read, and every fetched URL counts `AUDEL_MAX_MEDIA_BYTES` until its file is removed. A file stays
+counted until the grading that uses it really ends, even when its request timed out or its job was
+deleted. The derived per-tenant share always fits one maximum-size request (plus one URL fetch when
+URL ingest is on); an explicit `AUDEL_MAX_SPOOL_BYTES_PER_TENANT` below that is logged at start-up. A request
 that declares a length and also uses chunked framing is refused. Keep the overall bound below the cache
 volume (the Helm chart sets 1.2 GB against its 2Gi `cacheSizeLimit`). Past any bound a
 submission gets `429` with a `Retry-After` header. Finished results are kept for `AUDEL_JOB_RESULT_TTL_S` (default 1 hour) and

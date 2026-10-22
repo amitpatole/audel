@@ -319,8 +319,14 @@ _ARGV_STRONG = re.compile(r"password|passwd|passphrase|secret|api[_-]?key|access
                           re.IGNORECASE)
 
 
+# Flags that name WHERE a credential comes from (a path, an fd, stdin, an env var), or take no
+# value at all: ``--password-file /run/secrets/x``, ``--password-stdin``, ``--passphrase-fd 0``.
+_ARGV_INDIRECT = re.compile(r"[_-](?:file|path|fd|stdin|env|dir|cmd|command)$", re.IGNORECASE)
+
+
 def _argv(m: re.Match) -> str:
-    if not _ARGV_NAME.search(m.group(2)):
+    name = m.group(2)
+    if not _ARGV_NAME.search(name) or _ARGV_INDIRECT.search(name):
         return m.group()
     value = m.group(3).strip("\"'")
     weak_ok = (len(value) >= 8 and not value.startswith(("/", "~", ".")) and _looks_secret(value))

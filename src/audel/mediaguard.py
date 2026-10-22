@@ -739,27 +739,82 @@ def scan_packets(path: Path, settings: Settings, abs_index: int, *, min_gap_s: f
 
 
 # Sync markers of media data for containers whose demuxer can stop early with exit 0 and no
-# error (a damaged box / KLV / chained link): if one appears AFTER the last packet read, media
-# was left unread. Trailing tags and padding (ID3v1, APE, zeros) carry none. Not Matroska: its
-# demuxer resyncs past damage, and some muxers' packet positions aren't file offsets.
+# error (a damaged box / KLV / chained link). Every marker region (from one marker to the next)
+# must contain a packet the demuxer READ; a region of real size with none was never read. Judged
+# region by region, so one oversized or relocated packet can't vouch for the rest of the file.
+# Trailing tags and padding (ID3v1, APE, zeros) carry no marker. Not Matroska: its demuxer
+# resyncs past damage, and some muxers' packet positions aren't file offsets.
 _MEDIA_MARKERS = {
-    # Ogg packet positions are page starts (not byte exact): only a NEW link's first page
-    # (version 0, beginning-of-stream flag) after them means a chained link was never read.
+    # A new Ogg link's first page (version 0, beginning-of-stream flag). Ogg packet positions
+    # are page starts, so only link boundaries are judged.
     "ogg": (b"OggS\x00\x02",),
     "wv": (b"wvpk",),
-    "mov": (b"moof", b"mdat"),
-    "mxf": (b"\x06\x0e\x2b\x34\x01\x02\x01\x01\x0d\x01\x03\x01",),  # essence element
+    "mov": (b"moof", b"mdat"),  # validated as boxes (a plausible size before the type)
+    "mxf": (b"\x06\x0e\x2b\x34\x01\x02\x01\x01\x0d\x01\x03\x01",   # SMPTE essence element
+            b"\x06\x0e\x2b\x34\x01\x02\x01\x01\x0e\x04\x03\x01"),  # Avid essence element
 }
+_MIN_UNREAD = 4096        # a marker region smaller than this is headers, not unread media
+_WV_MAX_BLOCK = 1 << 21   # a WavPack packet covers its own (small) blocks, never more
+
+
+def _marker_regions(path: Path, container: str, markers: tuple[bytes, ...], size: int,
+                    deadline: float) -> list[int]:
+    """Offsets where a media region starts (sorted). MP4 boxes are checked for a plausible size,
+    and a moof's own mdat belongs to its region. Bounded by the file size and the deadline."""
+    import time
+
+    found: list[tuple[int, bytes]] = []
+    chunk = 1 << 20
+    keep = max(len(m) for m in markers) + 8
+    with open(path, "rb") as fh:
+        base = 0
+        prev = b""
+        while True:
+            if time.monotonic() > deadline:
+                raise UnsafeSourceError("analysis exceeded the per-file time budget")
+            buf = fh.read(chunk)
+            if not buf:
+                break
+            hay = prev + buf
+            start = base - len(prev)
+            for mk in markers:
+                i = hay.find(mk)
+                while i >= 0:
+                    off = start + i
+                    if container == "mov":
+                        box = int.from_bytes(hay[i - 4:i], "big") if i >= 4 else -1
+                        if box == 1 or 8 <= box <= size - (off - 4):
+                            found.append((off - 4, mk))
+                    else:
+                        found.append((off, mk))
+                    i = hay.find(mk, i + 1)
+            prev = hay[-keep:]
+            base += len(buf)
+    found = sorted(set(found))
+    moof_end: dict[int, int] = {}
+    out: list[int] = []
+    for off, mk in found:
+        if out and off < out[-1] + 8:
+            continue  # the same marker seen twice across a chunk boundary
+        if container == "mov" and mk == b"mdat" and out and moof_end.get(out[-1]) == off:
+            continue  # a fragment's mdat belongs to its moof's region
+        out.append(off)
+        if container == "mov" and mk == b"moof":
+            with open(path, "rb") as fh:
+                fh.seek(off)
+                n = int.from_bytes(fh.read(4), "big")
+            moof_end[off] = off + n
+    return out
 
 
 def unread_media_at(path: Path, settings: Settings, container: str, *,
                     timeout_s: float | None = None) -> int | None:
-    """Byte offset after the furthest packet the demuxer read, when the rest of the file holds
-    more media data of this container (``None`` when nothing was left unread, or the container
-    has no reliable marker). One streamed packet listing over every stream, then a chunked byte
-    search of the remainder; both bounded."""
+    """Byte offset of the first media region the demuxer never read (``None`` when every region
+    was read, or the container has no reliable marker). One streamed packet listing over every
+    stream, then a chunked marker search of the file; both inside ``timeout_s``."""
     import threading
     import time
+    from array import array
 
     markers = _MEDIA_MARKERS.get(container)
     if not markers:
@@ -769,9 +824,11 @@ def unread_media_at(path: Path, settings: Settings, container: str, *,
     except OSError:
         raise BusyError("could not read the file: the host is at capacity; retry later") from None
     ffprobe = _tool("ffprobe", settings.ffmpeg_path and str(Path(settings.ffmpeg_path).with_name("ffprobe")))
-    argv = [ffprobe, "-v", "error", "-show_entries", "packet=pos,size", "-of", "csv=p=0",
+    # Named fields (``size=N|pos=M``): ffprobe orders csv columns its own way, not as requested.
+    argv = [ffprobe, "-v", "error", "-show_entries", "packet=pos,size", "-of", "compact=p=0",
             *safe_input(path)]
     timeout = timeout_s or min(120.0, settings.decode_timeout_s)
+    deadline = time.monotonic() + timeout
     pre = _rlimit_setter(int(timeout) + _RLIMIT_CPU_PAD_S) if os.name == "posix" else None
     proc = _popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                   stderr=subprocess.DEVNULL, preexec_fn=pre)
@@ -784,34 +841,57 @@ def unread_media_at(path: Path, settings: Settings, container: str, *,
         proc.wait()
         proc.stdout.close()
         raise BusyError("could not start analysis: the host is at capacity; retry later") from None
-    end = 0
-    t0 = time.monotonic()
+    starts = array("q")
+    cover = []  # WavPack: (start, end) of each packet's own blocks
     try:
         for line in iter(lambda: proc.stdout.readline(64), b""):  # type: ignore[union-attr]
-            pos, _, sz = line.strip().partition(b",")
+            fields = dict(kv.partition(b"=")[::2] for kv in line.strip().split(b"|"))
+            pos, sz = fields.get(b"pos", b""), fields.get(b"size", b"")
             if pos.isdigit() and sz.isdigit():
-                end = max(end, int(pos) + int(sz))
+                p, n = int(pos), int(sz)
+                starts.append(p)
+                if container == "wv" and n <= _WV_MAX_BLOCK:
+                    cover.append((p, p + n))
     finally:
         killer.cancel()
         if proc.poll() is None:
             proc.kill()
         proc.wait()
         proc.stdout.close()
-    if time.monotonic() - t0 >= timeout or proc.returncode != 0 or end <= 0 or size - end < 16:
-        return None  # an incomplete listing proves nothing; the timeline checks still apply
-    chunk = 1 << 20
-    keep = max(len(m) for m in markers) - 1
-    with open(path, "rb") as fh:
-        fh.seek(end)
-        prev = b""
-        while True:
-            buf = fh.read(chunk)
-            if not buf:
-                return None
-            hay = prev + buf
-            if any(m in hay for m in markers):
-                return end
-            prev = hay[-keep:]
+    if time.monotonic() >= deadline:
+        raise UnsafeSourceError("analysis exceeded the per-file time budget")
+    if proc.returncode != 0 or not starts:
+        return None  # no usable listing; the timeline checks still apply
+    return _first_unread(_marker_regions(path, container, markers, size, deadline),
+                         list(starts), cover, size)
+
+
+def _first_unread(regions: list[int], starts: list[int], cover: list[tuple[int, int]],
+                  size: int) -> int | None:
+    """The first marker region (of real size) holding no packet the demuxer read: no packet
+    STARTS in it, and no small (WavPack) packet covers it. A packet's declared size never vouches
+    for other regions, so one oversized or relocated packet can't hide unread media."""
+    import bisect
+
+    ordered = sorted(starts)
+    cover = sorted(cover)
+    reach, ends = 0, []
+    for _a, b in cover:
+        reach = max(reach, b)
+        ends.append(reach)
+    cstarts = [a for a, _ in cover]
+    for k, off in enumerate(regions):
+        end = regions[k + 1] if k + 1 < len(regions) else size
+        if end - off < _MIN_UNREAD:
+            continue
+        j = bisect.bisect_left(ordered, off)
+        if j < len(ordered) and ordered[j] < end:
+            continue  # a packet the demuxer read starts in this region
+        c = bisect.bisect_right(cstarts, off) - 1
+        if c >= 0 and ends[c] > off:
+            continue  # inside a (WavPack) packet's own blocks
+        return off
+    return None
 
 
 def channel_layout_arg(layout: str, channels: int) -> str:

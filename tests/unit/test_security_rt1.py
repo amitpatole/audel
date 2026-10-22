@@ -4489,3 +4489,99 @@ def test_demux_stop_is_not_read_from_decoder_log_text():
     from audel import mediaguard
 
     assert "Error during demuxing" not in inspect.getsource(mediaguard)  # forgeable by tag text
+
+
+# ==== round 20, decode surface (unread media judged region by region) =========================
+
+def test_one_oversized_packet_cannot_vouch_for_unread_regions():
+    from audel.mediaguard import _first_unread
+
+    regions = [10_000 * k for k in range(1, 11)]            # ten 10 kB essence regions
+    assert _first_unread(regions, [10_100], [], 110_000) == 20_000  # one huge packet (MXF BER)
+    relocated = [10_100, 109_000]                           # a packet copied to the file end
+    assert _first_unread(regions, relocated, [], 110_000) == 20_000
+    every = [r + 100 for r in regions]
+    assert _first_unread(regions, every, [], 110_000) is None
+
+
+def test_wavpack_multiblock_packets_and_small_header_regions_are_read():
+    from audel.mediaguard import _first_unread
+
+    # one packet spanning two blocks: the second block's region starts inside it
+    assert _first_unread([0, 6_000, 12_000], [10, 12_010], [(10, 11_000), (12_010, 18_000)],
+                         18_000) is None
+    # header-sized regions (consecutive Ogg BOS pages) are not media
+    assert _first_unread([0, 300, 700], [800], [], 50_000) is None
+
+
+def test_packet_listing_reads_named_fields_not_csv_order():
+    import inspect
+
+    from audel import mediaguard
+
+    src = inspect.getsource(mediaguard.unread_media_at)
+    assert "compact=p=0" in src and 'b"pos"' in src  # ffprobe orders csv columns its own way
+
+
+# ==== round 20, REST + redaction ==============================================================
+
+def test_abandoned_grade_keeps_its_disk_reservation_until_it_ends(tmp_path, monkeypatch):
+    import time as _time
+
+    import audel.core as core
+
+    async def slow_check(path, **kw):
+        await asyncio.sleep(2.5)  # outlives the request's 1 s limit (the shielded work goes on)
+        raise AudelError("stub")
+
+    monkeypatch.setattr(core, "check", slow_check)
+    app = build_app(settings=_s(tmp_path, request_timeout_s=1, max_request_bytes=8_000,
+                                max_spool_bytes=20_000, max_spool_bytes_per_tenant=8_000))
+    import io
+    import wave
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:  # a real (tiny) WAV, so grading actually starts
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(8000)
+        w.writeframes(b"\1\0" * 2_400)
+    h = {"Authorization": f"Bearer {SHARED}"}
+    up = {"file": ("a.wav", buf.getvalue(), "audio/wav")}
+    with TestClient(app) as c:  # one event loop: the abandoned grade really keeps running
+        assert c.post("/check", files=up, headers=h).status_code != 200
+        assert c.post("/check", files=up, headers=h).status_code == 429  # still held on disk
+        _time.sleep(3)
+        assert c.post("/check", files=up, headers=h).status_code != 429  # released at its end
+
+
+def test_derived_spool_share_always_fits_one_url_request(tmp_path):
+    from audel.adapters import rest
+
+    seen = []
+    orig = rest.SpoolQuota.__init__
+
+    def spy(self, total, per_tenant):
+        seen.append(per_tenant)
+        orig(self, total, per_tenant)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(rest.SpoolQuota, "__init__", spy)
+        build_app(settings=_s(tmp_path, allow_url_ingest=True, max_request_bytes=1_000,
+                              max_media_bytes=10_000, max_spool_bytes=20_000))
+        assert seen[-1] >= 11_000                     # not total // 4 = 5 000
+        warned = []
+        mp.setattr(rest.log, "warning", lambda msg, *a: warned.append(msg % a))
+        build_app(settings=_s(tmp_path, allow_url_ingest=True, max_request_bytes=1_000,
+                              max_media_bytes=10_000, max_spool_bytes=20_000,
+                              max_spool_bytes_per_tenant=5_000))
+        assert any("always get 429" in w for w in warned)
+
+
+@pytest.mark.parametrize("text", ["docker login --username amit --password-stdin ghcr.io",
+                                  "--password-file /run/secrets/db_pass", "gpg --passphrase-fd 0",
+                                  "--ssh-key-file ~/.ssh/id_ed25519"])
+def test_flags_that_point_at_a_credential_are_kept(text):
+    from audel.logging import scrub_text
+
+    assert scrub_text(text) == text

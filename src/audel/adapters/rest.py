@@ -141,8 +141,17 @@ def build_app(settings: Settings | None = None):
 
     inflight: dict[str, int] = {}
     total_spool = settings.max_spool_bytes
-    spool = SpoolQuota(total_spool, settings.max_spool_bytes_per_tenant
-                       or min(total_spool, max(total_spool // 4, settings.max_request_bytes)))
+    # The derived share always fits one URL fetch plus its (undeclared-size) form, or URL
+    # ingest could never succeed; an explicit setting below that is warned about at start-up.
+    need = settings.max_request_bytes + (settings.max_media_bytes if settings.allow_url_ingest
+                                         else 0)
+    per_tenant = min(settings.max_spool_bytes_per_tenant or max(total_spool // 4, need),
+                     total_spool)
+    if per_tenant < need:
+        log.warning("spool budget per tenant (%d bytes) is below one maximum-size request "
+                    "(%d bytes%s): such requests will always get 429", per_tenant, need,
+                    " with URL ingest" if settings.allow_url_ingest else "")
+    spool = SpoolQuota(total_spool, per_tenant)
     cap_tenant = settings.max_inflight_per_tenant or max(2, settings.max_concurrent_jobs)
     cap_total = settings.max_inflight_total or 4 * settings.max_concurrent_jobs
 
@@ -247,7 +256,30 @@ def build_app(settings: Settings | None = None):
     _tenant_work = TenantSemaphores(max(1, settings.max_concurrent_jobs // 2))
     _tenant_jobs = TenantSemaphores(max(1, settings.max_concurrent_jobs // 2))
 
-    async def _shielded(coro_factory, timeout: float, tenant: str | None = None):
+    # Media files a shielded grade still has open: removed (and their spool bytes returned)
+    # only when that work REALLY ends, not when an abandoned request gives up on it.
+    _in_use: dict[str, int] = {}
+    _drop_pending: set[str] = set()
+
+    def _use(path: Path | None):
+        if path is None:
+            return lambda _t: None
+        key = str(path)
+        _in_use[key] = _in_use.get(key, 0) + 1
+
+        def done(_t) -> None:
+            left = _in_use.get(key, 1) - 1
+            if left > 0:
+                _in_use[key] = left
+                return
+            _in_use.pop(key, None)
+            if key in _drop_pending:
+                _drop_pending.discard(key)
+                _drop(Path(key))
+        return done
+
+    async def _shielded(coro_factory, timeout: float, tenant: str | None = None,
+                        path: Path | None = None):
         """Global work slots plus a per-tenant share of them, both held until the work REALLY
         ends (a cancelled or timed-out request cannot free its tenant's share early).
 
@@ -255,7 +287,11 @@ def build_app(settings: Settings | None = None):
         request's time limit start: work another tenant abandoned can make a request wait or
         retry, never fail as "grading exceeded" without having run."""
         if tenant is None:
-            return await run_shielded(_work_sem, coro_factory, timeout)
+            fin = _use(path)
+            try:
+                return await run_shielded(_work_sem, coro_factory, timeout)
+            finally:
+                fin(None)
         sem = _tenant_work.get(tenant)
         held: list[asyncio.Semaphore] = []
         try:
@@ -280,6 +316,7 @@ def build_app(settings: Settings | None = None):
 
         task = asyncio.ensure_future(guarded())
         task.add_done_callback(lambda _t: _tenant_work.done(tenant))  # cleanup when work ENDS
+        task.add_done_callback(_use(path))
         task.add_done_callback(_retrieve)
         return await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
 
@@ -313,12 +350,33 @@ def build_app(settings: Settings | None = None):
         _fetch_holds[str(path)] = (tenant, need)
         return path
 
-    def _drop(path: Path) -> None:
-        """Remove a request's temp media; a fetched file also returns its spool reservation."""
+    _pending_holds: dict[str, list[tuple[str, int]]] = {}
+
+    def _drop(path: Path, hold: tuple[str, int] | None = None) -> None:
+        """Remove a request's temp media and return its spool reservations (a fetched file's own,
+        plus ``hold``: the upload's). Deferred while a shielded grade still has the file open:
+        the bytes are still on disk, so they stay counted until that work really ends."""
+        key = str(path)
+        if _in_use.get(key):
+            _drop_pending.add(key)
+            if hold is not None and hold[1]:
+                _pending_holds.setdefault(key, []).append(hold)
+            return
         path.unlink(missing_ok=True)
-        held = _fetch_holds.pop(str(path), None)
-        if held is not None:
-            spool.release(*held)
+        fetched_hold = _fetch_holds.pop(key, None)
+        for h in ([fetched_hold] if fetched_hold else []) + _pending_holds.pop(key, []) + \
+                ([hold] if hold is not None and hold[1] else []):
+            spool.release(*h)
+
+    def _take_hold(request: Request) -> tuple[str, int] | None:
+        """Take the request's upload reservation over from the gate (it would release it as the
+        response is sent, while an abandoned grade may still hold the file)."""
+        held = getattr(request.state, "spool", None)
+        if held is None or not held[1]:
+            return None
+        out = (str(held[0]), int(held[1]))
+        held[1] = 0
+        return out
 
     @contextlib.asynccontextmanager
     async def _tenant_job_gate(tenant: str):
@@ -508,7 +566,7 @@ def build_app(settings: Settings | None = None):
             except (OSError, MemoryError, RuntimeError) as e:
                 raise BusyError("Server busy; retry later.") from e
             report = await _shielded(lambda: _grade(kind, path, p, gs),
-                                     settings.request_timeout_s, principal.tenant)
+                                     settings.request_timeout_s, principal.tenant, path=path)
             verdict, n_issues = report.verdict.value, len(report.issues)
             if as_handoff:
                 hand = report.to_handoff().model_dump(mode="json")
@@ -576,7 +634,7 @@ def build_app(settings: Settings | None = None):
             raise _http_error(e) from e
         finally:
             if path is not None:
-                _drop(path)
+                _drop(path, _take_hold(request))
 
     @app.post("/check")
     async def check_ep(request: Request, file: UploadFile | None = File(None),
@@ -630,7 +688,8 @@ def build_app(settings: Settings | None = None):
             digest, size = await asyncio.to_thread(_sha256, path)
             async with _slot_for(_principal(request).tenant):
                 rr = await _shielded(lambda: render(str(path), settings=grade_settings),
-                                     settings.request_timeout_s, _principal(request).tenant)
+                                     settings.request_timeout_s, _principal(request).tenant,
+                                     path=path)
             return {"duration_ms": rr.duration_ms, "channels": rr.channels,
                     "sample_rate": rr.sample_rate, "codec": rr.codec, "has_audio": rr.has_audio,
                     "integrated_lufs": rr.integrated_lufs, "true_peak_dbtp": rr.true_peak_dbtp,
@@ -654,7 +713,7 @@ def build_app(settings: Settings | None = None):
                             endpoint="/render", kind="render", status=status,
                             input_sha256=digest, input_bytes=size, source=src, source_host=host,
                             duration_ms=int((time.monotonic() - t0) * 1000))
-                _drop(path)
+                _drop(path, _take_hold(request))
 
     @app.post("/handoff")
     async def handoff_ep(request: Request, file: UploadFile | None = File(None),
@@ -672,7 +731,7 @@ def build_app(settings: Settings | None = None):
             raise _http_error(e) from e
         finally:
             if path is not None:
-                _drop(path)
+                _drop(path, _take_hold(request))
 
     @app.post("/watch")
     async def watch_ep(request: Request):
@@ -758,19 +817,21 @@ def build_app(settings: Settings | None = None):
             return await _run_and_audit(kind, source["path"], source["src"], source["host"], p,
                                         gs, principal, rid, job_id=holder.get("id"))
 
-        def cleanup() -> None:  # runs on done, failure AND cancel (even while still queued)
-            for f in ([spooled] if spooled is not None else []) + fetched:
-                _drop(f)
-
         held = getattr(request.state, "spool", None)
         owner, owned = (str(held[0]), int(held[1])) if held is not None else (principal.tenant, 0)
         released = [False]
 
-        def cleanup_and_release() -> None:
-            cleanup()
-            if owned and not released[0]:
-                released[0] = True
-                spool.release(owner, owned)
+        def cleanup_and_release() -> None:  # on done, failure AND cancel (even while queued)
+            if released[0]:
+                return
+            released[0] = True
+            hold = (owner, owned) if owned else None
+            if spooled is not None:
+                _drop(spooled, hold)  # returned when the file is really gone
+            elif hold is not None:
+                spool.release(*hold)
+            for f in fetched:
+                _drop(f)
 
         try:
             job = jobs.submit(principal.tenant, kind, work, cleanup=cleanup_and_release,
