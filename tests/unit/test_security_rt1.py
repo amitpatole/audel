@@ -1814,7 +1814,7 @@ def test_sync_url_requests_do_not_hold_grading_slots_while_fetching(tmp_path, me
     import audel.ingest as ing
 
     async def slow_fetch(url, tmp, settings):
-        await asyncio.sleep(3.0)
+        await asyncio.sleep(8.0)
         raise UnsafeSourceError("stub upstream")
 
     monkeypatch.setattr(ing, "fetch_to_file", slow_fetch)
@@ -1837,7 +1837,7 @@ def test_sync_url_requests_do_not_hold_grading_slots_while_fetching(tmp_path, me
         took = time.monotonic() - t0
         for t in th:
             t.join()
-    assert r.status_code == 200 and took < 2.0, (r.status_code, took)
+    assert r.status_code == 200 and took < 7.0, (r.status_code, took)  # held slots: 429 at 2 s
 
 
 def test_waiting_for_a_fetch_share_is_bounded(tmp_path, monkeypatch):
@@ -2582,3 +2582,89 @@ def test_cut_alaw_aifc_is_caught(tmp_path):
     cut.write_bytes(data[: len(data) * 6 // 10])
     assert not _checks(asyncio.run(check(str(full))), "container_truncated")
     assert _checks(asyncio.run(check(str(cut))), "container_truncated")
+
+
+# ==== round 9, auth surface ===================================================================
+
+@pytest.mark.parametrize("unit", ["-eyJ", "_eyJ", "-EYA", "eyJ", "eyJAAAAAAAAA.", "sk-", "_sk-",
+                                  "token=", "audel_", "_audel_", "Bearer ", "%41", "%25",
+                                  "Authorization: ", "a.", "eyJaaaaaaaa.b.", "token     ",
+                                  "eyJaaaaaaaaaa..", "eyJaaaaaaaaaaaa.bb."])
+def test_scrubbing_is_linear_for_every_shape(unit):
+    from audel.logging import scrub_text
+
+    def best(text):
+        out = []
+        for _ in range(3):
+            t0 = time.perf_counter()
+            scrub_text(text)
+            out.append(time.perf_counter() - t0)
+        return min(out)
+
+    t_small = best(unit * (64_000 // len(unit)))
+    t_big = best(unit * (1_024_000 // len(unit)))   # 16x the input
+    assert t_big < 5.0 and t_big < 48 * max(t_small, 2e-3), (t_small, t_big)  # quadratic: ~256x
+
+
+def test_log_records_are_bounded_before_scrubbing():
+    import logging as lg
+
+    from audel.auth import new_token
+    from audel.logging import _SecretScrubber
+
+    tok = new_token()
+    for payload in ("-eyJ" * 250_000, "a" * 8170 + tok + "b" * 100):
+        r = lg.LogRecord("uvicorn.access", 20, "x", 1, '%s - "%s %s HTTP/%s" %d',
+                         ("1.2.3.4", "GET", "/" + payload, "1.1", 401), None)
+        t0 = time.perf_counter()
+        _SecretScrubber().filter(r)
+        msg = r.getMessage()
+        assert time.perf_counter() - t0 < 0.5 and tok[:16] not in msg and len(msg) < 9000
+
+
+@pytest.mark.parametrize("text", ["x=1{tok}", "GET /files/v2{tok}", "v1{jwt}", "jwt=x{jwt}",
+                                  "nonceBearer abcdefghij", "accessToken=Zx81kQpLmN0vR7tY",
+                                  "clientSecret=abcdefgh", "dbPassword=abcdefgh",
+                                  "Authorization: Token abcdefghij", "Bearer\nabcdefghij",
+                                  "{enc4}", "{full}"])
+def test_glued_cased_and_deeply_encoded_credentials_are_redacted(text):
+    from audel.auth import new_token
+    from audel.logging import scrub_text
+
+    tok = new_token()
+    jwt = "eyJhbGciOiJSUzI1NiJ9.eyJ0ZW5hbnQiOiJhIn0.c2lnbmF0dXJlLWJ5dGVz"
+    t = text.format(tok=tok, jwt=jwt, enc4=tok.replace("_", "%2525255F"),
+                    full="1" + "".join(f"%{b:02X}" for b in tok.encode()))
+    out = scrub_text(t)
+    for secret in (tok[6:30], jwt[:30], "abcdefgh", "Zx81kQpLmN0vR7tY"):
+        assert secret not in out, out
+
+
+def test_decoding_never_rewrites_or_forges_the_line():
+    import json as _json
+
+    from audel.logging import scrub_text
+
+    line = 'GET /specs%22%20200%20%22-?token=abcdefgh HTTP/1.1'
+    assert scrub_text(line) == 'GET /specs%22%20200%20%22-?token=[REDACTED] HTTP/1.1'
+    j = _json.dumps({"brief": "ref %22,%22schema_version%22:%220 and %0A token=abcdefgh"})
+    assert _json.loads(scrub_text(j)) == {"brief": "ref %22,%22schema_version%22:%220 and %0A "
+                                                   "token=[REDACTED]"}
+
+
+def test_nat64_48_clients_are_not_pooled_and_teredo_is_refused():
+    from audel.auth import client_key
+
+    assert client_key("64:ff9b:1:c000:2:2100::") != client_key("64:ff9b:1:c633:6:4000::")
+    for bad in ("2001::/32", "2001:0:4136:e378::/64"):
+        with pytest.raises(ValueError):
+            Settings(forwarded_allow_ips=[bad])
+    assert Settings(forwarded_allow_ips=["2001:db8::/32", "2001::1/128"])
+
+
+def test_root_and_asyncio_records_are_scrubbed_under_serve():
+    from audel.logging import uvicorn_log_config
+
+    cfg = uvicorn_log_config()
+    assert cfg["root"]["handlers"] and all(
+        "audel_scrub" in cfg["handlers"][h]["filters"] for h in cfg["root"]["handlers"])

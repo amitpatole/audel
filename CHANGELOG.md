@@ -121,6 +121,22 @@ All notable changes to Audel are recorded here. The format follows
     at most 2 fetches, in a pool of 8.
   - **Low-Medium.** Work abandoned while waiting on its tenant share still ran later. Abandonment now
     propagates through both waits.
+- Red-team round 9 fixes (auth surface), each pinned by a regression test:
+  - **High.** The round-8 redaction patterns were still quadratic on runs such as `_eyJ_eyJ...`,
+    so one unauthenticated request could stall the server. Redaction was redesigned to be
+    linear by construction: the text is split once into runs, each run is tested with substring
+    checks and fixed-length patterns, and a few keyword patterns can't backtrack. Each log field
+    is also capped at 8 KB before scrubbing, cut at a run boundary so a credential is never left
+    half-visible.
+  - **Low.** The round-8 boundary rule let credentials glued to other text (`x=1audel_...`),
+    camelCase keys (`accessToken=`), `Authorization: Token ...` and `Bearer` followed by a newline
+    through. These are redacted again.
+  - **Low.** A percent-encoded credential made the scrubber swap in the decoded line, which could
+    forge access-log fields or break JSON. A run is now redacted in its original encoding, and the
+    rest of the line is left as it was. Encodings up to five deep are recognised.
+  - **Info.** NAT64 clients outside the /96 form are bucketed by /64, the Teredo prefix can't be a
+    trusted proxy, and Helm refuses more spellings. Records from asyncio and the root logger, and
+    stack traces, are scrubbed too.
 - Red-team round 8 fixes (decode and timeline accuracy), each pinned by a regression test. 110
   legitimate and edge-case files grade with no new integrity findings.
   - **Medium.** A dropout of 60 s or more in MP4, MOV or MKV was treated as a timestamp splice and,

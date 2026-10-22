@@ -327,7 +327,9 @@ def _nat64():
     import ipaddress
 
     class _Nets:
-        nets = (ipaddress.ip_network("64:ff9b::/96"), ipaddress.ip_network("64:ff9b:1::/48"))
+        # Only the /96 form carries the IPv4 address in the low 32 bits (RFC 6052); other
+        # embeddings (e.g. 64:ff9b:1::/48) are bucketed by /64 like any IPv6 client.
+        nets = (ipaddress.ip_network("64:ff9b::/96"),)
 
         def __contains__(self, ip) -> bool:
             return any(ip in n for n in self.nets)

@@ -244,7 +244,9 @@ class Settings(BaseSettings):
                 for v4ish, v4floor in ((ipaddress.ip_network("::ffff:0:0/96"), 104),
                                        (ipaddress.ip_network("::/96"), 104),
                                        (ipaddress.ip_network("64:ff9b::/96"), 104),
-                                       (ipaddress.ip_network("64:ff9b:1::/48"), 104)):
+                                       (ipaddress.ip_network("64:ff9b:1::/48"), 104),
+                                       # Teredo: any internet host can hold an address here.
+                                       (ipaddress.ip_network("2001::/32"), 128)):
                     if net.overlaps(v4ish):
                         floor = max(floor, v4floor)
             if net.prefixlen < floor:
