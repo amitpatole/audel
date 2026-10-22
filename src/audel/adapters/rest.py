@@ -76,7 +76,10 @@ def _public(report: Report) -> dict:
 
 
 def _request_id(raw: str | None) -> str:
-    if raw and 0 < len(raw) <= 64 and set(raw) <= _REQUEST_ID_OK:
+    from ..logging import scrub_text
+
+    # A client id that looks like a credential would be blanked in the audit trail: mint one.
+    if raw and 0 < len(raw) <= 64 and set(raw) <= _REQUEST_ID_OK and scrub_text(raw) == raw:
         return raw
     return uuid.uuid4().hex
 

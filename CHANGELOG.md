@@ -121,6 +121,20 @@ All notable changes to Audel are recorded here. The format follows
     at most 2 fetches, in a pool of 8.
   - **Low-Medium.** Work abandoned while waiting on its tenant share still ran later. Abandonment now
     propagates through both waits.
+- Red-team round 12 fixes (auth surface), each pinned by a regression test. No bypass,
+  escalation, credential disclosure or log forgery was found.
+  - **Low-Medium.** JWT-like floods still cost about 8x ordinary text to scrub. Header checks and
+    percent-decoding now share bounded per-call budgets, and the key/value patterns run only when
+    a keyword is present (an 8 KB field costs well under a millisecond in the common case).
+  - **Low.** A JWT whose first header key was longer than 14 characters escaped; keys up to 32
+    printable characters are covered.
+  - **Low.** Credentials in Python repr shapes (`b'...'`, header tuples), quoted multi-word values
+    and camelCase short keys (`dbPass=`) are redacted.
+  - **Low.** Over-redaction that hurt audit and log use is gone: provider keys use their real
+    case-sensitive shapes (so names like `aizawa-studios` survive), long legitimate percent-encoded
+    URLs are kept, and prose such as `VERDICT PASS: loudness_ok`, `credential: missing` or
+    `authorization: required` is not redacted. A client request id that looks like a credential is
+    replaced instead of blanked, and uvicorn's own lines keep their arguments.
 - Red-team round 11 fixes (network surface), each pinned by a regression test. A real-media leak
   stress (with `netflix` grades, disconnects, deletes and timeouts) returned processes, fds, temp
   files and counters to baseline.

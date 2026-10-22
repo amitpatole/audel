@@ -3373,7 +3373,7 @@ def test_abandoned_work_makes_others_wait_not_fail(tmp_path, media, monkeypatch)
     import audel.core as core
 
     def slow(*a, **k):
-        time.sleep(3)
+        time.sleep(6)
         raise UnsafeSourceError("stub")
 
     async def slow_check(*a, **k):
@@ -3386,15 +3386,89 @@ def test_abandoned_work_makes_others_wait_not_fail(tmp_path, media, monkeypatch)
         started.append(1)
         return await real_check(*a, **k)
 
-    s = Settings(cache_dir=tmp_path / "ws", max_concurrent_jobs=1, request_timeout_s=1.0,
+    s = Settings(cache_dir=tmp_path / "ws", max_concurrent_jobs=1, request_timeout_s=4.0,
                  queue_wait_s=10)
     with TestClient(build_app(settings=s)) as c:
         monkeypatch.setattr(core, "check", slow_check)
         body = media["good"].read_bytes()
         t = threading.Thread(target=lambda: c.post("/check", files={"file": ("a.wav", body)}))
         t.start()
-        time.sleep(1.5)                                  # the first request has timed out
+        time.sleep(4.5)                                  # the first request has timed out
         monkeypatch.setattr(core, "check", check_tracking)
         r = c.post("/check", files={"file": ("a.wav", body, "audio/wav")})
         t.join()
     assert started and r.status_code == 200, (r.status_code, r.text)  # waited, then ran
+
+
+# ==== round 12, auth surface ==================================================================
+
+@pytest.mark.parametrize("unit", ["eyJeyJeyJeyJeyJeyJeyJeyJeyJeyJeyJeyJeyJeyJeyJeyJ.ab.cd.",
+                                  "%25252541%41!", "x.y.z.", "a"])
+def test_scrub_cost_is_bounded_per_field_in_cpu_time(unit):
+    from audel.logging import scrub_text
+
+    text = unit * (8192 // len(unit))
+    best = 9.0
+    for _ in range(5):
+        t0 = time.process_time()
+        scrub_text(text)
+        best = min(best, time.process_time() - t0)
+    assert best < 0.03, best      # JWT-candidate floods were ~15 ms per 8 KB field
+
+
+@pytest.mark.parametrize("text", [
+    "dbPass=hunter22", "userPwd=s3cr3t!!", "apiSig=abcdef123", "{'password': b'hunter2hunter2'}",
+    "[(b'authorization', b'Basic dXNlcjpwYXNzd29yZA==')]", "[('x-api-key', 'AbCdEf123456')]",
+    "password = 'correct horse battery'", "Authorization: Token abcdefghij"])
+def test_repr_camelcase_and_quoted_credentials_are_redacted(text):
+    from audel.logging import scrub_text
+
+    out = scrub_text(text)
+    for secret in ("hunter2", "s3cr3t", "abcdef123", "dXNlcjpw", "AbCdEf123456", "horse",
+                   "abcdefghij"):
+        assert secret not in out, out
+
+
+def test_long_header_key_jwts_are_redacted():
+    import base64
+
+    from audel.logging import scrub_text
+
+    def b64(b):
+        return base64.urlsafe_b64encode(b).decode().rstrip("=")
+
+    for n in (15, 24, 32):
+        header = b'{"' + b"k" * n + b'":"v","alg":"RS256"}'
+        jwt = b64(header) + "." + b64(b'{"t":1}') + ".c2ln"
+        assert scrub_text(jwt) == "[REDACTED]", n
+
+
+@pytest.mark.parametrize("text", ['{"tenant": "jwt:aizawa-studios"}',
+                                  "ingest from sk-broadband.co.kr failed", "COMPASS: northwest",
+                                  "VERDICT PASS: loudness_ok_all", "signature: verified ok",
+                                  "credential: missing_or_expired", "pass: dialogue_loudness",
+                                  "authorization: required for this endpoint"])
+def test_names_and_prose_survive_in_audit_and_logs(text):
+    from audel.logging import scrub_text
+
+    assert scrub_text(text) == text
+
+
+def test_legitimate_percent_encoded_urls_are_not_redacted():
+    from audel.logging import scrub_text
+
+    url = "&".join("tag=caf%C3%A9_au_lait" for _ in range(180))
+    assert "[REDACTED]" not in scrub_text(url)
+
+
+def test_credential_like_request_ids_are_replaced_not_blanked():
+    from audel.adapters.rest import _request_id
+
+    assert _request_id("job-42.retry-1") == "job-42.retry-1"
+    rid = _request_id("eyJhbGciOiJIUzI1NiJ9.eyJ0IjoxfQ.c2lnbmF0dXJl")
+    assert rid != "eyJhbGciOiJIUzI1NiJ9.eyJ0IjoxfQ.c2lnbmF0dXJl" and len(rid) == 32
+
+
+def test_uvicorn_error_records_keep_their_arguments():
+    out = _emit("Uvicorn running on %s://%s:%d", "http", "127.0.0.1", 8000, name="uvicorn.error")
+    assert out == "Uvicorn running on http://127.0.0.1:8000"

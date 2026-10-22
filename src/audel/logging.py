@@ -25,21 +25,35 @@ _RUN_CH = re.compile(r"[A-Za-z0-9_.~+/=%\-]")
 _PCT = re.compile(r"%[0-9A-Fa-f]{2}")
 _TOKCH = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-")
 _MINTED = re.compile(r"audel_[A-Za-z0-9_\-]{43}_[a-z2-7]{8}", re.IGNORECASE)        # fixed length
-_PROVIDER = re.compile(r"(?<![A-Za-z0-9])(?:sk-|AIza)[A-Za-z0-9_\-]{8}", re.IGNORECASE)
-# Keys whose value is a credential whatever it looks like (when assigned), and the weaker
-# ``token`` / ``key`` family, whose ``key: value`` prose is redacted only for credential-like values.
+# Real provider-key shapes, case-sensitive (so "aizawa-studios" or "sk-broadband.co.kr" are names).
+_PROVIDER = re.compile(r"(?<![A-Za-z0-9])(?:AIza[0-9A-Za-z_\-]{35}|sk-[A-Za-z0-9_\-]{20,}+)")
+# Keys whose value is a credential whatever it looks like when assigned or quoted. Short keys
+# (pwd/pass/sig) only as whole words or a camelCase suffix (not "compass:", "bypass=", "COMPASS:").
 _STRONG_KEYS = (r"password|passwd|passphrase|secret|client[_-]?secret|api[_-]?key|apikey"
-                r"|access[_-]?key|private[_-]?key|credentials?|signature"
-                # short keys only as whole words (not "compass:", "bypass=", "design:")
-                r"|(?-i:(?<![a-z]))(?:pwd|pass|sig)")
+                r"|access[_-]?key|private[_-]?key|auth[_-]?token|x-api-key"
+                r"|(?<![A-Za-z])(?:pwd|pass|sig)(?![A-Za-z])|(?-i:(?<=[a-z])(?:Pwd|Pass|Sig))")
+# Weaker keys: ``key: value`` prose after them is redacted only for credential-like values.
+_WEAK_KEYS = r"token|signature|credentials?"
+_KEYS = "(?:" + _STRONG_KEYS + "|" + _WEAK_KEYS + ")"
+# Unquoted value: up to whitespace / separators.
 _KV = re.compile(
-    r"((?:" + _STRONG_KEYS + r"|token)([\"'`]?+)[ \t]*+([:=])[ \t]*+[\"'`]?+)"
+    r"(" + _KEYS + r"([\"'`]?+)[ \t]*+([:=])[ \t]*+[\"'`]?+)"
     r"([^\s&\"'`,;<>\\]{6,}+)", re.IGNORECASE)
-_AUTHZ = re.compile(r"(authorization[\"'`]?+[ \t]*+[:=][ \t]*+[\"'`]?+)"
+# Quoted value (JSON / Python repr / header tuples), redacted up to its closing quote, spaces and
+# all: ``"password": "correct horse"``, ``{'password': b'x'}``, ``('x-api-key', 'abc')``.
+_KVQ = re.compile(
+    r"((?:" + _KEYS + r"|authorization|cookie|set-cookie)[\"'`]?+[ \t]*+(?:[:=]|,)[ \t]*+b?([\"'`]))([^\"'`\n\\]{4,256}+)(?=\2)",
+    re.IGNORECASE)
+_KV_HINT = ("pass", "pwd", "secret", "key", "credential", "signature", "sig", "token",
+            "authorization", "cookie")
+_AUTHZ = re.compile(r"(authorization([\"'`]?+)[ \t]*+([:=])[ \t]*+([\"'`]?+))"
                     r"((?:[A-Za-z][A-Za-z0-9_-]{1,31}\s++)?+[^\s\"'`,;\\]++)", re.IGNORECASE)
 _BEARER = re.compile(r"(bearer\s++)([A-Za-z0-9._~+/=\-]{8,}+)", re.IGNORECASE)
-_SECRETISH = frozenset("0123456789._~+/=-%")
-_STRONG_RE = re.compile(_STRONG_KEYS, re.IGNORECASE)
+_SECRETISH = frozenset("0123456789.~+/=%")  # not "_" or "-": snake_case / kebab-case are words
+# Keys explicit even in ``key: value`` prose. The short keys, "signature" and "credential" are
+# not: "VERDICT PASS: loudness_ok", "credential: missing" are prose unless the value looks secret.
+_EXPLICIT_RE = re.compile(r"password|passwd|passphrase|secret|api[_-]?key|apikey|access[_-]?key"
+                          r"|private[_-]?key|auth[_-]?token|x-api-key", re.IGNORECASE)
 
 
 def _looks_secret(value: str) -> bool:
@@ -52,19 +66,26 @@ def _looks_secret(value: str) -> bool:
 
 
 _MAX_UNQUOTE = 5
-_DECODE_BUDGET = 256  # percent-decodings per scrub call; past it, encoded runs fail closed
-_JWT_HDR = re.compile(r'\{\s*"[^"\\]{1,32}"\s*:')
+_DECODE_CHARS = 2 * 8192   # characters percent-decoded per scrub call; past it, fail closed
+_HEADER_TRIES = 64         # JWT header decodes per scrub call; past it, candidates fail closed
+_JWT_HDR = re.compile(r'\{\s*"[ !#-\[\]-~]{1,32}"\s*:')  # printable key, up to 32 chars
 _JWT_PREFIX = ("eyj", "eya", "ewo", "ew0", "ewk")  # base64url of '{"', '{ "', '{\n', '{\r', '{\t'
-_JWT_TRIES = 16
 _JWT_ANY = re.compile(r"e(?:y[ja]|w[o0k])", re.IGNORECASE)
+
+
+class _Budget:
+    """Per-call work budgets: hostile text can't cost more than a bounded amount of decoding."""
+
+    __slots__ = ("chars", "headers")
+
+    def __init__(self) -> None:
+        self.chars, self.headers = _DECODE_CHARS, _HEADER_TRIES
 
 
 def _jwt_header(chunk: str) -> bool:
     """The candidate header really is base64url JSON (``{"alg":`` ...), not a word that happens to
-    contain "eyJ" (``honeyJar``, ``keyArchive``). Fixed cost: at most 24 characters decoded."""
-    import base64
-    import binascii
-
+    contain "eyJ" (``honeyJar``, ``keyArchive``). Fixed cost: at most 56 characters decoded,
+    enough for a first key of up to 32 characters."""
     chunk = chunk[: len(chunk) // 4 * 4]
     try:
         dec = base64.urlsafe_b64decode(chunk).decode("latin-1")
@@ -73,9 +94,10 @@ def _jwt_header(chunk: str) -> bool:
     return _JWT_HDR.match(dec) is not None
 
 
-def _jwt_in(run: str) -> bool:
+def _jwt_in(run: str, budget: _Budget) -> bool:
     """A JWT inside a run, in linear time: every header candidate in a segment's token-character
-    tail is tried (bounded), so text glued in front of a JWT can't hide it."""
+    tail is tried, within the call's header budget (spent: fail closed), so text glued in front of
+    a JWT can't hide it and floods of candidates can't make scrubbing costly."""
     if run.count(".") < 2 or _JWT_ANY.search(run) is None:
         return False
     segs = run.split(".")
@@ -90,70 +112,79 @@ def _jwt_in(run: str) -> bool:
             j -= 1
         tail = seg[j:]
         low_t = tail.lower()
-        tries = 0
-        for k in range(len(tail) - 1):
-            if low_t[k:k + 2] in ("ey", "ew") and low_t[k:k + 3] in _JWT_PREFIX:
-                tries += 1
-                if len(tail) - k >= 8 and _jwt_header(tail[k:k + 24]):
-                    return True
-                if tries >= _JWT_TRIES:
-                    break
-    return False
-
-
-def _credential(run: str) -> bool:
-    if _KNOWN_RE is not None and _KNOWN_RE.search(run):
-        return True
-    low = run.lower()
-    return bool(("audel" in low and _MINTED.search(run))
-                or (("sk-" in low or "aiza" in low) and _PROVIDER.search(run))
-                or _jwt_in(run))
-
-
-def _run_holds_secret(run: str, budget: list[int]) -> bool:
-    if _credential(run):
-        return True
-    if "%" in run and _PCT.search(run):  # a credential may be percent-encoded, even repeatedly
-        cur = run
-        for _ in range(_MAX_UNQUOTE):
-            if budget[0] <= 0:
-                return True  # decode budget spent: an encoded run fails closed (redacted)
-            budget[0] -= 1
-            nxt = unquote(cur)
-            if nxt == cur:
+        for m in _JWT_ANY.finditer(low_t):
+            k = m.start()
+            if len(tail) - k < 8:
                 break
-            cur = nxt
-            if _credential(cur):
+            if budget.headers <= 0:
+                return True  # header budget spent: a remaining candidate fails closed
+            budget.headers -= 1
+            if _jwt_header(tail[k:k + 56]):
                 return True
     return False
 
 
-from urllib.parse import unquote  # noqa: E402 - kept beside its only use
+def _credential(run: str, budget: _Budget, *, decoded: bool = False) -> bool:
+    # Registered values in the RAW text were already replaced by value; only decoded forms
+    # need the check here.
+    if decoded and any(sec in run for sec in _KNOWN_SECRETS):
+        return True
+    low = run.lower()
+    return bool(("audel" in low and _MINTED.search(run))
+                or (("sk-" in low or "aiza" in low) and _PROVIDER.search(run))
+                or _jwt_in(run, budget))
+
+
+def _run_holds_secret(run: str, budget: _Budget) -> bool:
+    if _credential(run, budget):
+        return True
+    cur = run
+    for _ in range(_MAX_UNQUOTE):  # a credential may be percent-encoded, even repeatedly
+        if "%" not in cur or not _PCT.search(cur):
+            break  # nothing left to decode: no charge
+        if budget.chars < len(cur):
+            return True  # decode budget spent: an encoded run fails closed (redacted)
+        budget.chars -= len(cur)
+        cur = unquote(cur)
+        if _credential(cur, budget, decoded=True):
+            return True
+    return False
+
+
+import base64  # noqa: E402
+import binascii  # noqa: E402
+from urllib.parse import unquote  # noqa: E402
 
 _LOGGER_NAME = "audel"
 
 # Exact secret VALUES resolved at runtime (provider keys, the API token). Value-based scrubbing
 # is sound where the regex is only a backstop; config registers every key it resolves.
 _KNOWN_SECRETS: set[str] = set()
-_KNOWN_RE: re.Pattern | None = None  # one compiled alternation: a C-speed check per run
 
 
 def register_secret(value: str | None) -> None:
     """Register a resolved secret value so it is redacted from any log line. No-op for short or
     empty values (avoids redacting innocuous substrings)."""
-    global _KNOWN_RE
-    if value and len(value) >= 6 and value not in _KNOWN_SECRETS:
+    if value and len(value) >= 6:
         _KNOWN_SECRETS.add(value)
-        _KNOWN_RE = re.compile("|".join(re.escape(v) for v in
-                                        sorted(_KNOWN_SECRETS, key=len, reverse=True)))
 
 
 def _kv(m: re.Match) -> str:
     key, quote, sep, value = m.group(1), m.group(2), m.group(3), m.group(4)
     # An assignment (``=``), a quoted JSON/YAML key, or a strong key is a credential whatever
-    # the value looks like; ``token: expired`` prose is redacted only for credential-like values.
-    explicit = sep == "=" or bool(quote) or _STRONG_RE.search(key) is not None
+    # the value looks like; prose after a weak key (``token: expired``, ``signature: verified``)
+    # is redacted only for credential-like values.
+    explicit = sep == "=" or bool(quote) or _EXPLICIT_RE.search(key) is not None
     return key + "[REDACTED]" if explicit or _looks_secret(value) else m.group()
+
+
+def _authz(m: re.Match) -> str:
+    # ``Authorization: <scheme> <credential>`` and ``authorization="..."`` are credentials; prose
+    # (``authorization: required for this endpoint``) is kept.
+    value = m.group(5)
+    scheme = " " in value and value[:1].isupper()  # "<Scheme> <credential>": Basic, Token, SSWS
+    explicit = m.group(3) == "=" or bool(m.group(2)) or bool(m.group(4)) or scheme
+    return m.group(1) + "[REDACTED]" if explicit or _looks_secret(value) else m.group()
 
 
 def scrub_text(text: str) -> str:
@@ -164,10 +195,17 @@ def scrub_text(text: str) -> str:
     holding a credential is replaced whole, in its original encoding, so the rest of the line
     is left exactly as it was. Used by the workspace so a credential can never reach disk via
     persisted session state, and by the log filter below."""
-    text = _AUTHZ.sub(lambda m: m.group(1) + "[REDACTED]", _scrub_shapes(text))
-    text = _BEARER.sub(lambda m: m.group(1) + "[REDACTED]" if _looks_secret(m.group(2))
-                       else m.group(), text)
-    return _KV.sub(_kv, text)
+    text = _scrub_shapes(text)
+    low = text.lower()
+    if "authorization" in low:
+        text = _AUTHZ.sub(_authz, text)
+    if "bearer" in low:
+        text = _BEARER.sub(lambda m: m.group(1) + "[REDACTED]" if _looks_secret(m.group(2))
+                           else m.group(), text)
+    if any(h in low for h in _KV_HINT):  # every key contains one of these: skip the regexes
+        text = _KVQ.sub(lambda m: m.group(1) + "[REDACTED]", text)
+        text = _KV.sub(_kv, text)
+    return text
 
 
 def _scrub_shapes(text: str) -> str:
@@ -175,7 +213,7 @@ def _scrub_shapes(text: str) -> str:
     for secret in sorted(_KNOWN_SECRETS, key=len, reverse=True):  # longest first
         if secret in text:
             text = text.replace(secret, "[REDACTED]")
-    budget = [_DECODE_BUDGET]
+    budget = _Budget()
     return _RUN.sub(lambda m: "[REDACTED]" if _run_holds_secret(m.group(), budget)
                     else m.group(), text)
 
@@ -201,15 +239,17 @@ def _clip(text: str) -> str:
 
 # Records whose formatter unpacks a fixed argument tuple. Their templates are fixed (uvicorn's),
 # so each argument is a separate field: scrubbed once, in place.
-_TUPLE_FORMATTED = ("uvicorn.access",)
+_TUPLE_FORMATTED = ("uvicorn.access", "uvicorn.error")
 
 
 class _SecretScrubber(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003
         if record.name in _TUPLE_FORMATTED and isinstance(record.args, tuple) \
                 and isinstance(record.msg, str):
-            record.args = tuple(scrub_text(_clip(a)) if isinstance(a, str) else a
-                                for a in record.args)
+            record.args = tuple(
+                a if isinstance(a, (int, float)) and not isinstance(a, bool)
+                else scrub_text(_clip(a if isinstance(a, str) else str(a)))
+                for a in record.args)  # numbers stay numbers (``%d``); anything else is text
         else:
             # Everything else: render first (``str()`` of any message or argument object, so an
             # exception or a dict is covered), then scrub the whole line once and flatten. A
