@@ -3665,7 +3665,8 @@ def test_our_proxys_busy_reply_and_wrapped_host_errors_are_busy():
     assert _upstream_failure(OSError(errno.EMFILE, "x")) == BUSY_STATUS
     assert _upstream_failure(OSError(errno.ECONNREFUSED, "x")) == b"502 Bad Gateway"
     assert _host_failure(urllib.error.URLError(OSError(errno.EMFILE, "Too many open files")))
-    assert _host_failure(OSError("Tunnel connection failed: 503 Audel Host Busy"))
+    # Round 14: response text is the origin's to choose; it is never a busy signal.
+    assert not _host_failure(OSError("Tunnel connection failed: 503 Audel Host Busy"))
     assert not _host_failure(urllib.error.URLError(OSError(errno.ECONNREFUSED, "refused")))
 
 
@@ -3731,3 +3732,71 @@ def test_speech_detection_streams_and_never_writes_a_temp_file(tmp_path, monkeyp
     f = _real_speech(tmp_path)
     monkeypatch.setattr(tempfile, "mkstemp", no_temp)
     assert speech_regions(f, Settings(), stream=0, labels=["FC"], channels=1)
+
+
+# ==== round 14, network + auth surfaces =======================================================
+
+def test_an_origin_cannot_forge_host_busy():
+    import urllib.error
+
+    from audel.ingest import _host_failure
+
+    for reason in ("Audel Host Busy", "Forbidden (Audel Host Busy)"):
+        for code in (503, 404, 403):
+            err = urllib.error.HTTPError("http://o/a.wav", code, reason, {}, None)
+            assert not _host_failure(err)
+
+
+def test_only_our_proxys_own_refusal_marks_it_busy():
+    import errno
+
+    from audel.proxy import BUSY_STATUS, VettingProxy, _upstream_failure
+
+    proxy = VettingProxy()
+    assert proxy.host_busy is False
+    assert _upstream_failure(OSError(errno.EMFILE, "x")) == BUSY_STATUS
+
+
+def test_keyword_floods_never_blank_the_line_and_stay_cheap():
+    from audel.logging import scrub_text
+
+    line = "GET /jobs/PROBE-MARKER-2?q=" + "key" * 400
+    assert scrub_text(line).startswith("GET /jobs/PROBE-MARKER-2")
+    flood = "/x?" + "key=v&" * 300 + "password=hunter22"
+    out = scrub_text(flood)
+    assert "hunter22" not in out and out.startswith("/x?key=")
+    for unit in ("key", "pass", "ap", "authorization=a,", "monkey "):
+        text = unit * (8192 // len(unit)) + "key"
+        best = 9.0
+        for _ in range(5):
+            t0 = time.process_time()
+            scrub_text(text)
+            best = min(best, time.process_time() - t0)
+        assert best < 0.015, (unit, best)     # was up to 761 ms / 9 ms per 8 KB field
+
+
+@pytest.mark.parametrize("text", ["password=pa\\ss0rdHunter2xyz", "secret=ab\\cdefghijklmnop",
+                                  "password=ab;cdefghijkl", "password=ab,cdefghijkl",
+                                  "password=hunt3", "DB_PASSWORD=ab\\$cdefgh"])
+def test_explicit_assignments_redact_any_value(text):
+    from audel.logging import scrub_text
+
+    out = scrub_text(text)
+    assert out.endswith("[REDACTED]") and "=" in out, out
+
+
+@pytest.mark.parametrize("text", ['["pass", "warn", "fail"]', "{'verdict': 'pass', 'issues': 3}"])
+def test_bare_verdict_words_dont_redact_their_neighbours(text):
+    from audel.logging import scrub_text
+
+    assert scrub_text(text) == text
+
+
+@requires_ffmpeg
+def test_a_timed_out_stream_is_reaped_even_while_suspended(media):
+    from audel.mediaguard import stream_pcm16
+
+    gen = stream_pcm16(media["good"], Settings(), stream=0, channels=2, chunk_s=1, timeout_s=0.3)
+    next(gen)
+    time.sleep(1.0)                     # the watchdog fires while we hold the generator
+    gen.close()

@@ -42,6 +42,9 @@ class VettingProxy:
         self._lifetime = max_lifetime_s  # absolute cap per connection, however active it is
         self._active = 0  # in-flight connections (single-threaded asyncio → no lock needed)
         self._tasks: set[asyncio.Task] = set()
+        # Set when THIS proxy refused an upstream connection for lack of host resources. The
+        # ingest path trusts only this flag, never response text an origin could forge.
+        self.host_busy = False
 
     async def start(self) -> None:
         self._server = await asyncio.start_server(self._handle, self._host, 0)
@@ -116,7 +119,10 @@ class VettingProxy:
         try:
             up_r, up_w = await asyncio.open_connection(ip, port)
         except OSError as e:
-            return await _reply_close(writer, _upstream_failure(e))
+            reply = _upstream_failure(e)
+            if reply == BUSY_STATUS:
+                self.host_busy = True
+            return await _reply_close(writer, reply)
         except Exception:  # noqa: BLE001
             return await _reply_close(writer, b"502 Bad Gateway")
         writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
@@ -130,7 +136,10 @@ class VettingProxy:
         try:
             up_r, up_w = await asyncio.open_connection(ip, port)
         except OSError as e:
-            return await _reply_close(writer, _upstream_failure(e))
+            reply = _upstream_failure(e)
+            if reply == BUSY_STATUS:
+                self.host_busy = True
+            return await _reply_close(writer, reply)
         except Exception:  # noqa: BLE001
             return await _reply_close(writer, b"502 Bad Gateway")
         origin = path + (("?" + query) if query else "")

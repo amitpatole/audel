@@ -124,19 +124,12 @@ def _download(url: str, dest: Path, proxy_url: str, settings: Settings,
 
 
 def _host_failure(e: OSError) -> bool:
-    """A host-capacity failure, however urllib wraps it: our own errno, the reason inside a
-    URLError, or our vetting proxy's own busy reply (plain HTTP 503 or a refused tunnel)."""
-    import urllib.error
-
+    """A host-capacity failure in THIS process: our errno, or the errno inside a URLError.
+    Never response text: an origin controls its status line (see ``VettingProxy.host_busy``)."""
     if e.errno in _HOST_ERRNOS:
         return True
     reason = getattr(e, "reason", None)
-    if isinstance(reason, OSError) and reason.errno in _HOST_ERRNOS:
-        return True
-    if isinstance(e, urllib.error.HTTPError) and e.code == 503 and \
-            "Audel Host Busy" in str(getattr(e, "reason", "") or e.msg or ""):
-        return True
-    return "Audel Host Busy" in str(reason or e)
+    return isinstance(reason, OSError) and reason.errno in _HOST_ERRNOS
 
 
 _HOST_ERRNOS = frozenset(getattr(__import__("errno"), n) for n in
@@ -223,6 +216,8 @@ async def fetch_to_file(url: str, tmp_dir: Path, settings: Settings) -> Path:
         raise
     except Exception as e:  # noqa: BLE001 - normalize: never leak the URL (it may be signed)
         dest.unlink(missing_ok=True)
+        if proxy.host_busy:  # our own proxy ran out of resources for this download
+            raise BusyError("could not download: the host is at capacity; retry later") from None
         log.warning("ingest from %s failed: %s", url_host(url), type(e).__name__)
         raise UnsafeSourceError(f"could not fetch media from {url_host(url)!r}") from None
     except BaseException:  # cancellation / timeout: stop the thread, drop the partial file

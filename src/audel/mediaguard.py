@@ -1169,6 +1169,7 @@ def stream_pcm16(path: Path, settings: Settings, *, stream: int, channels: int,
             if time.monotonic() >= limit_at:
                 expired.set()
                 proc.kill()
+                proc.wait()  # reap now, even if the consumer holds the generator suspended
                 return
 
     watcher = threading.Thread(target=_watch, daemon=True, name="audel-pcm-watch")

@@ -41,14 +41,22 @@ _KEYS = "(?:" + _STRONG_KEYS + "|" + _WEAK_KEYS + ")"
 _KEY_START = r"(?=[pPsScCaAxXtT])"  # every key starts with one of these: skip other positions fast
 _KV = re.compile(
     _KEY_START + r"(" + _KEYS + r"([\"'`]?+)[ \t]*+([:=])[ \t]*+[\"'`]?+)"
-    r"([^\s&\"'`,;<>\\]{6,}+)", re.IGNORECASE)
+    r"([^\s&\"'`]{1,4096}+)", re.IGNORECASE)
 # Quoted value (JSON / Python repr / header tuples), redacted up to its closing quote, spaces and
 # all: ``"password": "correct horse"``, ``{'password': b'x'}``, ``('x-api-key', 'abc')``.
 _KVQ = re.compile(
-    _KEY_START + r"((?:" + _KEYS + r"|authorization|cookie|set-cookie)[\"'`]?+[ \t]*+(?:[:=]|,)[ \t]*+b?([\"'`]))"
+    _KEY_START + r"((?:" + _KEYS + r"|authorization|cookie|set-cookie)[\"'`]?+[ \t]*+[:=][ \t]*+b?([\"'`]))"
     r"((?:[^\"'`\n\\]|\\.|(?!\2)[\"'`]){4,4096}+)(?=\2)",
     re.IGNORECASE)
-_MAX_KEYWORDS = 128
+_HEADER_KEYS = (r"(?:proxy-)?authorization|set-cookie|cookie|x-api-key|api-key|apikey|x-auth-token"
+                r"|x-amz-security-token|x-goog-api-key|private-token")
+# Header tuples: ``(b'authorization', b'Basic ...')``, ``('x-api-key', 'abc')``. Only in a tuple
+# or list opening, so a bare "pass" in ``['pass', 'warn']`` doesn't redact its neighbour.
+_KVT = re.compile(
+    r"([\(\[][ \t]*+b?[\"'](?:" + _HEADER_KEYS + r")[\"'][ \t]*+,"
+    r"[ \t]*+b?([\"']))((?:[^\"'\n\\]|\\.|(?!\2)[\"']){1,4096}+)(?=\2)", re.IGNORECASE)
+_MAX_KEYWORDS = 128   # keyword positions matched with the patterns; beyond, a linear fallback
+_KEY_BACK = 8         # a key starts at most this far before its hint ("client_" + "secret")
 _KV_HINT = ("pass", "pwd", "secret", "key", "credential", "signature", "sig", "token",
             "authorization", "cookie")
 _AUTHZ = re.compile(r"(authorization([\"'`]?+)[ \t]*+([:=])[ \t]*+([\"'`]?+))"
@@ -178,10 +186,69 @@ def register_secret(value: str | None) -> None:
 def _kv(m: re.Match) -> str:
     key, quote, sep, value = m.group(1), m.group(2), m.group(3), m.group(4)
     # An assignment (``=``), a quoted JSON/YAML key, or a strong key is a credential whatever
-    # the value looks like; prose after a weak key (``token: expired``, ``signature: verified``)
-    # is redacted only for credential-like values.
+    # the value looks like, short or with punctuation; prose after a weak key (``token:
+    # expired``, ``signature: verified``) is redacted only for credential-like values.
     explicit = sep == "=" or bool(quote) or _EXPLICIT_RE.search(key) is not None
-    return key + "[REDACTED]" if explicit or _looks_secret(value) else m.group()
+    if explicit or (len(value) >= 6 and _looks_secret(value.rstrip(",;.)"))):
+        return key + "[REDACTED]"
+    return m.group()
+
+
+_HINT_RE = re.compile("|".join(_KV_HINT))
+_VALUE_END = frozenset(" \t\r\n\"'`&")
+_KEY_FIRST = frozenset("pscaxt([")  # first characters of every key, and of a tuple opening
+
+
+def _scrub_keywords(text: str) -> str:
+    """Key/value credentials, in linear time: the patterns run only at keyword positions (found
+    with plain substring search), anchored, for the first ``_MAX_KEYWORDS``; any beyond get a
+    cheap value-only redaction. Nothing is blanked wholesale, so a flood of keywords can't hide
+    the rest of a line (the route of a probing request), nor make matching costly."""
+    low = text.lower()
+    hits: list[int] = []
+    for hm in _HINT_RE.finditer(low):  # in order, C-speed; stop just past the pattern budget
+        hits.append(hm.start())
+        if len(hits) > _MAX_KEYWORDS:
+            break
+    if not hits:
+        return text
+    out: list[str] = []
+    last = 0
+    tried = 0
+    for p in hits:
+        if p < last:
+            continue
+        if tried >= _MAX_KEYWORDS:
+            # Pattern budget spent: one C-speed pass redacts the value after any remaining
+            # keyword (fail closed), without per-keyword Python work.
+            out.append(text[last:p])
+            out.append(_FALLBACK.sub(lambda m: m.group(1) + "[REDACTED]", text[p:]))
+            return "".join(out)
+        tried += 1
+        span = None
+        for i in range(max(last, p - _KEY_BACK), p + 1):
+            if low[i] not in _KEY_FIRST:
+                continue  # no key (or tuple opening) starts here: skip the patterns
+            m = _KVT.match(text, i) or _KVQ.match(text, i)
+            if m:
+                span = (m.start(), m.end(), m.group(1) + "[REDACTED]")
+                break
+            m = _KV.match(text, i)
+            if m:
+                span = (m.start(), m.end(), _kv(m))
+                break
+        if span is not None:
+            out.append(text[last:span[0]])
+            out.append(span[2])
+            last = span[1]
+    out.append(text[last:])
+    return "".join(out)
+
+
+_FALLBACK = re.compile(
+    r"((?:pass|pwd|secret|key|credential|signature|sig|token|authorization|cookie)"
+    r"[A-Za-z_\-]{0,24}+[\"'`]?+[ \t]*+[:=][ \t]*+[\"'`]?+)([^\s\"'`&]{1,4096}+)",
+    re.IGNORECASE)
 
 
 def _authz(m: re.Match) -> str:
@@ -208,20 +275,13 @@ def scrub_text(text: str) -> str:
     persisted session state, and by the log filter below."""
     text = _scrub_shapes(text)
     low = text.lower()
-    if sum(low.count(h) for h in _KV_HINT) > _MAX_KEYWORDS:
-        # Hundreds of credential keywords in one field is a flood, not a log line: redact it
-        # whole (fail closed) rather than spend per-keyword matching on it.
-        return "[REDACTED: too many credential keywords]"
     if "authorization" in low:
         text = _AUTHZ.sub(_authz, text)
     if "bearer" in low:
         text = _BEARER.sub(lambda m: m.group(1) + "[REDACTED]"
                        if _looks_secret(m.group(2)) or any(c in "_-" for c in m.group(2))
                        else m.group(), text)
-    if any(h in low for h in _KV_HINT):  # every key contains one of these: skip the regexes
-        text = _KVQ.sub(lambda m: m.group(1) + "[REDACTED]", text)
-        text = _KV.sub(_kv, text)
-    return text
+    return _scrub_keywords(text)
 
 
 def _scrub_shapes(text: str) -> str:

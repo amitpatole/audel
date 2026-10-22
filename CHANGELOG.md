@@ -121,6 +121,18 @@ All notable changes to Audel are recorded here. The format follows
     at most 2 fetches, in a pool of 8.
   - **Low-Medium.** Work abandoned while waiting on its tenant share still ran later. Abandonment now
     propagates through both waits.
+- Red-team round 14 fixes (network and auth surfaces), each pinned by a regression test. No
+  bypass, escalation or disclosure was found; the leak stress returned to baseline.
+  - **Low-Medium.** A remote origin could send a status line containing Audel's own "busy" text
+    and make its bad file retry forever. Busy is now decided only by a flag the vetting proxy sets
+    on itself, never by response text.
+  - **Low-Medium.** The keyword cap blanked whole log fields, which let a client hide its requests
+    from the access log, and keyword matching could still cost about 40x on crafted text.
+    Keywords are now found with a linear search, the patterns run only at those positions, and
+    past a budget one C-speed pass redacts just the values. No line is blanked.
+  - **Low.** An explicit assignment (`password=...`) redacts its value whatever it contains or
+    however short it is. A bare `"pass"` in a list no longer redacts its neighbour.
+  - **Info.** A decode stopped by its watchdog is reaped at once.
 - Red-team round 13 fixes (dialogue gating), each pinned by a regression test. 227 files grade
   as before under both specs.
   - **Medium.** An inaudible subsonic signal in one channel inflated its raw level, so the real
