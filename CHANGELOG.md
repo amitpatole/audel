@@ -121,6 +121,23 @@ All notable changes to Audel are recorded here. The format follows
     at most 2 fetches, in a pool of 8.
   - **Low-Medium.** Work abandoned while waiting on its tenant share still ran later. Abandonment now
     propagates through both waits.
+- Red-team round 11 fixes (auth and decode surfaces), each pinned by a regression test:
+  - **Medium.** Round 10's narrower log filter skipped messages and arguments that weren't strings
+    (an exception, a dict), registered secrets included. Every record except uvicorn's access
+    lines is now rendered first and scrubbed as one line, which also covers a keyword in the
+    template with its credential in an argument. A template that fails to format no longer prints
+    its raw arguments.
+  - **Medium.** Nested percent-encodings brought back a costly scrub (about 9x fewer requests per
+    second). Runs shorter than any credential shape never reach Python, per-run checks are compiled
+    patterns, decoding has a per-call budget past which encoded runs are redacted, and each access
+    field is scrubbed once. Hostile text now costs about what ordinary text does.
+  - **Low-Medium.** JSON and INI credentials (`"password": "..."`, `api_key = ...`), any
+    `Authorization` scheme (`SSWS`, `Splunk`, `AWS4-HMAC-SHA256`), mixed-case bearer tokens,
+    values with special characters, signed-URL signatures, JWTs behind glued text or with long,
+    hyphenated or pretty-printed headers are redacted. Short keys like `pass` or `sig` match only
+    as whole words, so `compass:` and `design:` stay readable.
+  - **Low-Medium.** Listed missing-packet gaps totalling more than 10% of a track are now an
+    error, matching the spread-loss rule.
 - Red-team round 10 fixes (decode and accuracy), each pinned by a regression test. 212 legitimate
   and edge-case files grade with no new integrity findings.
   - **Medium.** Undoing a stray packet's gap also pulled the track's end back, so a sustained decoy

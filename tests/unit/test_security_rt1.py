@@ -562,11 +562,11 @@ def test_caption_and_script_cost_is_bounded():
     from audel.speech.listening import align_script
 
     t = _big_transcript(30_000)
-    t0 = time.monotonic()
+    t0 = time.process_time()   # CPU time: the shared test host's wall clock is too noisy
     align_script(" ".join(["the"] * 30_000), t, 9_000_000)
     cues = [Cue(i * 500, i * 500 + 2000, "the " * 60) for i in range(20_000)]
     issues, _ = caption_issues(cues, t, Settings(), 9_000_000)
-    assert time.monotonic() - t0 < 30
+    assert time.process_time() - t0 < 30
 
 
 def test_windowed_alignment_still_finds_a_dropped_line():
@@ -2600,12 +2600,12 @@ def test_cut_alaw_aifc_is_caught(tmp_path):
 def test_scrubbing_is_linear_for_every_shape(unit):
     from audel.logging import scrub_text
 
-    def best(text):
+    def best(text):  # CPU time: wall clock on a shared host is too noisy for a ratio
         out = []
         for _ in range(3):
-            t0 = time.perf_counter()
+            t0 = time.process_time()
             scrub_text(text)
-            out.append(time.perf_counter() - t0)
+            out.append(time.process_time() - t0)
         return min(out)
 
     t_small = best(unit * (64_000 // len(unit)))
@@ -3159,3 +3159,114 @@ def test_decoder_cause_ignores_metadata_tag_lines():
     tail = ("  Metadata:\n    title           : ERROR invalid stream failed\n"
             "[aac @ 0x1] Changing audio frame properties on the fly is not supported.\n")
     assert "Changing audio frame properties" in _cause(tail)
+
+
+# ==== round 11, auth surface ==================================================================
+
+def _emit(msg, *args, name="audel.rest"):
+    import logging as lg
+
+    from audel.logging import _SecretScrubber
+
+    rec = lg.LogRecord(name, 30, "x", 1, msg, args or None, None)
+    _SecretScrubber().filter(rec)
+    return rec.getMessage()
+
+
+def test_non_string_messages_and_arguments_are_scrubbed():
+    from audel.auth import new_token
+    from audel.logging import register_secret
+
+    register_secret("Zx81kQpLmN0vR7tYreg")
+    tok = new_token()
+    out = " | ".join([
+        _emit(RuntimeError("provider said api_key=AIzaSyA1234567890abcdefghijklmn")),
+        _emit(RuntimeError("key Zx81kQpLmN0vR7tYreg")),
+        _emit(RuntimeError(f"bad {tok}")),
+        _emit("decode failed: %s", RuntimeError("ffmpeg: https://h/a.wav?token=Zx81kQpLmN0vR7tY")),
+        _emit("cfg %s", {"password": "hunter2hunter2"}),
+    ])
+    for secret in ("AIzaSyA1234567890", "Zx81kQpLmN0vR7tY", tok[6:30], "hunter2hunter2"):
+        assert secret not in out, out
+
+
+@pytest.mark.parametrize("msg,args", [("api_key=%s", ("Zx81kQpLmN0vR7tY",)),
+                                      ("login failed password=%s", ("Zx81kQpLmN0vR7tY",)),
+                                      ("token: %s", ("Zx81kQpLmN0vR7tY",)),
+                                      ("%s=%s", ("token", "Zx81kQpLmN0vR7tY")),
+                                      ("token=%s%s", ("Zx81kQp", "LmN0vR7tY"))])
+def test_keyword_in_template_with_credential_in_argument(msg, args):
+    assert "LmN0vR7tY" not in _emit(msg, *args)
+
+
+def test_a_broken_template_never_prints_raw_arguments():
+    out = _emit("upstream rejected Authorization: %s %s", "AbCdEfGhIjKl1234Mn")
+    assert "AbCdEfGhIjKl1234Mn" not in out
+
+
+@pytest.mark.parametrize("text", [
+    '{"user": "bob", "password": "correcthorsebattery"}', "{'password': 'correcthorse'}",
+    '{"api_key": "AbCdEfGhIjKlMnOpQrSt"}', '{"access_token":"AbCdEfGhIjKlMnOpQrStUv"}',
+    "password = hunter2hunter2", 'api_key = "AbCd1234EfGh5678"',
+    "Authorization: SSWS 00QCjAl4MlV-WPXM3abc", "Authorization: Splunk 1234-abcd-5678",
+    "Authorization: Bearer\nZx81kQpLmN0vR7tY", "calling upstream with Bearer AbCdEfGhIjKlMnOpQrSt",
+    "token: AbCdEfGhIjKlMnOpQrSt", "password=P@ssw0rd!2024", "secret=hun*ter2hunter2",
+    "X-Amz-Signature=abcdef123456", "sig=abcdef123456"])
+def test_structured_and_unusual_credentials_are_redacted(text):
+    from audel.logging import scrub_text
+
+    out = scrub_text(text)
+    assert "[REDACTED]" in out and out != text
+
+
+def test_jwts_behind_glued_text_and_unusual_headers_are_redacted():
+    import base64
+
+    from audel.logging import scrub_text
+
+    def b64(b):
+        return base64.urlsafe_b64encode(b).decode().rstrip("=")
+
+    body, sig = b64(b'{"t":1}'), "c2lnbmF0dXJl"
+    for hdr in (b'{"alg":"RS256"}', b'{"customHeaderX":"a","alg":"RS256"}',
+                b'{\n    "alg": "RS256"}', b'{"a":1}', b'{"x-tenant":"t","alg":"RS256"}'):
+        jwt = f"{b64(hdr)}.{body}.{sig}"
+        for text in (jwt, "honeyJar_" + jwt, "/v1/monkeyAuth-" + jwt, "/s/q9eyAz_" + jwt):
+            assert b64(hdr)[:10] not in scrub_text(text), (hdr, text)
+
+
+@pytest.mark.parametrize("text", ["compass: north-northwest", "bypass mode on",
+                                  "design: minimalist", "secretary: Jane Doe",
+                                  "Authorization required for this", "token: expired at noon"])
+def test_short_keys_inside_words_are_not_redacted(text):
+    from audel.logging import scrub_text
+
+    assert scrub_text(text) == text
+
+
+def test_nested_percent_floods_are_bounded_and_fail_closed():
+    from audel.logging import scrub_text
+
+    text = "%25252541%41!" * (8192 // 13)
+    t0 = time.process_time()
+    out = scrub_text(text)
+    assert time.process_time() - t0 < 0.2
+    assert "%25252541%41" not in out.split("[REDACTED]")[-1] or out.count("[REDACTED]") > 0
+
+
+# ==== round 11, decode surface ================================================================
+
+def test_listed_gaps_over_ten_percent_are_an_error():
+    from audel.mediaguard import MediaInfo, StreamInfo
+    from audel.signals.checks import evaluate
+    from audel.signals.measure import Measurements, TrackMeasurements
+
+    st = StreamInfo(index=0, codec="aac", sample_rate=48000, channels=2)
+    m = Measurements(info=MediaInfo(duration_s=600, sample_rate=48000, channels=2, codec="aac",
+                                    has_audio=True, streams=(st,)))
+    tm = TrackMeasurements(stream=st, decoded_s=300.0, extent_s=600.0, gap_total_s=300.0,
+                           gaps=[(30.0 + 60 * i, 60.0 + 60 * i) for i in range(10)],
+                           frames=[(0.1, -23.0, -23.0, -3.0)], rms_dbfs=-20.0)
+    m.tracks = [tm]
+    sev = {i.severity.value for i in evaluate(m, Settings()) if i.detail.get("check") == "packet_gap"}
+    assert sev == {"error"}
