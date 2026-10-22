@@ -121,6 +121,18 @@ All notable changes to Audel are recorded here. The format follows
     at most 2 fetches, in a pool of 8.
   - **Low-Medium.** Work abandoned while waiting on its tenant share still ran later. Abandonment now
     propagates through both waits.
+- Red-team round 18 fixes (auth surface), each pinned by a regression test. No auth bypass or
+  escalation was found.
+  - **Low-Medium.** Log redaction missed compound key names glued to an acronym, digit or
+    non-ASCII letter (`XAPIKEY`, `AWSAccessKey`, `9apikey`), and a `}` or `]` inside an unquoted
+    value cut the redaction short. Both now redact the whole value.
+  - **Low.** Strong keys with a suffix (`SECRET_KEY_BASE`, `DB_PASSWORD_PROD`, `password2`,
+    `API_KEY_V2`), pair names longer than 48 characters, and pair names starting with a
+    non-ASCII letter are now redacted.
+  - **Low.** The round-17 carve-outs are narrower: `true`/`null`-style literals are kept only in
+    `key: value` form, and numeric ids only up to 10 digits.
+  - **Low.** Double-encoded JSON matching is bounded and runs only when an escaped quote is
+    present, keeping its cost near that of benign text.
 - Red-team round 17 fixes (multichannel decode), each pinned by a regression test. The 456-file
   battery shows no regressions.
   - **Medium.** The round-16 mono mix used ffmpeg's own downmix for named layouts, which silently

@@ -4210,3 +4210,40 @@ def test_speex_decodes_identically_every_run(tmp_path):
         digests.add(hashlib.sha256(out.read_bytes()).hexdigest())
         out.unlink()
     assert len(digests) == 1
+
+
+# ==== round 18, auth surface ==================================================================
+
+@pytest.mark.parametrize("key", ["XAPIKEY", "AWSAccessKey", "GCPApiKey", "OPENAIAPIKEY", "DBPRIVATEKEY",
+                                 "TLSPrivateKey", "myapikey", "9apikey", "éapikey", "SECRET_KEY_BASE",
+                                 "DB_PASSWORD_PROD", "password2", "API_KEY_V2"])
+def test_glued_and_suffixed_compound_keys_are_redacted(key):
+    from audel.logging import scrub_text
+
+    for fmt in ("{k}=zQ7hunterZ", "{k}: zQ7hunterZ", '{{"{k}": "zQ7hunterZ"}}'):
+        assert "zQ7hunterZ" not in scrub_text(fmt.format(k=key)), fmt.format(k=key)
+
+
+@pytest.mark.parametrize("text", ["password=zQ7}hunterZ", "DB_PASSWORD=p4ss]w0rd{zQ7hunterZ}",
+                                  "secret=}zQ7hunterZ", "api_key: ]zQ7hunterZ",
+                                  "('AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA_PASSWORD_BBBBBBBBBBB', 'zQ7hunterZ')",
+                                  "('İsecret', 'zQ7hunterZ')"])
+def test_brackets_inside_values_and_long_or_unicode_pair_names(text):
+    from audel.logging import scrub_text
+
+    assert "zQ7hunterZ" not in scrub_text(text)
+
+
+@pytest.mark.parametrize("text", ["password=none", "password=yes", "session_id: 123456789012345"])
+def test_carve_outs_are_narrow(text):
+    from audel.logging import scrub_text
+
+    assert scrub_text(text).endswith("[REDACTED]")
+
+
+@pytest.mark.parametrize("text", ["tokens=512", "max_tokens=1024", "pass_rate: 98%", "keyframe=12",
+                                  "monkey=3", "hotkey: ctrl", '{"password": null}'])
+def test_counts_and_ordinary_words_are_kept(text):
+    from audel.logging import scrub_text
+
+    assert scrub_text(text) == text
