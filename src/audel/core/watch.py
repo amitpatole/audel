@@ -13,7 +13,7 @@ import asyncio
 import math
 
 from ..config import Settings, load_settings
-from ..errors import AudelError
+from ..errors import AudelError, BusyError
 from ..mediaguard import probe_streams, validate_source
 from ..models import (
     Confidence,
@@ -124,5 +124,7 @@ async def watch(source, *, settings: Settings | None = None, frames: int | None 
         if is_url(str(source)):
             return await _watch_url(source, settings, click_selector, frames * interval_ms)
         return await asyncio.to_thread(_watch_sync, source, settings, frames, interval_ms)
+    except BusyError:
+        raise  # host capacity, not the media: the caller retries (REST: 429)
     except AudelError as e:
         return _decode_error(source, e)

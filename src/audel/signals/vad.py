@@ -80,7 +80,7 @@ def speech_gated_lufs(path: Path, settings: Settings, regions: list[tuple[float,
     if not regions:
         return None
     expr = "+".join(f"between(t\\,{a:.3f}\\,{b:.3f})" for a, b in regions)
-    from ..errors import AudelError
+    from ..errors import AudelError, BusyError
     from ..mediaguard import pass_timeout, pcm_pipeline, probe
 
     info = probe(path, settings)
@@ -93,6 +93,8 @@ def speech_gated_lufs(path: Path, settings: Settings, regions: list[tuple[float,
                            layout=st.layout, timeout_s=pass_timeout(settings, info.duration_s),
                            analysis=["-af", f"aselect={expr},asetpts=N/SR/TB,ebur128=framelog=quiet",
                                      "-f", "null", "-"])
+    except BusyError:
+        raise  # the host, not the media: never silently skip the speech-gated measurement
     except AudelError:
         return None
     return parse_ebur128(err).get("I")

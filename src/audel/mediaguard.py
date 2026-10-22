@@ -184,6 +184,8 @@ class MediaInfo:
     has_video: bool = False            # a real picture stream (not cover art)
     container_shortfall_s: float = 0.0  # header-declared audio missing (WAV/W64/AIFF/CAF)
     estimated_durations: bool = False   # MPEG-TS/PS: stream durations are bitrate estimates
+    decode_cap_s: float = 0.0           # per-stream decode cap (0 = settings.max_duration_s)
+    byte_clock: bool = False            # AVI: packet times come from byte positions
     packets_declare_end: bool = False   # per-stream durations unreliable (TS/PS estimates, ASF
                                         # copies the file's): the packets are the declaration
 
@@ -376,8 +378,19 @@ def pcm_pipeline(path: Path, settings: Settings, *, stream: int, channels: int,
         raise DecodeError(f"analysis failed (rc={p2.returncode})")
     # A decoder stopped by a closed pipe (analysis finished early) exits 224 / -13: not an error.
     if p1.returncode not in (0, None, 224, -13):
-        raise DecodeError(f"could not decode audio: {tail1[-200:]}")
+        raise DecodeError(f"could not decode audio: {_cause(tail1)}")
     return out2
+
+
+def _cause(tail: str) -> str:
+    """The decoder's own reason, not its closing statistics: the last error-like line."""
+    lines = [ln.strip() for ln in tail.splitlines() if ln.strip()]
+    keys = ("error", "invalid", "not supported", "failed", "unsupported", "corrupt")
+    for ln in reversed(lines):
+        low = ln.lower()
+        if any(k in low for k in keys) and "decode errors" not in low:
+            return ln[-200:]
+    return (lines[-1] if lines else "")[-200:]
 
 
 ANALYSIS_MAX_RATE = 48000
@@ -411,13 +424,16 @@ class PacketScan:
     gap_total_s: float = 0.0           # ALL missing time, including gaps past ``limit``
     gap_count: int = 0
     segments: list[tuple[float, float]] = field(default_factory=list)
+    overlap_s: float = 0.0             # audio packets laid over earlier ones (duplicates)
+    jumps: int = 0                     # impossible forward jumps (beyond the duration cap)
     complete: bool = True
+    max_s: float = 86400.0             # extent clamp (the duration cap)
 
     @property
     def extent_s(self) -> float:
         if self.first_pts is None or self.last_end is None:
             return 0.0
-        return max(0.0, self.last_end - self.first_pts)
+        return min(self.max_s, max(0.0, self.last_end - self.first_pts))
 
 
 class _GapScanner:
@@ -428,10 +444,12 @@ class _GapScanner:
       sample duration). The final packet is exempt: it is legitimately short or long.
     Packets without a duration are taken at the stream's typical length (TrueHD in MKV).
 
-    Timestamp jumps: a BACKWARD jump re-anchors the clock in every container. A huge FORWARD
-    jump is folded out only when ``fold`` (MPEG-TS/PS, where splices are routine); elsewhere it is
-    missing audio and reported as a gap. A jump that returns to the old clock within a few
-    packets was a stray packet (a decoy), so the gap is measured against the old clock."""
+    Timestamp jumps are folded out only when ``fold`` (MPEG-TS/PS, where splices and wraps are
+    routine): the clock re-anchors, and a jump off an established clock that returns within a few
+    packets was a stray (a decoy), so the gap is measured against the old clock. Elsewhere the
+    clock never restarts: a forward jump is missing audio (a gap), a backward step lays audio over
+    earlier audio (counted as overlap), and the track runs from its earliest packet to its latest
+    end, so stray packets can only make the timeline look LONGER than the audio, never shorter."""
 
     _CALIBRATE = 4096
     _OUTLIER_WINDOW = 8
@@ -446,9 +464,16 @@ class _GapScanner:
         self._prev_end: float | None = None
         self._pending: tuple[float, float | None] | None = None
         self._anchor: dict | None = None  # the clock before the last jump, while it is suspect
+        self._run = 0  # packets on the current clock since the last jump
+        self.overflow = False
+        self.scan.max_s = max_gap_s
 
     def add(self, pts: float, dur: float | None) -> None:
         if self.scan.first_pts is None:
+            self.scan.first_pts = pts
+        if not self.fold and pts < self.scan.first_pts:
+            # Outside MPEG-TS the clock never restarts: the track starts at its EARLIEST packet
+            # (a stray packet far ahead can't move the start or shrink the extent).
             self.scan.first_pts = pts
         if self.typical is None:
             self._head.append((pts, dur))
@@ -485,12 +510,19 @@ class _GapScanner:
         if self._anchor is not None:
             a = self._anchor
             back = pts - a["offset"] - a["prev_end"]
-            if -tol <= back <= _MAX_PACKET_GAP_S:
+            # After a folded jump the old clock may resume after a real hole (measured below);
+            # after a gap, only a packet continuing exactly where the old clock ended undoes it.
+            limit = _MAX_PACKET_GAP_S if a["kind"] == "jump" else tol
+            if -tol <= back <= limit:
                 # Back on the clock from before the jump: the jumped packet(s) were strays.
+                # Undo everything they did (gaps measured on the stray clock included), and keep
+                # the clock ESTABLISHED, so a decoy every few packets is recognised every time.
                 self._offset, self._prev_end = a["offset"], a["prev_end"]
                 self._pending, self._anchor = None, None
-                if self.scan.segments:
-                    self.scan.segments.pop()
+                self._run = a["run"] + (self._OUTLIER_WINDOW - a["left"])
+                del self.scan.gaps[a["gaps"]:]
+                self.scan.gap_total_s, self.scan.gap_count = a["gap_total"], a["gap_count"]
+                del self.scan.segments[a["segments"]:]
             else:
                 a["left"] -= 1
                 if a["left"] <= 0:
@@ -499,23 +531,53 @@ class _GapScanner:
         jumped = False
         if self._prev_end is not None:
             delta = c - self._prev_end
-            if delta < -tol or (self.fold and delta > _MAX_PACKET_GAP_S):
-                if self._anchor is None:
-                    self._anchor = {"offset": self._offset, "prev_end": self._prev_end,
-                                    "left": self._OUTLIER_WINDOW}
+            impossible = delta > self.max_gap  # longer than any file may run: a corrupt stamp
+            if impossible or (self.fold and (delta < -tol or delta > _MAX_PACKET_GAP_S)):
+                if impossible and not self.fold:
+                    self.scan.jumps += 1
+                # Only an ESTABLISHED clock can be returned to: otherwise a leading decoy (or a
+                # decoy every few packets) would capture the clock and erase the real timeline.
+                self._arm("jump")
                 self._offset += delta
                 c, jumped = self._prev_end, True
-                self.scan.segments.append((pts, self._offset))
+                self._run = 0
+                if len(self.scan.segments) < self.limit:
+                    self.scan.segments.append((pts, self._offset))
+                else:
+                    self.overflow = True  # too many jumps to place reliably: incomplete
             elif delta > self.min_gap:
+                self._arm("gap")  # a stray packet AHEAD of the clock also looks like a gap
                 self._gap(self._prev_end, c)
+            elif delta < 0 and -delta > max(0.5 * typical, 0.0025):
+                # Laid over earlier audio (a duplicate, or outside MPEG-TS any backward step):
+                # decoded audio the timeline doesn't hold. Timestamp rounding isn't counted:
+                # under half a packet, and under 2.5 ms (MKV rounds to 1 ms; a TrueHD packet is
+                # 0.83 ms, so consecutive packets often share a timestamp).
+                self.scan.overlap_s += min(-delta, d)
         if self._pending is not None:  # long-packet rule, for every packet but the final one
             pc, pd = self._pending
             if pd is not None and typical > 0 and pd - typical > self.min_gap \
                     and (pd <= _MAX_PACKET_GAP_S or not self.fold):
                 self._gap(pc + typical, pc + pd)
         self._pending = (c, dur)
+        self._run += 1
         end = c + d
         self._prev_end = end if (self._prev_end is None or jumped) else max(self._prev_end, end)
+
+    def _arm(self, kind: str) -> None:
+        """Remember the clock before a jump or gap, so packets that return to it within a few
+        packets can be recognised as strays. A JUMP can only be undone back to an ESTABLISHED
+        clock (otherwise a leading decoy, or one every few packets, would capture the clock). A
+        GAP can always be undone, but only by a packet continuing exactly where the clock left
+        off, which missing audio can never supply, so undoing one can't hide a real hole."""
+        if self._anchor is not None and self._anchor["kind"] == "gap" and kind == "jump":
+            self._anchor = None  # the return from a stray ahead is handled by the revert below
+        if self._anchor is None and (kind == "gap" or self._run >= self._OUTLIER_WINDOW):
+            self._anchor = {"kind": kind, "offset": self._offset, "prev_end": self._prev_end,
+                            "left": self._OUTLIER_WINDOW, "run": self._run,
+                            "gaps": len(self.scan.gaps), "gap_total": self.scan.gap_total_s,
+                            "gap_count": self.scan.gap_count,
+                            "segments": len(self.scan.segments)}
 
     def _gap(self, a: float, b: float) -> None:
         b = min(b, a + self.max_gap)
@@ -579,7 +641,13 @@ def scan_packets(path: Path, settings: Settings, abs_index: int, *, min_gap_s: f
                 return
 
     watcher = threading.Thread(target=_watch, daemon=True, name="audel-scan-watch")
-    watcher.start()
+    try:
+        watcher.start()
+    except RuntimeError:  # no thread for the watchdog: don't run an unwatched ffprobe
+        proc.kill()
+        proc.wait()
+        proc.stdout.close()
+        return PacketScan(complete=False)
     sc = _GapScanner(min_gap_s, limit, fold=fold, max_gap_s=settings.max_duration_s)
     try:
         for line in iter(lambda: proc.stdout.readline(256), b""):  # type: ignore[union-attr]
@@ -596,7 +664,7 @@ def scan_packets(path: Path, settings: Settings, abs_index: int, *, min_gap_s: f
             proc.kill()
         proc.wait()
         proc.stdout.close()
-    result.complete = not expired.is_set() and proc.returncode == 0
+    result.complete = not expired.is_set() and proc.returncode == 0 and not sc.overflow
     return result
 
 
@@ -721,14 +789,24 @@ def probe(path: Path, settings: Settings) -> MediaInfo:
         )
     if sample_rate > settings.max_sample_rate:
         raise UnsafeSourceError(f"sample rate {sample_rate} exceeds the {settings.max_sample_rate} cap")
-    # A missing / zero declared duration counts as the maximum: it cannot dodge the budgets.
-    budget_dur = duration_s if duration_s > 0 else settings.max_duration_s
-    if budget_dur * max(1, len(astreams)) > settings.max_total_audio_s:
+    # A missing / zero declared duration cannot dodge the budgets: each stream is then given its
+    # SHARE of them as a hard decode cap (reaching it fails closed), instead of assuming the
+    # maximum for every stream and refusing every multi-track file of unknown length.
+    total_ch = sum(max(1, _int(st.get("channels"))) for st in astreams) or 1
+    decode_cap = settings.max_duration_s
+    if duration_s > 0:
+        budget_dur = duration_s
+    else:
+        decode_cap = min(settings.max_duration_s,
+                         settings.max_total_audio_s / max(1, len(astreams)),
+                         settings.max_total_channel_s / total_ch)
+        budget_dur = decode_cap
+    if budget_dur * max(1, len(astreams)) > settings.max_total_audio_s + 1e-6:
         raise UnsafeSourceError(
             f"{len(astreams)} audio stream(s) x {budget_dur:.0f}s exceeds the "
             f"{settings.max_total_audio_s:.0f}s total-audio budget")
     total_channels = sum(max(1, _int(st.get("channels"))) for st in astreams)
-    if budget_dur * total_channels > settings.max_total_channel_s:
+    if budget_dur * total_channels > settings.max_total_channel_s + 1e-6:
         raise UnsafeSourceError(
             f"{total_channels} channel(s) x {budget_dur:.0f}s exceeds the "
             f"{settings.max_total_channel_s:.0f} channel-second budget")
@@ -768,6 +846,7 @@ def probe(path: Path, settings: Settings) -> MediaInfo:
                      format_start=format_start, format_start_raw=format_start_raw,
                      has_video=has_video, container_shortfall_s=shortfall,
                      estimated_durations=fmt.split(",")[0] in ("mpegts", "mpeg", "mpegvideo"),
+                     decode_cap_s=decode_cap, byte_clock=fmt.split(",")[0] == "avi",
                      packets_declare_end=fmt.split(",")[0] in ("mpegts", "mpeg", "mpegvideo",
                                                                "asf"))
 

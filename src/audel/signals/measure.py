@@ -75,6 +75,8 @@ class TrackMeasurements:
     seek_base_s: float = 0.0                 # programme time -> ffmpeg input -ss offset
     gap_total_s: float = 0.0                 # ALL missing-packet time (gaps lists the first ones)
     extent_s: float = 0.0                    # how long the packet timeline says the track runs
+    overlap_s: float = 0.0                   # decoded audio laid over earlier packets (duplicates)
+    timestamp_jumps: int = 0                 # impossible timestamp jumps (a corrupt timeline)
 
     @property
     def end_s(self) -> float:
@@ -201,8 +203,8 @@ def _spectral_pass(ffmpeg: str, path, idx: int, tm: TrackMeasurements, settings:
         analysis += ["-map", o, "-f", "null", "-"]
     try:
         err = _pipe(path, tm.stream, settings, analysis, dur_s, deadline=deadline)
-    except UnsafeSourceError:
-        raise
+    except (UnsafeSourceError, BusyError):
+        raise  # a busy host must not silently drop checks (it is retried, not graded partially)
     except AudelError:
         return  # best-effort: the main pass already graded the essentials
     ser = parse_metadata_series(err)
@@ -228,8 +230,8 @@ def _tail_pass(ffmpeg: str, path, idx: int, tm: TrackMeasurements, settings: Set
         err = _pipe(path, tm.stream, settings,
                     ["-af", "astats=metadata=0:measure_overall=RMS_level:measure_perchannel=none",
                      "-f", "null", "-"], 1.0, pre_input=seek, deadline=deadline)
-    except UnsafeSourceError:
-        raise
+    except (UnsafeSourceError, BusyError):
+        raise  # a busy host must not silently drop the truncation check
     except AudelError:
         return
     tm.tail_rms_dbfs = parse_astats(err).get("rms")
@@ -246,7 +248,7 @@ def measure_track(path, st: StreamInfo, settings: Settings, dur_s: float = 0.0,
         _spectral_pass(ffmpeg, path, st.index, tm, settings, max(dur_s, tm.decoded_s), deadline)
     if timeline is not None:
         (tm.stream, gaps, tm.gap_scan_incomplete, tm.seek_base_s, tm.gap_total_s,
-         tm.extent_s) = timeline(st)
+         tm.extent_s, tm.overlap_s, tm.timestamp_jumps) = timeline(st)
         tm.gaps = sorted(gaps)
     _tail_pass(ffmpeg, path, st.index, tm, settings, deadline)
     return tm
@@ -276,10 +278,11 @@ def _shared_clock(scans) -> None:
     for sc in live:
         if sc is ref:
             continue
-        shift = 0.0
-        for raw, off in ref.segments:
-            if raw <= sc.first_pts + 1e-6:
-                shift = off
+        # The reference clock's segment this track starts in: the one with the greatest raw start
+        # not after it (segments are in stream order, not timestamp order), tolerating ordinary
+        # inter-PID skew around a splice (well under the 60 s fold rule).
+        cands = [(raw, off) for raw, off in ref.segments if raw <= sc.first_pts + 30.0]
+        shift = max(cands)[1] if cands else 0.0
         if shift:
             sc.first_pts -= shift
             if sc.last_end is not None:
@@ -297,6 +300,9 @@ def measure(path, info: MediaInfo, settings: Settings) -> Measurements:
                                                 channels=info.channels)]
     if not settings.analyze_all_tracks:
         streams = streams[:1]
+    if 0 < info.decode_cap_s < settings.max_duration_s:
+        # Unknown length: each stream decodes at most its share of the budgets (fails closed).
+        settings = settings.model_copy(update={"max_duration_s": info.decode_cap_s})
     import dataclasses
     import time
 
@@ -316,8 +322,15 @@ def measure(path, info: MediaInfo, settings: Settings) -> Measurements:
     stop = threading.Event()
     # Timestamp jumps are folded out only where splices are routine (MPEG-TS/PS); elsewhere a
     # jump is missing audio.
-    futures = [pool.submit(_scan, path, st, settings, deadline, stop, info.estimated_durations)
-               for st in streams]
+    futures: list = []
+    try:
+        for st in streams:
+            futures.append(pool.submit(_scan, path, st, settings, deadline, stop,
+                                       info.estimated_durations))
+    except RuntimeError:  # the host can't start another thread: retry later, leave nothing
+        stop.set()
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise BusyError("could not start analysis: the host is at capacity; retry later") from None
     placed: dict = {}
 
     def timeline(st: StreamInfo):
@@ -344,7 +357,13 @@ def measure(path, info: MediaInfo, settings: Settings) -> Measurements:
                 placed[s.index] = (dataclasses.replace(s, start_s=max(0.0, start - origin)), gaps,
                                    sc is not None and not sc.complete, seek_base,
                                    sc.gap_total_s if sc is not None else 0.0,
-                                   sc.extent_s if sc is not None and sc.complete else 0.0)
+                                   # AVI times compressed audio by byte position (a nominal
+                                   # rate), so its extent is no measure of the audio.
+                                   sc.extent_s if sc is not None and sc.complete
+                                   and not (info.byte_clock and not s.codec.startswith("pcm"))
+                                   else 0.0,
+                                   sc.overlap_s if sc is not None else 0.0,
+                                   sc.jumps if sc is not None else 0)
                 if info.packets_declare_end and sc is not None and sc.last_end is not None \
                         and sc.complete:
                     # TS durations are bitrate estimates, ASF copies the file's onto every

@@ -1237,7 +1237,7 @@ def test_audio_reaching_the_duration_cap_fails_closed(tmp_path):
 
 
 @requires_ffmpeg
-def test_unknown_duration_counts_as_the_maximum_for_budgets(tmp_path):
+def test_unknown_duration_streams_share_the_budgets(tmp_path):
     a = tmp_path / "a.wav"
     _ff("-f", "lavfi", "-i", "sine=d=3", a)
     mkv = tmp_path / "nodur.mkv"
@@ -1253,8 +1253,15 @@ def test_unknown_duration_counts_as_the_maximum_for_budgets(tmp_path):
         pass
     if info_dur and info_dur > 0:
         pytest.skip("this ffmpeg recovered a duration from the piped file")
-    with pytest.raises(UnsafeSourceError, match="budget"):
-        probe(validate_source(mkv, s), s)
+    # Unknown length can't dodge the budgets: each stream may decode only its share of them
+    # (round 9: rather than refusing every multi-track file of unknown length).
+    info = probe(validate_source(mkv, s), s)
+    assert 0 < info.decode_cap_s and info.decode_cap_s * len(info.streams) <= 100 + 1e-6
+    from audel.signals.measure import measure
+
+    tight = Settings(max_duration_s=60, max_total_audio_s=4)   # 2 s per stream < the 3 s audio
+    with pytest.raises(UnsafeSourceError):
+        measure(mkv, probe(validate_source(mkv, tight), tight), tight)  # cap reached: refused
 
 
 @requires_ffmpeg
@@ -2668,3 +2675,244 @@ def test_root_and_asyncio_records_are_scrubbed_under_serve():
     cfg = uvicorn_log_config()
     assert cfg["root"]["handlers"] and all(
         "audel_scrub" in cfg["handlers"][h]["filters"] for h in cfg["root"]["handlers"])
+
+
+# ==== round 9, decode surface =================================================================
+
+def _gs(packets, *, fold, limit=50, max_gap=10800.0):
+    from audel.mediaguard import _GapScanner
+
+    sc = _GapScanner(0.1, limit, fold=fold, max_gap_s=max_gap)
+    for p in packets:
+        sc.add(*p)
+    return sc, sc.finish()
+
+
+def _spread_loss(n=1740, frame=0.0232):
+    return [(i * frame, frame) for i in range(n) if i % 3 != 2]       # a third of frames gone
+
+
+@pytest.mark.parametrize("fold", [True, False])
+def test_decoys_cannot_capture_the_clock(fold):
+    real = _spread_loss()
+    pk = [(5.0, 0.0232)]                                   # a leading decoy...
+    for i, p in enumerate(real):
+        pk.append(p)
+        if i % 6 == 5:
+            pk.append((5.0, 0.0232))                       # ...repeated every 6 real packets
+    _, res = _gs(pk, fold=fold)
+    decoded = len(real) * 0.0232
+    assert res.extent_s - (decoded - res.overlap_s) - res.gap_total_s > 0.2 * res.extent_s
+
+
+def test_duplicates_cannot_cancel_missing_audio():
+    pk = []
+    for i in range(1725):
+        if i % 5 == 4:
+            continue                                       # 20% dropped
+        pk.append((i * 0.0232, 0.0232))
+        if i % 5 == 0:
+            pk.append((i * 0.0232, 0.0232))                # 20% duplicated
+    _, res = _gs(pk, fold=True)
+    decoded = len(pk) * 0.0232
+    assert res.overlap_s > 0.15 * res.extent_s
+    assert res.extent_s - (decoded - res.overlap_s) - res.gap_total_s > 0.1 * res.extent_s
+
+
+def test_millisecond_rounded_truehd_is_not_counted_as_duplicates():
+    pk = [(round(i / 1200, 3), None) for i in range(1200 * 20)]
+    _, res = _gs(pk, fold=False)
+    assert res.overlap_s < 0.05 and res.gap_total_s == 0 and 19.9 <= res.extent_s <= 20.1
+
+
+def test_impossible_jumps_are_folded_and_counted_everywhere():
+    pk = [(i * 0.0232, 0.0232) for i in range(400)] + \
+         [(4_294_967.0 + i * 0.0232, 0.0232) for i in range(400)]
+    _, res = _gs(pk, fold=False, max_gap=10800.0)
+    assert res.jumps == 1 and res.gap_total_s == 0 and res.extent_s < 20
+
+
+def test_jump_segments_are_capped():
+    pk = []
+    t = 100.0
+    for _ in range(300):
+        pk += [(t + k * 0.0232, 0.0232) for k in range(3)]
+        t -= 0.1                                           # a backward step every 3 packets
+    sc, res = _gs(pk, fold=True, limit=20)
+    assert len(res.segments) <= 20 and sc.overflow
+
+
+def test_shared_clock_tolerates_inter_pid_skew_at_a_splice():
+    from audel.mediaguard import PacketScan
+    from audel.signals.measure import _shared_clock
+
+    a = PacketScan(first_pts=1.0, last_end=41.0, segments=[(1000.0, 989.0)])
+    b = PacketScan(first_pts=999.99, last_end=1030.0)
+    _shared_clock([a, b])
+    assert 10.5 <= b.first_pts <= 11.5
+
+
+def test_decode_failure_reports_the_cause_not_the_statistics():
+    from audel.mediaguard import _cause
+
+    tail = ("[aac @ 0x1] Changing audio frame properties on the fly is not supported.\n"
+            "[aist#0:0/aac] Decoding error: Invalid data found when processing input\n"
+            "[in#0/mp3] Input stream #0:0 (audio): 120 packets read; 98 frames decoded; "
+            "0 decode errors (452608 samples)\n")
+    assert "Invalid data" in _cause(tail) or "not supported" in _cause(tail)
+
+
+@requires_ffmpeg
+def test_avi_compressed_audio_extent_is_not_trusted(tmp_path):
+    from audel.mediaguard import probe
+    from audel.signals.measure import measure
+
+    f = tmp_path / "a.avi"
+    _ff("-f", "lavfi", "-i", "color=c=black:s=64x64:d=6", "-f", "lavfi", "-i", "sine=d=6",
+        "-map", "0:v", "-map", "1:a", "-c:v", "mpeg4", "-c:a", "libmp3lame", "-q:a", "0", f)
+    s = Settings()
+    m = measure(f, probe(f, s), s)
+    assert m.tracks[0].extent_s == 0.0
+
+
+@requires_ffmpeg
+def test_multi_track_ts_of_unknown_length_is_graded_not_refused(tmp_path):
+    from audel import check
+
+    seg = []
+    for i, off in enumerate((1000, 10)):
+        a = tmp_path / f"s{i}.ts"
+        _ff("-f", "lavfi", "-i", "sine=d=5", "-f", "lavfi", "-i", "sine=f=660:d=5",
+            "-map", "0:a", "-map", "1:a", "-c:a", "aac", "-output_ts_offset", str(off), a)
+        seg.append(a.read_bytes())
+    f = tmp_path / "restart.ts"
+    f.write_bytes(b"".join(seg))
+    r = asyncio.run(check(str(f)))
+    assert r.tracks and not [i for i in r.issues if i.detail.get("check") == "decode_error"], \
+        [i.message for i in r.issues]
+
+
+def test_shared_clock_picks_the_segment_by_timestamp_not_by_order():
+    from audel.mediaguard import PacketScan
+    from audel.signals.measure import _shared_clock
+
+    # Reference: a stray at 101, real packets unwrapped past 2^33 (fold), then a step back to 41.
+    a = PacketScan(first_pts=101.0, last_end=141.0,
+                   segments=[(95444.739, 95343.717), (41.0, -59.0)])
+    b = PacketScan(first_pts=95444.717, last_end=95484.7)
+    _shared_clock([a, b])
+    assert 100 <= b.first_pts <= 102
+
+
+# ==== round 9, network surface ================================================================
+
+def _busy_spawn(monkeypatch, match):
+    import subprocess as sp
+
+    real = sp.Popen
+
+    def popen(argv, *a, **k):
+        if match(argv):
+            raise BlockingIOError(11, "Resource temporarily unavailable")
+        return real(argv, *a, **k)
+
+    monkeypatch.setattr(sp, "Popen", popen)
+
+
+@requires_ffmpeg
+def test_a_busy_host_never_silently_drops_the_truncation_check(media, monkeypatch):
+    from audel import check
+    from audel.errors import BusyError
+
+    _busy_spawn(monkeypatch, lambda argv: "-sseof" in argv or any(
+        str(x).startswith("astats=metadata=0:measure_overall=RMS_level") for x in argv))
+    with pytest.raises(BusyError):
+        asyncio.run(check(str(media["good"])))
+
+
+def test_analyze_and_handoff_report_busy_not_a_bad_file(tmp_path, media, monkeypatch):
+    _busy_spawn(monkeypatch, lambda argv: "ffmpeg" in str(argv[0]))
+    s = Settings(cache_dir=tmp_path / "ws")
+    with TestClient(build_app(settings=s)) as c:
+        for route in ("/analyze", "/handoff"):
+            r = c.post(route, files={"file": ("a.wav", media["good"].read_bytes(), "audio/wav")})
+            assert r.status_code == 429, (route, r.status_code, r.text)
+
+
+@requires_ffmpeg
+def test_thread_exhaustion_is_busy_and_leaves_no_scans(media, monkeypatch):
+    import concurrent.futures as cf
+
+    import audel.signals.measure as ms
+    from audel.errors import BusyError
+    from audel.mediaguard import probe
+
+    real = cf.ThreadPoolExecutor.submit
+    calls = {"n": 0}
+
+    def submit(self, *a, **k):
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise RuntimeError("can't start new thread")
+        return real(self, *a, **k)
+
+    monkeypatch.setattr(cf.ThreadPoolExecutor, "submit", submit)
+    s = Settings()
+    info = probe(media["good"], s)
+    info = type(info)(**{**info.__dict__, "streams": info.streams * 2})
+    with pytest.raises(BusyError):
+        ms.measure(media["good"], info, s)
+    deadline = time.monotonic() + 5
+    while _scan_threads() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert not _scan_threads()
+
+
+@requires_ffmpeg
+def test_scan_without_a_watchdog_thread_never_runs_unwatched(media, monkeypatch):
+    import threading
+
+    from audel.mediaguard import scan_packets
+
+    real = threading.Thread.start
+
+    def start(self):
+        if self.name == "audel-scan-watch":
+            raise RuntimeError("can't start new thread")
+        return real(self)
+
+    monkeypatch.setattr(threading.Thread, "start", start)
+    res = scan_packets(media["good"], Settings(), 0, timeout_s=10)
+    assert res is not None and not res.complete
+
+
+@requires_ffmpeg
+def test_cli_exits_75_when_the_host_is_busy(media):
+    import sys
+
+    code = ("import subprocess as sp, sys\n"
+            "real = sp.Popen\n"
+            "def no(argv, *a, **k):\n"
+            "    if 'ffmpeg' in str(argv[0]): raise BlockingIOError(11, 'x')\n"
+            "    return real(argv, *a, **k)\n"
+            "sp.Popen = no\n"
+            "sys.argv = ['audel', 'check', sys.argv[1]]\n"
+            "from audel.adapters.cli import main\n"
+            "main()\n")
+    r = subprocess.run([sys.executable, "-c", code, str(media["good"])], capture_output=True,
+                       text=True)
+    assert r.returncode == 75 and "busy" in r.stderr and "Traceback" not in r.stderr
+
+
+def test_mcp_tools_report_busy():
+    import audel.adapters.mcp as m
+    from audel.errors import BusyError
+
+    async def tool():
+        raise BusyError("host at capacity")
+
+    seen = {}
+    wrapped = m._busy_safe(lambda fn: seen.setdefault("fn", fn))(tool)
+    del wrapped
+    out = asyncio.run(seen["fn"]())
+    assert out["error"] == "busy" and out["retry"] is True

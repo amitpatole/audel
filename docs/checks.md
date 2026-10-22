@@ -25,6 +25,8 @@ consumers of the contract key on. It also has a precise rule name in `detail.che
 | `empty_stream` | `silence` | an audio stream contains no samples | critical |
 | `packet_gap` | `dropout` | audio packets are missing from the stream's timeline, including a hole stored as one long sample | warning |
 | `timeline_shortfall` | `dropout` | the packet timeline runs longer than the audio that decodes plus the reported gaps (missing audio spread through the track) | warning, error above 10% |
+| `timeline_excess` | `duration` | more audio decodes than the packet timeline holds (duplicated or mis-timed packets) | warning |
+| `timestamp_jump` | `other` | packet timestamps jump by more than any file may run (a corrupt timeline) | error |
 | `packet_gap_total` | `dropout` | more missing-packet gaps than are listed; reports the total | warning |
 | `gap_scan_incomplete` | `other` | the packet timeline couldn't be read in full, so missing-packet detection is incomplete | warning (low confidence) |
 | `container_truncated` | `truncation` | the file header declares more audio than the file contains (WAV, RF64, BW64, W64, AIFF, CAF) | error |

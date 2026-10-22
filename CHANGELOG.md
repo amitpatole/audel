@@ -121,6 +121,33 @@ All notable changes to Audel are recorded here. The format follows
     at most 2 fetches, in a pool of 8.
   - **Low-Medium.** Work abandoned while waiting on its tenant share still ran later. Abandonment now
     propagates through both waits.
+- Red-team round 9 fixes (decode and network surfaces), each pinned by a regression test. 197
+  legitimate and edge-case files grade with no new integrity findings.
+  - **Medium.** Decoy packets could capture the stray-packet logic and switch off the round-8
+    shortfall check. A jump can now only be undone back to an established clock. A gap can be
+    undone only by a packet continuing exactly where the clock left off, which missing audio can
+    never supply. Outside MPEG-TS the clock never restarts: a backward step lays audio over earlier
+    audio, and the track runs from its earliest packet to its latest end.
+  - **Medium.** One crafted upload with millions of timestamp jumps could grow the server's own
+    memory by about 800 MB. The jump list is capped (the scan is then reported incomplete): 37 MB
+    peak on the same file.
+  - **Low-Medium.** Duplicate packets could cancel out missing ones. Audio laid over earlier audio
+    is counted and subtracted, except for timestamp rounding (MKV rounds to 1 ms).
+  - **Low-Medium.** Legacy AVI times compressed audio by byte position, which gave a false FAIL on
+    VBR MP3. AVI's packet extent is no longer trusted for compressed audio.
+  - **Low-Medium.** A multi-track file of unknown length (such as a spliced MPEG-TS) was refused by
+    the duration budget. Each stream now decodes at most its share of the budget, which still fails
+    closed.
+  - **Low.** TS tracks are placed on the reference clock by timestamp, tolerating ordinary skew
+    between PIDs around a splice.
+  - **Low.** An impossible timestamp jump (longer than any file may run) is reported as a corrupt
+    timeline (`timestamp_jump`), and more audio decoding than the timeline holds is reported
+    (`timeline_excess`). Extents are clamped to the duration cap.
+  - **Low.** A busy host no longer silently drops the truncation, spectral or speech-gated passes,
+    and `/analyze`, `/handoff`, watch and jobs report it as busy (HTTP 429), never as a bad file. A
+    failed thread start leaves no scans running. The CLI exits with 75 when the host is busy, and
+    MCP tools return a `busy` result.
+  - **Info.** A refused decode now reports the decoder's reason, not its closing statistics.
 - Red-team round 9 fixes (auth surface), each pinned by a regression test:
   - **High.** The round-8 redaction patterns were still quadratic on runs such as `_eyJ_eyJ...`,
     so one unauthenticated request could stall the server. Redaction was redesigned to be

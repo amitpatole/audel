@@ -340,11 +340,18 @@ def evaluate(m: Measurements, settings: Settings, spec: DeliverySpec | str | Non
                 f"{label}{b - a:.2f}s of audio packets missing (timeline gap)",
                 Span(start_ms=_ms(a), end_ms=_ms(b)), "packet_gap", tm, conf=Confidence.MEDIUM,
                 programme=True, gap_s=round(b - a, 3)))
+        if tm.timestamp_jumps:
+            issues.append(_issue(
+                IssueKind.OTHER, Severity.ERROR,
+                f"{label}the packet timestamps jump {tm.timestamp_jumps} time(s) by more than any "
+                "file may run (a corrupt timeline); positions after a jump are unreliable",
+                _track_span(tm, dur), "timestamp_jump", tm, conf=Confidence.MEDIUM,
+                programme=True, jumps=tm.timestamp_jumps))
         if tm.extent_s > 0 and tm.decoded_s > 0:
             # Header-independent: the packets say how long the track runs; the decoded audio
             # plus the reported gaps must account for it. Catches missing audio spread through
             # the track (many tiny holes, stretched packet durations) that no single gap shows.
-            short = tm.extent_s - tm.decoded_s - tm.gap_total_s
+            short = tm.extent_s - (tm.decoded_s - tm.overlap_s) - tm.gap_total_s
             if short > max(0.5, 0.01 * tm.extent_s):
                 issues.append(_issue(
                     IssueKind.DROPOUT,
@@ -354,6 +361,14 @@ def evaluate(m: Measurements, settings: Settings, spec: DeliverySpec | str | Non
                     "the track)", _track_span(tm, dur), "timeline_shortfall", tm,
                     conf=Confidence.MEDIUM, programme=True, missing_s=round(short, 3),
                     extent_s=round(tm.extent_s, 3)))
+            excess = tm.decoded_s - tm.extent_s
+            if excess > max(1.0, 0.05 * tm.extent_s):
+                issues.append(_issue(
+                    IssueKind.DURATION, Severity.WARNING,
+                    f"{label}{tm.decoded_s:.1f}s of audio decodes but the packet timeline holds "
+                    f"only {tm.extent_s:.1f}s (duplicated or mis-timed packets)",
+                    _track_span(tm, dur), "timeline_excess", tm, conf=Confidence.MEDIUM,
+                    programme=True, excess_s=round(excess, 3)))
         if tm.gap_scan_incomplete:
             issues.append(_issue(
                 IssueKind.OTHER, Severity.WARNING,

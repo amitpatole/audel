@@ -19,7 +19,7 @@ import re
 from ..acoustic import clap
 from ..backends.registry import resolve_backend
 from ..config import Settings, load_settings
-from ..errors import AudelError, BackendAuthError, MissingDependencyError
+from ..errors import AudelError, BackendAuthError, BusyError, MissingDependencyError
 from ..models import (
     ClaimStatus,
     Conformance,
@@ -112,6 +112,8 @@ async def analyze(source, *, settings: Settings | None = None, brief=None, backe
     sp = effective_spec(settings, spec)
     try:
         rr = await asyncio.to_thread(_render_sync, source, settings, sp)
+    except BusyError:
+        raise  # host capacity, not the media: the caller retries (REST: 429)
     except AudelError as e:
         return _decode_error(source, e)
 

@@ -58,13 +58,32 @@ def _settings(content: str | None):
     return load_settings(content_type=content) if content else load_settings()
 
 
+def _busy_safe(decorator):
+    """Wrap an MCP tool so a busy host is reported as such (retry), not as a generic error."""
+    import functools
+
+    from ..errors import BusyError
+
+    def wrap(fn):
+        @functools.wraps(fn)
+        async def inner(*a, **k):
+            try:
+                return await fn(*a, **k)
+            except BusyError as e:
+                return {"error": "busy", "retry": True, "detail": str(e)}
+
+        return decorator(inner)
+
+    return wrap
+
+
 def build_server():
     if FastMCP is None:
         raise MissingDependencyError("MCP server needs the mcp package; pip install audel[mcp]")
 
     mcp = FastMCP("audel")
 
-    @mcp.tool()
+    @_busy_safe(mcp.tool())
     async def check_audio(source: str, brief: str | None = None,
                           expect: list[str] | None = None, spec: str | None = None,
                           content: str | None = None) -> dict:
@@ -83,7 +102,7 @@ def build_server():
                              spec=_builtin(spec))
         return report.model_dump(mode="json")
 
-    @mcp.tool()
+    @_busy_safe(mcp.tool())
     async def listen_audio(source: str, script: str | None = None, captions: str | None = None,
                            require: list[str] | None = None, forbid: list[str] | None = None,
                            key_messages: list[str] | None = None, tone: str | None = None,
@@ -113,7 +132,7 @@ def build_server():
 
         return [s.model_dump(mode="json") for s in BUILTIN_SPECS.values()]
 
-    @mcp.tool()
+    @_busy_safe(mcp.tool())
     async def analyze_audio(source: str, brief: str | None = None,
                             expect: list[str] | None = None, backend: str | None = None) -> dict:
         """Full grade: deterministic signals + ASR + backend LLM/CLAP critique (may egress)."""
@@ -123,7 +142,7 @@ def build_server():
                                backend=backend)
         return report.model_dump(mode="json")
 
-    @mcp.tool()
+    @_busy_safe(mcp.tool())
     async def perceive_handoff(source: str, brief: str | None = None,
                                expect: list[str] | None = None, backend: str | None = None) -> dict:
         """The ears→brain handoff: grade and return the distilled signal.
@@ -137,7 +156,7 @@ def build_server():
                                backend=backend)
         return report.to_handoff().model_dump(mode="json")
 
-    @mcp.tool()
+    @_busy_safe(mcp.tool())
     async def watch_audio(source: str, click_selector: str | None = None) -> dict:
         """Watch a file OR http(s) URL OVER TIME — does the audio play THROUGH (not a glance)?
 
@@ -148,7 +167,7 @@ def build_server():
         report = await watch(source, settings=load_settings(), click_selector=click_selector)
         return report.model_dump(mode="json")
 
-    @mcp.tool()
+    @_busy_safe(mcp.tool())
     async def render_audio(source: str) -> dict:
         """Decode to trustworthy signals (loudness/true-peak/RMS/silent spans); no LLM, no key."""
         from ..core import render
@@ -159,7 +178,7 @@ def build_server():
                 "true_peak_dbtp": rr.true_peak_dbtp, "rms_dbfs": rr.rms_dbfs, "lra": rr.lra,
                 "silences": len(rr.silences)}
 
-    @mcp.tool()
+    @_busy_safe(mcp.tool())
     async def diff_audio(baseline: str, candidate: str) -> dict:
         """Grade two clips and report what changed (resolved/introduced/persisted issues)."""
         from ..core import check, compute_diff
@@ -169,7 +188,7 @@ def build_server():
         after = await check(candidate, settings=settings)
         return compute_diff(before, after).model_dump(mode="json")
 
-    @mcp.tool()
+    @_busy_safe(mcp.tool())
     async def start_loop(source: str, brief: str | None = None, expect: list[str] | None = None,
                          backend: str | None = None, offline: bool = False) -> dict:
         """Start an audio feedback loop session; returns session_id + first iteration."""
@@ -181,7 +200,7 @@ def build_server():
         result = await session.iterate()
         return {"session_id": session.session_id, "iteration": result.model_dump(mode="json")}
 
-    @mcp.tool()
+    @_busy_safe(mcp.tool())
     async def loop_iterate(session_id: str, source: str | None = None) -> dict:
         """Continue a loop session after the agent fixes the audio."""
         session = _sessions.get(session_id)

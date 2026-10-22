@@ -355,8 +355,17 @@ def demo() -> None:
         typer.echo("\nNo API key used — this is the deterministic check path.")
 
 
+EX_TEMPFAIL = 75  # sysexits: a temporary failure (the host is busy), distinct from a FAIL verdict
+
+
 def main() -> None:
-    app()
+    from ..errors import BusyError
+
+    try:
+        app()
+    except BusyError as e:  # Typer re-raises application errors: report busy, exit distinctly
+        typer.echo(f"audel: busy: {e}", err=True)
+        raise SystemExit(EX_TEMPFAIL) from None
 
 
 if __name__ == "__main__":

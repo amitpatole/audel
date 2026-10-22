@@ -45,3 +45,12 @@ directly.
 audel qc "$MASTER" --spec atsc_a85 --html "$OUT/qc.html" --json "$OUT/qc.json" \
   || { echo "audio QC failed, see $OUT/qc.html"; exit 1; }
 ```
+
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | the verdict is PASS or WARN |
+| `1` | the verdict is FAIL, or the command failed |
+| `2` | a usage error |
+| `75` | the host is busy (it couldn't start a process or thread); retry later |
