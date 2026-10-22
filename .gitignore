@@ -27,3 +27,11 @@ site/
 # OS / editor
 .DS_Store
 *.swp
+
+# Security residuals ledger + red-team notes — LOCAL ONLY, never tracked or pushed
+docs/SECURITY_RESIDUALS.md
+.security-local/
+
+# Benchmark / QC scratch output
+bench-out/
+*.qc.html

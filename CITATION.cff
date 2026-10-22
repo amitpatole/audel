@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+message: "If you use Audel in your work, please cite it as below."
+title: "Audel: Ears for AI Agents"
+abstract: >-
+  Audel is a machine-graded audio feedback loop that AI agents and media pipelines use to hear
+  and listen to their own audio output, returning a pass/warn/fail verdict with time-grounded
+  issues so the work can be fixed before it is called done.
+type: software
+authors:
+  - family-names: Patole
+    given-names: Amit
+    email: amit.patole@gmail.com
+repository-code: "https://github.com/amitpatole/audel"
+url: "https://amitpatole.github.io/audel/"
+license: MIT
+version: 0.1.0
+date-released: "2026-06-22"
+keywords:
+  - audio quality control
+  - loudness
+  - speech recognition
+  - AI agents
+  - verification

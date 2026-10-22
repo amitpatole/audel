@@ -8,14 +8,20 @@ Heavy/optional: install with ``audel[mcp]``.
 
 from __future__ import annotations
 
+from typing import Any
+
 from ..config import load_settings
 from ..errors import MissingDependencyError
 from ..models import Brief
 
-try:
-    from mcp.server.fastmcp import FastMCP
-except ImportError:  # pragma: no cover - only without the [mcp] extra
-    FastMCP = None  # type: ignore
+FastMCP: Any
+try:  # mcp >= 2: the high-level server is ``mcp.server.MCPServer``
+    from mcp.server import MCPServer as FastMCP
+except ImportError:  # pragma: no cover - mcp 1.x layout, or the extra is absent
+    try:
+        from mcp.server.fastmcp import FastMCP  # type: ignore[attr-defined,no-redef]
+    except ImportError:
+        FastMCP = None
 
 _MAX_SESSIONS = 64
 _sessions: dict = {}

@@ -22,7 +22,7 @@ APP_NAME = "audel"
 # opt-in audio-native critique model.
 DEFAULT_MODELS = {
     "ollama": "gemma4:31b",
-    "anthropic": "claude-haiku-4-5",
+    "anthropic": "claude-haiku-5-5",
     "gemini_audio": "gemini-2.0-flash",
 }
 

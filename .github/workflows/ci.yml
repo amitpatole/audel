@@ -49,10 +49,27 @@ jobs:
         run: ruff check src tests
 
       - name: Type check
-        run: mypy src || true   # advisory in v1
+        run: mypy src
 
       - name: Test
         run: pytest -q
 
       - name: Smoke (no-key demo path → time-grounded FAIL then PASS)
-        run: audel demo || true
+        run: audel demo
+
+  audit:
+    # Supply chain: fail on known-vulnerable dependencies of the installed package set.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install package (base + service extras)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[serve,mcp]" pip-audit
+      - name: Dependency vulnerability audit
+        run: pip-audit --skip-editable --progress-spinner off

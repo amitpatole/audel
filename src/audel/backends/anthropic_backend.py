@@ -46,9 +46,17 @@ class AnthropicBackend:
         try:
             client = anthropic.Anthropic(api_key=key)
             msg = client.messages.create(
-                model=self._settings.anthropic_model, max_tokens=700, temperature=0,
+                # Sampling params (temperature/top_p) are gone from the Messages API; effort
+                # "low" keeps a short, consistent grading answer. max_tokens leaves headroom for
+                # the model's (always-on) adaptive thinking.
+                model=self._settings.anthropic_model, max_tokens=4000,
+                output_config={"effort": "low"},
                 system=system, messages=[{"role": "user", "content": user}])
-            parts = [b.text for b in msg.content if getattr(b, "type", "") == "text"]
+            if getattr(msg, "stop_reason", None) == "refusal":
+                raise BackendError("Anthropic declined the critique request (refusal)")
+            parts = [b.text for b in msg.content if b.type == "text"]
+        except BackendError:
+            raise
         except Exception as e:  # noqa: BLE001
             raise BackendError(f"Anthropic request failed: {type(e).__name__}") from e
         return ("".join(parts))[:_MAX_RESPONSE_CHARS]
