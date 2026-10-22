@@ -147,21 +147,133 @@ def run(argv: list[str], *, timeout_s: float, max_stdout_bytes: int | None = Non
     ``argv[0]`` must be an absolute tool path (from :func:`_tool`). Output is captured; stdout is
     truncated to ``max_stdout_bytes`` when given (bounds raw-PCM decode buffers).
     """
+    pre = _rlimit_setter(int(timeout_s) + _RLIMIT_CPU_PAD_S) if os.name == "posix" else None
+    p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, preexec_fn=pre)
+    assert p.stdout is not None and p.stderr is not None
+    out = _BoundedReader(p.stdout, max_stdout_bytes or 16 * 1024 * 1024)
+    err = _BoundedReader(p.stderr, 1024 * 1024, tail=True)  # bounded: a flood can't grow memory
     try:
-        proc = subprocess.run(
-            argv,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            timeout=timeout_s,
-            preexec_fn=_rlimit_setter(int(timeout_s) + _RLIMIT_CPU_PAD_S) if os.name == "posix" else None,
-            check=False,
-        )
+        p.wait(timeout=timeout_s)
     except subprocess.TimeoutExpired as e:
+        p.kill()
+        p.wait()
         raise UnsafeSourceError(f"decode exceeded {timeout_s}s timeout (possible resource bomb)") from e
-    if max_stdout_bytes is not None and len(proc.stdout) > max_stdout_bytes:
-        proc = subprocess.CompletedProcess(proc.args, proc.returncode,
-                                           proc.stdout[:max_stdout_bytes], proc.stderr)
-    return proc
+    except BaseException:
+        p.kill()
+        p.wait()
+        raise
+    return subprocess.CompletedProcess(argv, p.returncode, out.join(5), err.join(5))
+
+
+class _BoundedReader:
+    """Drain a pipe in a thread, keeping at most ``cap`` bytes (head) so a flood of tool output
+    can never grow memory. ``tail`` keeps the LAST bytes instead (for error context)."""
+
+    def __init__(self, pipe, cap: int, tail: bool = False) -> None:
+        import threading
+
+        self._pipe, self._cap, self._tail = pipe, cap, tail
+        self.data = bytearray()
+        self.truncated = False
+        self._t = threading.Thread(target=self._run, daemon=True)
+        self._t.start()
+
+    def _run(self) -> None:
+        try:
+            while True:
+                chunk = self._pipe.read(65536)
+                if not chunk:
+                    break
+                if self._tail:
+                    self.data += chunk
+                    if len(self.data) > self._cap:
+                        del self.data[:len(self.data) - self._cap]
+                        self.truncated = True
+                elif len(self.data) < self._cap:
+                    self.data += chunk[: self._cap - len(self.data)]
+                else:
+                    self.truncated = True
+        except (OSError, ValueError):
+            pass
+
+    def join(self, timeout: float | None = None) -> bytes:
+        self._t.join(timeout)
+        return bytes(self.data)
+
+
+def pass_timeout(settings: Settings, duration_s: float) -> float:
+    """Wall-clock budget for one analysis pass, scaled by DECLARED duration so a legitimate
+    3-hour master can finish while a bomb is still bounded (duration is capped before decode)."""
+    return settings.decode_timeout_s + max(0.0, duration_s) * settings.decode_timeout_per_audio_s
+
+
+def pcm_pipeline(path: Path, settings: Settings, *, stream: int, channels: int,
+                 sample_rate: int, analysis: list[str], timeout_s: float,
+                 pre_input: list[str] | None = None, layout: str = "",
+                 verbose: bool = False, max_stderr: int = 128 * 1024 * 1024) -> str:
+    """Decode the untrusted file to raw float PCM in one process and ANALYSE it in another.
+
+    The analysing ffmpeg only ever sees a raw PCM stream (no container, no metadata, no tags), so
+    nothing attacker-controlled can appear in the stderr we parse for measurements. The decoding
+    ffmpeg runs quietly (``-v error``) with only a 64 KB stderr tail kept. Both processes run in
+    argv form under RLIMITs and share one wall-clock deadline; on timeout both are killed.
+    Returns the analysing process's stderr (trusted text).
+    """
+    import time
+
+    ffmpeg = _tool("ffmpeg", settings.ffmpeg_path)
+    ch = max(1, int(channels))
+    sr = max(1, int(sample_rate))
+    decode = [ffmpeg, "-nostdin", "-hide_banner", "-v", "error", "-threads", "1",
+              *(pre_input or []), *safe_input(path), "-map", f"0:a:{int(stream)}",
+              "-t", str(settings.max_duration_s), "-vn", "-sn", "-dn", "-map_metadata", "-1",
+              "-ac", str(ch), "-ar", str(sr), "-f", "f32le", "-acodec", "pcm_f32le", "pipe:1"]
+    lay = ["-ch_layout", layout] if layout in CHANNEL_LABELS else []
+    analyse = [ffmpeg, "-nostdin", "-hide_banner", "-v", "verbose" if verbose else "info",
+               "-threads", "1", "-f", "f32le", "-ar", str(sr), "-ac", str(ch), *lay,
+               "-i", "pipe:0", *analysis]
+    pre = _rlimit_setter(int(timeout_s) + _RLIMIT_CPU_PAD_S) if os.name == "posix" else None
+    p1 = subprocess.Popen(decode, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, preexec_fn=pre)
+    try:
+        p2 = subprocess.Popen(analyse, stdin=p1.stdout, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.PIPE, preexec_fn=pre)
+    except BaseException:
+        p1.kill()
+        p1.wait()
+        raise
+    assert p1.stdout is not None and p1.stderr is not None and p2.stderr is not None
+    p1.stdout.close()  # p2 owns the read end now (so p1 gets SIGPIPE if p2 exits)
+    err1 = _BoundedReader(p1.stderr, 64 * 1024, tail=True)
+    err2 = _BoundedReader(p2.stderr, max_stderr)
+    deadline = time.monotonic() + timeout_s
+    try:
+        for proc in (p2, p1):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(analyse, timeout_s)
+            proc.wait(timeout=remaining)
+    except subprocess.TimeoutExpired as e:
+        for proc in (p1, p2):
+            proc.kill()
+        for proc in (p1, p2):
+            proc.wait()
+        raise UnsafeSourceError(f"analysis exceeded {timeout_s:.0f}s (possible resource bomb)") from e
+    except BaseException:
+        for proc in (p1, p2):
+            proc.kill()
+            proc.wait()
+        raise
+    tail1 = err1.join(5).decode("utf-8", "replace")
+    out2 = err2.join(5).decode("utf-8", "replace")
+    if p1.returncode not in (0, None) and not out2:
+        raise DecodeError(f"could not decode audio: {tail1[-200:]}")
+    if p2.returncode != 0:
+        raise DecodeError(f"analysis failed (rc={p2.returncode})")
+    if p1.returncode not in (0, None) and p1.returncode != -13:  # -13 = SIGPIPE after p2 ended
+        raise DecodeError(f"could not decode audio: {tail1[-200:]}")
+    return out2
 
 
 def validate_source(source: str | os.PathLike, settings: Settings, *, allow_local_files: bool | None = None) -> Path:
@@ -245,6 +357,10 @@ def probe(path: Path, settings: Settings) -> MediaInfo:
         )
     if sample_rate > settings.max_sample_rate:
         raise UnsafeSourceError(f"sample rate {sample_rate} exceeds the {settings.max_sample_rate} cap")
+    if duration_s * max(1, len(astreams)) > settings.max_total_audio_s:
+        raise UnsafeSourceError(
+            f"{len(astreams)} audio stream(s) x {duration_s:.0f}s exceeds the "
+            f"{settings.max_total_audio_s:.0f}s total-audio budget")
     if len(astreams) > settings.max_audio_streams:
         raise UnsafeSourceError(
             f"{len(astreams)} audio streams exceeds the {settings.max_audio_streams}-stream cap")
@@ -316,13 +432,17 @@ def decode_to_wav(path: Path, settings: Settings, *, sample_rate: int = 16000,
     process more than ``max_duration_s`` of audio even if the container lies about its length.
     """
     ffmpeg = _tool("ffmpeg", settings.ffmpeg_path)
-    fd, name = tempfile.mkstemp(suffix=".wav", prefix="audel-asr-")
+    fd, name = tempfile.mkstemp(suffix=".wav", prefix="audel-asr-", dir=_tmp_dir(settings))
     os.close(fd)
     out = Path(name)
     argv = [ffmpeg, "-nostdin", "-hide_banner", "-threads", "1", *safe_input(path),
             "-map", f"0:a:{int(stream)}?", "-t", str(settings.max_duration_s),
             "-ar", str(sample_rate), "-ac", "1", "-f", "wav", "-y", str(out)]
-    proc = run(argv, timeout_s=settings.decode_timeout_s)
+    try:
+        proc = run(argv, timeout_s=pass_timeout(settings, settings.max_duration_s))
+    except BaseException:
+        out.unlink(missing_ok=True)
+        raise
     if proc.returncode != 0 or out.stat().st_size == 0:
         out.unlink(missing_ok=True)
         raise DecodeError(f"could not decode audio for ASR: {proc.stderr.decode('utf-8', 'replace')[-200:]}")
@@ -335,14 +455,25 @@ def excerpt_wav(path: Path, settings: Settings, *, start_s: float, dur_s: float,
     hears. Duration is clamped to 60 s whatever the caller asks for."""
     ffmpeg = _tool("ffmpeg", settings.ffmpeg_path)
     dur = max(0.5, min(60.0, float(dur_s)))
-    fd, name = tempfile.mkstemp(suffix=".wav", prefix="audel-excerpt-")
+    fd, name = tempfile.mkstemp(suffix=".wav", prefix="audel-excerpt-", dir=_tmp_dir(settings))
     os.close(fd)
     out = Path(name)
     argv = [ffmpeg, "-nostdin", "-hide_banner", "-threads", "1", "-ss", f"{max(0.0, start_s):.3f}",
             *safe_input(path), "-map", f"0:a:{int(stream)}?", "-t", f"{dur:.3f}",
             "-ar", str(sample_rate), "-ac", "1", "-f", "wav", "-y", str(out)]
-    proc = run(argv, timeout_s=min(60.0, settings.decode_timeout_s))
+    try:
+        proc = run(argv, timeout_s=min(60.0, settings.decode_timeout_s))
+    except BaseException:
+        out.unlink(missing_ok=True)
+        raise
     if proc.returncode != 0 or out.stat().st_size == 0:
         out.unlink(missing_ok=True)
         raise DecodeError("could not cut an audio excerpt")
     return out
+
+
+def _tmp_dir(settings: Settings) -> str:
+    """Temp files go under the private workspace (0700, reaped by ``audel purge``)."""
+    from .workspace import Workspace
+
+    return str(Workspace(settings).tmp)

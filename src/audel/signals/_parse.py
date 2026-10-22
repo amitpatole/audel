@@ -16,8 +16,8 @@ _RE_PEAK = re.compile(r"Peak level dB:\s*(-?[\d.]+|-?inf|nan)")
 _RE_RMS = re.compile(r"RMS level dB:\s*(-?[\d.]+|-?inf|nan)")
 _RE_DC = re.compile(r"DC offset:\s*(-?[\d.]+|-?inf|nan)")
 _RE_FLAT = re.compile(r"Flat factor:\s*(-?[\d.]+|-?inf|nan)")
-_RE_SIL_START = re.compile(r"silence_start:\s*(-?[\d.]+)")
-_RE_SIL_END = re.compile(r"silence_end:\s*(-?[\d.]+)")
+_RE_SIL_START = re.compile(r"silence_start:\s*(-?\d+(?:\.\d+)?)\b")
+_RE_SIL_END = re.compile(r"silence_end:\s*(-?\d+(?:\.\d+)?)\b")
 
 
 def _f(s: str | None) -> float | None:
@@ -54,10 +54,19 @@ def parse_astats(text: str) -> dict:
             "dc": _first(_RE_DC, text), "flat": _first(_RE_FLAT, text)}
 
 
+def _floats(rx: re.Pattern, text: str) -> list[float]:
+    out = []
+    for m in rx.finditer(text):
+        v = _f(m.group(1))
+        if v is not None and math.isfinite(v):
+            out.append(v)
+    return out
+
+
 def parse_silences(text: str) -> list[tuple[float, float]]:
     """Pair silence_start/silence_end in order; a dangling start (file ends silent) ends at -1."""
-    starts = [float(m.group(1)) for m in _RE_SIL_START.finditer(text)]
-    ends = [float(m.group(1)) for m in _RE_SIL_END.finditer(text)]
+    starts = _floats(_RE_SIL_START, text)
+    ends = _floats(_RE_SIL_END, text)
     spans: list[tuple[float, float]] = []
     for i, s in enumerate(starts):
         e = ends[i] if i < len(ends) else -1.0
@@ -81,7 +90,7 @@ def parse_frames(text: str) -> list[tuple[float, float | None, float | None, flo
     Per-channel FTPK values are reduced to their max (the deliverable's frame peak).
     """
     out: list[tuple[float, float | None, float | None, float | None]] = []
-    for line in text.splitlines():
+    for line in text.split("\n"):
         if "TARGET:" not in line:
             continue
         m = _RE_FRAME.search(line)
@@ -111,7 +120,7 @@ def parse_astats_sections(text: str) -> dict[int, dict]:
               "Flat factor": "flat", "RMS trough dB": "rms_trough", "Noise floor dB": "noise_floor"}
     out: dict[int, dict] = {}
     current: dict[int, dict | None] = {}
-    for line in text.splitlines():
+    for line in text.split("\n"):
         im = _RE_INSTANCE.search(line)
         if not im or im.group(1) != "astats":
             continue
@@ -137,7 +146,7 @@ def parse_astats_sections(text: str) -> dict[int, dict]:
 def parse_metadata_series(text: str) -> dict[int, list[float]]:
     """``ametadata=mode=print`` astats RMS series keyed by ametadata instance (−inf → −150 dB)."""
     out: dict[int, list[float]] = {}
-    for line in text.splitlines():
+    for line in text.split("\n"):
         im = _RE_INSTANCE.search(line)
         if not im or im.group(1) != "ametadata":
             continue

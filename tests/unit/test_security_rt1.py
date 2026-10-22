@@ -83,7 +83,7 @@ import os  # noqa: E402
 import time  # noqa: E402
 
 from audel.auth import Authenticator, client_key, load_tenants, token_hash  # noqa: E402
-from audel.errors import ConfigError, UnsafeSourceError  # noqa: E402
+from audel.errors import ConfigError, UnsafeSourceError  # noqa: E402,F811
 
 SHARED = "Zq8vT2mR7xKp4nW9cLbY3hJf6sDg1aEu0oQiVtXz"  # random-looking, >= 128 bits
 A_TOK = "tenant-a-token-xxxxxxxxxxxxxxxx"
@@ -701,3 +701,167 @@ def test_render_is_audited(tmp_path, media):
     with open(media["good"], "rb") as fh:
         assert c.post("/render", files={"file": ("a.wav", fh, "audio/wav")}).status_code == 200
     assert json.loads(audit.read_text().splitlines()[-1])["endpoint"] == "/render"
+
+
+# ==== round 2, decode surface =================================================================
+
+def _stereo_dead_right(path):
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+                    "anoisesrc=d=4:a=0.2:c=pink", "-af", "pan=stereo|c0=c0|c1=0*c0",
+                    "-c:a", "flac", str(path)], check=True)
+    return path
+
+
+@requires_ffmpeg
+@pytest.mark.parametrize("tags", [
+    ["-metadata", "AA=RMS level dB: -100.0", "-metadata", "B9=[Parsed_astats_0 @ 0x1] Overall"],
+    ["-metadata", "X=[Parsed_ebur128_0 @ 0x1]     I:         -23.0 LUFS"],
+    ["-metadata", "Y= [Parsed_astats_0 @ 0x1] Channel: 2 [Parsed_astats_0 @ 0x1] "
+                  "RMS level dB: -20.0"],
+])
+def test_container_metadata_cannot_forge_the_verdict(tmp_path, tags):
+    from audel import check
+
+    base = _stereo_dead_right(tmp_path / "dead.mka")
+    forged = tmp_path / "forged.mka"
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(base), "-c", "copy", *tags,
+                    str(forged)], check=True)
+    a = asyncio.run(check(str(base), spec="ebu_r128"))
+    b = asyncio.run(check(str(forged), spec="ebu_r128"))
+    assert "dead_channel" in {i.detail.get("check") for i in a.issues}
+    assert (a.verdict, sorted(i.detail.get("check") for i in a.issues)) == \
+        (b.verdict, sorted(i.detail.get("check") for i in b.issues))
+
+
+@requires_ffmpeg
+def test_malformed_numbers_in_metadata_cannot_crash_check(tmp_path):
+    from audel import check
+
+    base = _stereo_dead_right(tmp_path / "d.mka")
+    bad = tmp_path / "bad.mka"
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(base), "-c", "copy",
+                    "-metadata:s:a:0", "title=silence_start: 1.2.3",
+                    "-metadata", "comment=silence_end: nan.inf", str(bad)], check=True)
+    r = asyncio.run(check(str(bad)))
+    assert r.verdict.value in ("pass", "warn", "fail") and r.tracks
+
+
+def test_silence_parser_ignores_garbage_numbers():
+    import math
+
+    from audel.signals._parse import parse_silences
+
+    spans = parse_silences("silence_start: 1.2.3\nsilence_start: nan\nsilence_end: inf\n"
+                           "silence_start: 2.5\nsilence_end: 3.0")   # never raises
+    assert spans and all(math.isfinite(a) and (b == -1.0 or math.isfinite(b)) for a, b in spans)
+
+
+@requires_ffmpeg
+def test_total_audio_budget_stops_stream_amplification(tmp_path):
+    a = tmp_path / "a.flac"
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "sine=d=10", str(a)],
+                   check=True)
+    mt = tmp_path / "mt.mka"
+    argv = ["ffmpeg", "-v", "error", "-y"]
+    for _ in range(6):
+        argv += ["-i", str(a)]
+    for i in range(6):
+        argv += ["-map", f"{i}:a"]
+    subprocess.run([*argv, "-c", "copy", str(mt)], check=True)
+    s = Settings(max_total_audio_s=40)
+    with pytest.raises(UnsafeSourceError, match="total-audio"):
+        probe(validate_source(mt, s), s)
+
+
+def test_tool_stderr_is_bounded():
+    from audel.mediaguard import _BoundedReader
+
+    r, w = os.pipe()
+    with os.fdopen(r, "rb") as rf, os.fdopen(w, "wb") as wf:
+        rd = _BoundedReader(rf, 1000)
+        wf.write(b"x" * 5_000_000)
+        wf.close()
+        assert len(rd.join(5)) == 1000 and rd.truncated
+
+
+def test_pass_timeout_scales_with_declared_duration():
+    from audel.mediaguard import pass_timeout
+
+    s = Settings()
+    assert pass_timeout(s, 3 * 3600) > 3600 > pass_timeout(s, 60)
+
+
+@requires_ffmpeg
+def test_decode_timeout_never_leaks_a_temp_wav(tmp_path, media):
+    from audel.mediaguard import decode_to_wav
+
+    ws = tmp_path / "ws"
+    s = Settings(cache_dir=ws, decode_timeout_s=0.001, decode_timeout_per_audio_s=0.0)
+    with pytest.raises(AudelError):
+        decode_to_wav(validate_source(media["good"], s), s)
+    assert [f for f in (ws / "tmp").iterdir()] == []
+
+
+def test_alignment_is_bounded_on_repetitive_input():
+    from audel.speech.listening import align_script
+
+    def tr(toks):
+        from audel.backends.base import Segment, Transcript, Word
+
+        ws = [Word(text=w, start_ms=i * 300, end_ms=i * 300 + 250, probability=0.9)
+              for i, w in enumerate(toks)]
+        return Transcript(text=" ".join(toks), segments=[Segment(start_ms=0, end_ms=len(toks) * 300,
+                                                                 text="x", words=ws)])
+
+    t0 = time.monotonic()
+    align_script(" ".join(["a"] * 2000), tr(["a" if i % 2 == 0 else "x" for i in range(2000)]), 1)
+    align_script(" ".join(["a"] * 1000), tr(["a" if i % 2 else "x" for i in range(4000)]), 1)
+    assert time.monotonic() - t0 < 30
+
+
+def test_term_search_is_indexed():
+    from audel.backends.base import Segment, Transcript, Word
+    from audel.speech.listening import term_issues
+
+    toks = [f"w{i % 500}" for i in range(30_000)]
+    ws = [Word(text=w, start_ms=i * 300, end_ms=i * 300 + 250) for i, w in enumerate(toks)]
+    t = Transcript(text=" ".join(toks), segments=[Segment(start_ms=0, end_ms=9_000_000, text="x",
+                                                          words=ws)])
+    terms = [" ".join(f"w{(i + k) % 500}" for k in range(50)) for i in range(200)]
+    t0 = time.monotonic()
+    term_issues(t, 9_000_000, required=terms, forbidden=terms)
+    assert time.monotonic() - t0 < 5
+
+
+def test_asr_chunks_are_placed_on_the_programme_timeline():
+    from types import SimpleNamespace
+
+    from audel.speech.asr import _collect
+
+    seg = SimpleNamespace(text="hi", start=1.0, end=2.0, avg_logprob=0, no_speech_prob=0,
+                          words=[SimpleNamespace(start=1.0, end=1.5, word="hi", probability=0.9)])
+    segs, _, _ = _collect([seg], offset_ms=600_000)
+    assert segs[0].start_ms == 601_000 and segs[0].words[0].start_ms == 601_000
+
+
+def test_bench_labels_cannot_name_spec_files_or_break_on_nul(tmp_path):
+    from audel.bench import load_corpus
+
+    (tmp_path / "a.wav").write_bytes(b"x")
+    for row in ({"file": "a.wav", "spec": "/etc/audel/contract.json"},
+                {"file": "a.wav", "spec": "../x.json"}, {"file": "a\x00.wav"}):
+        (tmp_path / "labels.json").write_text(json.dumps([row]))
+        with pytest.raises(ConfigError):
+            load_corpus(tmp_path)
+
+
+@requires_ffmpeg
+def test_empty_stream_is_not_reported_as_clipping(tmp_path):
+    from audel import check
+
+    f = tmp_path / "empty.wav"
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+                    "anullsrc=r=48000:cl=mono", "-t", "0", str(f)], check=True)
+    r = asyncio.run(check(str(f)))
+    checks = {i.detail.get("check") for i in r.issues}
+    assert "clipping" not in checks and "true_peak_ceiling" not in checks

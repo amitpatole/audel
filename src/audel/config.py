@@ -146,7 +146,9 @@ class Settings(BaseSettings):
     max_duration_s: float = 3 * 60 * 60      # 3h duration cap (decompression-bomb bound)
     max_sample_rate: int = 192_000           # reject absurd sample rates
     max_channels: int = 64                    # reject channel-count bombs (broadcast tops out ~16)
-    decode_timeout_s: float = 120.0          # hard timeout on the ffmpeg subprocess
+    decode_timeout_s: float = 120.0          # base timeout per ffmpeg pass ...
+    decode_timeout_per_audio_s: float = 0.5  # ... plus this many seconds per second of audio
+    max_total_audio_s: float = 4 * 3600      # streams x duration budget per file (amplification)
     ffmpeg_path: str | None = None           # explicit ffmpeg binary; else auto-detected
 
     # watch() temporal bounds (Phase 4)

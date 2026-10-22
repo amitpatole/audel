@@ -125,6 +125,27 @@ All notable changes to Audel are recorded here. The format follows
   - **Low.** The message sanitizer now redacts registered server roots exactly, plus Windows,
     percent-encoded and IPv6 forms, server temp names and ffmpeg pointer addresses.
   - **Low.** `/render` and `/handoff` now go through the grading timeout and the audit log.
+- Red-team round 2 fixes (decode and resource surface), each pinned by a regression test:
+  - **High.** ffmpeg printed container metadata into the same stderr the measurement parsers read,
+    so two crafted tags could turn a FAIL into a PASS and a malformed tag could crash `check`.
+    Every measurement pass is now a two-process pipeline. Untrusted decode goes to raw float PCM,
+    and analysis runs on PCM that carries no metadata. Parsers tolerate malformed numbers.
+  - **Medium.** Stream-count amplification. There is now a total-audio budget, streams times
+    duration (`AUDEL_MAX_TOTAL_AUDIO_S`).
+  - **Medium.** Tool stderr was buffered without a cap. Every subprocess now uses bounded readers.
+  - **Medium.** Repetitive script and transcript pairs made alignment take minutes. Alignment now
+    uses smaller windows under a wall-clock budget, and truncation is reported.
+  - **Medium/Low.** ASR loaded the whole programme into memory (1.7 GB for 3 h). Transcription now
+    runs in 10-minute chunks, peaking at about 160 MB for 3 h.
+  - **Low.** Temp WAVs leaked on ffmpeg timeout. They are now removed on every exit and created
+    inside the private workspace.
+  - **Low.** Term search is indexed: at the caps it now takes 0.3 s instead of 17 s.
+  - **Low.** Bench `labels.json` specs are built-in names only, and a NUL in a file name is a
+    config error.
+  - **Fixed.** Real 3-hour broadcast masters exceeded the fixed 120 s decode timeout. Timeouts now
+    scale with declared duration (`AUDEL_DECODE_TIMEOUT_PER_AUDIO_S`).
+  - **Fixed.** An empty audio stream was reported as 0 dBTP clipping. It is now reported as an
+    empty stream.
 - **Per-tenant tokens.** `AUDEL_API_TOKENS_FILE` holds SHA-256 hashes only, and
   `audel token new` mints a token. All tenant hashes are compared in constant time on every
   request.

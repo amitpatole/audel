@@ -48,6 +48,7 @@ class ScriptResult:
     heard_words: int
     wer: float
     deviations: list[ScriptDeviation] = field(default_factory=list)
+    truncated: bool = False
 
     @property
     def adherence(self) -> float:
@@ -87,19 +88,29 @@ def _gap_span(words: list[Word], j: int, duration_ms: int) -> tuple[int, int]:
     return start, max(start, end)
 
 
-_EXACT_LIMIT = 4_000_000   # script x heard tokens below this: one exact alignment
-_CHUNK = 600               # otherwise align ~600-token script windows against nearby speech
+_EXACT_LIMIT = 250_000     # script x heard tokens below this: one exact alignment
+_CHUNK = 150               # otherwise align ~150-token script windows against nearby speech
+_ALIGN_BUDGET_S = 20.0     # wall-clock budget; past it the alignment is reported as truncated
 
 
-def _opcodes(s_toks: list[str], h_toks: list[str]):
-    """difflib opcodes, exact for normal sizes; windowed (O(n x window)) for very large pairs so
-    alignment time stays bounded whatever the input."""
+def _opcodes(s_toks: list[str], h_toks: list[str], state: dict | None = None):
+    """difflib opcodes, exact for small pairs; windowed (O(n x window)) otherwise, under a
+    wall-clock budget (``state["truncated"]`` is set when it runs out) so alignment time stays
+    bounded whatever the input, including adversarially repetitive text."""
+    import time
+
+    state = state if state is not None else {}
     if len(s_toks) * max(1, len(h_toks)) <= _EXACT_LIMIT:
         yield from difflib.SequenceMatcher(None, s_toks, h_toks, autojunk=False).get_opcodes()
         return
+    deadline = time.monotonic() + _ALIGN_BUDGET_S
     j = 0
     ratio = len(h_toks) / max(1, len(s_toks))
     for i in range(0, len(s_toks), _CHUNK):
+        if time.monotonic() > deadline:
+            state["truncated"] = True
+            state["aligned_upto"] = i
+            return
         a = s_toks[i:i + _CHUNK]
         last = i + _CHUNK >= len(s_toks)
         # heard window: proportional extent plus slack, starting where the last chunk ended
@@ -126,7 +137,8 @@ def align_script(script: str, transcript: Transcript, duration_ms: int) -> Scrip
     h_toks = [w.text for w in words]
     edits = 0
     devs: list[ScriptDeviation] = []
-    for tag, i1, i2, j1, j2 in _opcodes(s_toks, h_toks):
+    state: dict = {}
+    for tag, i1, i2, j1, j2 in _opcodes(s_toks, h_toks, state):
         if tag == "equal":
             continue
         a, b = i2 - i1, j2 - j1
@@ -143,8 +155,10 @@ def align_script(script: str, transcript: Transcript, duration_ms: int) -> Scrip
         elif tag == "insert":
             devs.append(ScriptDeviation("insertion", "", " ".join(h_toks[j1:j2]),
                                         heard[0].start_ms, heard[-1].end_ms, b, low))
-    wer = edits / len(s_toks) if s_toks else 0.0
-    return ScriptResult(script_words=len(s_toks), heard_words=len(h_toks), wer=wer, deviations=devs)
+    denom = state.get("aligned_upto", len(s_toks)) or 1
+    wer = edits / denom if s_toks else 0.0
+    return ScriptResult(script_words=len(s_toks), heard_words=len(h_toks), wer=wer,
+                        deviations=devs, truncated=bool(state.get("truncated")))
 
 
 def script_issues(res: ScriptResult) -> list[Issue]:
@@ -162,8 +176,14 @@ def script_issues(res: ScriptResult) -> list[Issue]:
         else:
             sev = Severity.WARNING
             msg = f"unscripted words: \"{d.heard[:160]}\""
-        conf = Confidence.HIGH if line and not d.low_confidence else (
-            Confidence.LOW if d.low_confidence else Confidence.MEDIUM)
+        # Only a dropped LINE is high-confidence: substitutions and ad-libs are often recognition
+        # errors, so they stay medium (or low when the recogniser itself was unsure).
+        if d.low_confidence:
+            conf = Confidence.LOW
+        elif d.op == "omission" and line:
+            conf = Confidence.HIGH
+        else:
+            conf = Confidence.MEDIUM
         out.append(Issue.make(IssueKind.TRANSCRIPT_MISMATCH, sev, msg,
                               span=Span(start_ms=d.start_ms, end_ms=d.end_ms),
                               source=IssueSource.ASR, confidence=conf,
@@ -172,22 +192,33 @@ def script_issues(res: ScriptResult) -> list[Issue]:
     return out
 
 
-def _find(seq: list[str], needle: list[str]) -> list[int]:
+def _find(seq: list[str], needle: list[str], index: dict[str, list[int]] | None = None) -> list[int]:
+    """Start positions of ``needle`` in ``seq``. With a token->positions index only candidate
+    positions are checked (linear in matches, not in sequence length x terms)."""
     if not needle:
         return []
     n = len(needle)
-    return [i for i in range(len(seq) - n + 1) if seq[i:i + n] == needle]
+    starts = index.get(needle[0], []) if index is not None else range(len(seq) - n + 1)
+    return [i for i in starts if seq[i:i + n] == needle]
+
+
+def _index(seq: list[str]) -> dict[str, list[int]]:
+    idx: dict[str, list[int]] = {}
+    for i, t in enumerate(seq):
+        idx.setdefault(t, []).append(i)
+    return idx
 
 
 def term_issues(transcript: Transcript, duration_ms: int, *, required: list[str] | None = None,
                 forbidden: list[str] | None = None) -> tuple[list[Issue], dict[str, bool]]:
     words = timed_words(transcript)
     toks = [w.text for w in words]
+    index = _index(toks)
     found: dict[str, bool] = {}
     out: list[Issue] = []
     for term in (required or [])[:200]:
         needle = _tokens(term)[:50]
-        hits = _find(toks, needle)
+        hits = _find(toks, needle, index)[:1000]
         found[term] = bool(hits)
         if not hits:
             out.append(Issue.make(IssueKind.TRANSCRIPT_MISMATCH, Severity.ERROR,
@@ -197,7 +228,7 @@ def term_issues(transcript: Transcript, duration_ms: int, *, required: list[str]
                                   detail={"check": "required_term", "term": term[:200]}))
     for term in (forbidden or [])[:200]:
         needle = _tokens(term)[:50]
-        hits = _find(toks, needle)
+        hits = _find(toks, needle, index)[:1000]
         found[term] = bool(hits)
         for i in hits[:20]:
             out.append(Issue.make(IssueKind.INTENT_MISMATCH, Severity.ERROR,

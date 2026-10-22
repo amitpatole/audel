@@ -117,5 +117,5 @@ jobs in parallel to use more cores.
 
 | Workload | Wall time | Peak memory |
 |---|---|---|
-| 10 min stereo, `ebu_r128` | 13.8 s (about 43x realtime) | 61 MB |
+| 10 min stereo, `ebu_r128` | 16.1 s (about 37x realtime) | 59 MB |
 | 10 min stereo, `netflix` (speech-gated) | 17.1 s | 380 MB |

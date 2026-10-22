@@ -281,6 +281,13 @@ def evaluate(m: Measurements, settings: Settings, spec: DeliverySpec | str | Non
     multi = len(m.tracks) > 1
     for tm in m.tracks:
         label = _track_label(tm, multi)
+        if not tm.frames and (tm.rms_dbfs is None or not math.isfinite(tm.rms_dbfs)):
+            # No samples were measured at all: report it once instead of trusting the meters'
+            # placeholder values (an empty stream otherwise reads as 0 dBTP "clipping").
+            issues.append(_issue(IssueKind.SILENCE, Severity.CRITICAL,
+                                 f"{label}the audio stream contains no samples", _full_span(dur),
+                                 "empty_stream", tm))
+            continue
         found, dead = _silence(tm, dur, settings, label)
         issues.extend(found)
         if dead:

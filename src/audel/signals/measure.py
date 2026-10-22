@@ -20,7 +20,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from ..config import Settings
-from ..mediaguard import MediaInfo, StreamInfo, _tool, run, safe_input
+from ..errors import AudelError
+from ..mediaguard import MediaInfo, StreamInfo, _tool, pass_timeout, pcm_pipeline
 from ..signals._parse import (
     parse_astats,
     parse_astats_sections,
@@ -84,22 +85,29 @@ class Measurements:
     tracks: list[TrackMeasurements] = field(default_factory=list)
 
 
-def _main_pass(ffmpeg: str, path, idx: int, st: StreamInfo, settings: Settings) -> TrackMeasurements:
+def _rate(st: StreamInfo) -> int:
+    return st.sample_rate if 8000 <= st.sample_rate <= 384_000 else 48000
+
+
+def _pipe(path, st: StreamInfo, settings: Settings, analysis: list[str], dur_s: float, *,
+          pre_input: list[str] | None = None, verbose: bool = False) -> str:
+    return pcm_pipeline(path, settings, stream=st.index, channels=st.channels or 1,
+                        sample_rate=_rate(st), layout=st.layout, analysis=analysis,
+                        timeout_s=pass_timeout(settings, dur_s), pre_input=pre_input,
+                        verbose=verbose)
+
+
+def _main_pass(ffmpeg: str, path, idx: int, st: StreamInfo, settings: Settings,
+               dur_s: float = 0.0) -> TrackMeasurements:
     af = (
         "ebur128=peak=true:framelog=verbose,"
         "astats=metadata=0:measure_perchannel=Peak_level+RMS_level+DC_offset"
         ":measure_overall=Peak_level+RMS_level+DC_offset+Flat_factor,"
         f"silencedetect=noise={settings.silence_dbfs}dB:d=0.5"
     )
-    # `-t max_duration_s` bounds how much is actually processed even if the container LIES about
-    # its duration (the probe cap trusts metadata; this caps the real decode regardless).
-    argv = [ffmpeg, "-nostdin", "-hide_banner", "-v", "verbose", "-threads", "1", *safe_input(path),
-            "-map", f"0:a:{idx}?", "-t", str(settings.max_duration_s), "-af", af, "-f", "null", "-"]
-    proc = run(argv, timeout_s=settings.decode_timeout_s)
-    err = proc.stderr.decode("utf-8", "replace")
-    if proc.returncode != 0:
-        from ..errors import DecodeError
-        raise DecodeError(f"ffmpeg analysis failed (rc={proc.returncode}): {err[-300:]}")
+    # The untrusted file is decoded in a separate process; this analysis sees raw PCM only, so
+    # container metadata can never appear in the text parsed below.
+    err = _pipe(path, st, settings, ["-af", af, "-f", "null", "-"], dur_s, verbose=True)
 
     tm = TrackMeasurements(stream=st)
     eb = parse_ebur128(err)
@@ -124,7 +132,8 @@ def _main_pass(ffmpeg: str, path, idx: int, st: StreamInfo, settings: Settings) 
     return tm
 
 
-def _spectral_pass(ffmpeg: str, path, idx: int, tm: TrackMeasurements, settings: Settings) -> None:
+def _spectral_pass(ffmpeg: str, path, idx: int, tm: TrackMeasurements, settings: Settings,
+                   dur_s: float = 0.0) -> None:
     n = _SERIES_RATE // SERIES_HZ
     series = ("astats=metadata=1:reset=1:measure_perchannel=none:measure_overall=RMS_level,"
               "ametadata=mode=print:key=lavfi.astats.Overall.RMS_level")
@@ -133,25 +142,23 @@ def _spectral_pass(ffmpeg: str, path, idx: int, tm: TrackMeasurements, settings:
         return f"bandpass=f={f}:width_type=q:w=15,bandpass=f={f}:width_type=q:w=15"
 
     stereo = tm.stream.channels >= 2
-    graph = [f"[0:a:{idx}]asplit=2[r1][r2]" if stereo else f"[0:a:{idx}]anull[r1]",
+    graph = ["[0:a:0]asplit=2[r1][r2]" if stereo else "[0:a:0]anull[r1]",
              f"[r1]aresample={_SERIES_RATE},aformat=channel_layouts=mono,"
              f"asetnsamples=n={n}:p=0,asplit=3[t][a][b]",
              f"[t]{series}[ot]", f"[a]{band(50)},{series}[o50]", f"[b]{band(60)},{series}[o60]"]
     outs = ["[ot]", "[o50]", "[o60]"]
     if stereo:
-        # Mid = (L+R)/2, Side = (L-R)/2 over the first channel pair. Side ≫ mid = polarity problem.
+        # Mid = (L+R)/2, Side = (L-R)/2 over the first channel pair. Side >> mid = polarity problem.
         graph.append("[r2]pan=stereo|c0=0.5*c0+0.5*c1|c1=0.5*c0-0.5*c1,"
                      "astats=metadata=0:measure_perchannel=RMS_level:measure_overall=none[oms]")
         outs.append("[oms]")
-    # Input-side -t: with several outputs an output-side -t would bound only the first one.
-    argv = [ffmpeg, "-nostdin", "-hide_banner", "-threads", "1", "-t", str(settings.max_duration_s),
-            *safe_input(path), "-filter_complex", ";".join(graph)]
+    analysis = ["-filter_complex", ";".join(graph)]
     for o in outs:
-        argv += ["-map", o, "-f", "null", "-"]
-    proc = run(argv, timeout_s=settings.decode_timeout_s)
-    if proc.returncode != 0:
+        analysis += ["-map", o, "-f", "null", "-"]
+    try:
+        err = _pipe(path, tm.stream, settings, analysis, dur_s)
+    except AudelError:
         return  # best-effort: the main pass already graded the essentials
-    err = proc.stderr.decode("utf-8", "replace")
     ser = parse_metadata_series(err)
     keys = sorted(ser)  # instance numbers follow graph order: total, 50 Hz, 60 Hz
     if len(keys) >= 3:
@@ -166,19 +173,21 @@ def _spectral_pass(ffmpeg: str, path, idx: int, tm: TrackMeasurements, settings:
 
 def _tail_pass(ffmpeg: str, path, idx: int, tm: TrackMeasurements, settings: Settings) -> None:
     # Truncation cue: RMS of the final 250 ms. A clip that ends loud (no trailing decay/silence)
-    # is a likely mid-word cut. Bounded second pass via -sseof.
-    tail = run([ffmpeg, "-nostdin", "-hide_banner", "-threads", "1", "-sseof", "-0.25",
-                *safe_input(path), "-map", f"0:a:{idx}?",
-                "-af", "astats=metadata=0:measure_overall=RMS_level:measure_perchannel=none",
-                "-f", "null", "-"], timeout_s=min(30.0, settings.decode_timeout_s))
-    tm.tail_rms_dbfs = parse_astats(tail.stderr.decode("utf-8", "replace")).get("rms")
+    # is a likely mid-word cut. Bounded pass via -sseof on the decoding side.
+    try:
+        err = _pipe(path, tm.stream, settings,
+                    ["-af", "astats=metadata=0:measure_overall=RMS_level:measure_perchannel=none",
+                     "-f", "null", "-"], 1.0, pre_input=["-sseof", "-0.25"])
+    except AudelError:
+        return
+    tm.tail_rms_dbfs = parse_astats(err).get("rms")
 
 
-def measure_track(path, st: StreamInfo, settings: Settings) -> TrackMeasurements:
+def measure_track(path, st: StreamInfo, settings: Settings, dur_s: float = 0.0) -> TrackMeasurements:
     ffmpeg = _tool("ffmpeg", settings.ffmpeg_path)
-    tm = _main_pass(ffmpeg, path, st.index, st, settings)
+    tm = _main_pass(ffmpeg, path, st.index, st, settings, dur_s)
     if settings.hum_detection or st.channels >= 2:
-        _spectral_pass(ffmpeg, path, st.index, tm, settings)
+        _spectral_pass(ffmpeg, path, st.index, tm, settings, dur_s)
     _tail_pass(ffmpeg, path, st.index, tm, settings)
     return tm
 
@@ -193,7 +202,7 @@ def measure(path, info: MediaInfo, settings: Settings) -> Measurements:
                                                 channels=info.channels)]
     if not settings.analyze_all_tracks:
         streams = streams[:1]
-    m.tracks = [measure_track(path, st, settings) for st in streams]
+    m.tracks = [measure_track(path, st, settings, info.duration_s) for st in streams]
     p = m.tracks[0]
     m.integrated_lufs, m.lra, m.true_peak_dbtp = p.integrated_lufs, p.lra, p.true_peak_dbtp
     m.peak_dbfs, m.rms_dbfs, m.dc_offset, m.flat_factor = p.peak_dbfs, p.rms_dbfs, p.dc_offset, p.flat_factor

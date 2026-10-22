@@ -252,14 +252,23 @@ def load_corpus(root: Path) -> list[Case]:
     for i, row in enumerate(data):
         if not isinstance(row, dict) or not isinstance(row.get("file"), str):
             raise ConfigError(f"labels.json entry {i} needs a 'file' string")
-        f = (root / row["file"]).resolve()
+        try:
+            f = (root / row["file"]).resolve()
+        except (ValueError, OSError) as e:
+            raise ConfigError(f"labels.json entry {i}: invalid file name") from e
+        spec = row.get("spec")
+        if spec is not None:
+            from .specs import BUILTIN_SPECS
+
+            if not isinstance(spec, str) or spec.strip().lower() not in BUILTIN_SPECS:
+                raise ConfigError(f"labels.json entry {i}: spec must be a built-in name")
         if root not in f.parents:
             raise ConfigError(f"labels.json entry {i} points outside the corpus directory")
         expect = row.get("expect", [])
         if not isinstance(expect, list) or not all(isinstance(e, str) for e in expect):
             raise ConfigError(f"labels.json entry {i}: 'expect' must be a list of check names")
         cases.append(Case(name=row.get("name") or f.name, file=f, expect=set(expect),
-                          spec=row.get("spec"), content=row.get("content")))
+                          spec=spec, content=row.get("content")))
     return cases
 
 

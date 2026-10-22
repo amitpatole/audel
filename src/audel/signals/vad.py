@@ -20,7 +20,7 @@ import numpy as np
 
 from ..config import Settings
 from ..logging import get_logger
-from ..mediaguard import _tool, decode_to_wav, run, safe_input
+from ..mediaguard import decode_to_wav
 from ._parse import parse_ebur128
 
 _log = get_logger("vad")
@@ -80,11 +80,19 @@ def speech_gated_lufs(path: Path, settings: Settings, regions: list[tuple[float,
     if not regions:
         return None
     expr = "+".join(f"between(t\\,{a:.3f}\\,{b:.3f})" for a, b in regions)
-    ffmpeg = _tool("ffmpeg", settings.ffmpeg_path)
-    argv = [ffmpeg, "-nostdin", "-hide_banner", "-threads", "1", *safe_input(path),
-            "-map", f"0:a:{int(stream)}?", "-t", str(settings.max_duration_s),
-            "-af", f"aselect={expr},asetpts=N/SR/TB,ebur128=framelog=quiet", "-f", "null", "-"]
-    proc = run(argv, timeout_s=settings.decode_timeout_s)
-    if proc.returncode != 0:
+    from ..errors import AudelError
+    from ..mediaguard import pass_timeout, pcm_pipeline, probe
+
+    info = probe(path, settings)
+    st = next((x for x in info.streams if x.index == int(stream)), None)
+    if st is None:
         return None
-    return parse_ebur128(proc.stderr.decode("utf-8", "replace")).get("I")
+    try:
+        err = pcm_pipeline(path, settings, stream=st.index, channels=st.channels or 1,
+                           sample_rate=st.sample_rate if st.sample_rate >= 8000 else 48000,
+                           layout=st.layout, timeout_s=pass_timeout(settings, info.duration_s),
+                           analysis=["-af", f"aselect={expr},asetpts=N/SR/TB,ebur128=framelog=quiet",
+                                     "-f", "null", "-"])
+    except AudelError:
+        return None
+    return parse_ebur128(err).get("I")

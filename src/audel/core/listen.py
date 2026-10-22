@@ -30,6 +30,7 @@ from ..errors import ConfigError, MissingDependencyError
 from ..logging import get_logger
 from ..mediaguard import excerpt_wav, validate_source
 from ..models import (
+    Confidence,
     Conformance,
     DeliveryReading,
     Issue,
@@ -125,6 +126,13 @@ async def listen(source, *, settings: Settings | None = None, spec=None, brief=N
             issues.extend(lis.script_issues(res))
             summ.script_words, summ.script_wer = res.script_words, round(res.wer, 3)
             summ.script_adherence = round(res.adherence, 3)
+            if res.truncated:
+                issues.append(Issue.make(IssueKind.OTHER, Severity.WARNING,
+                                         "script check stopped early: the script and the read are "
+                                         "too long or repetitive to align in full",
+                                         span=Span(start_ms=0, end_ms=duration_ms),
+                                         source=IssueSource.ASR, confidence=Confidence.LOW,
+                                         detail={"check": "script_truncated"}))
             if res.wer > 0.25:
                 issues.append(Issue.make(IssueKind.TRANSCRIPT_MISMATCH, Severity.ERROR,
                                          f"read departs from the script: {res.adherence:.0%} adherence "

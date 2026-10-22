@@ -93,20 +93,54 @@ def transcribe_file(path: str, *, model_name: str = "base", language: str | None
 
         root = str(settings.asr_model_dir) if settings.asr_model_dir else None
         model = _load(model_name, device, compute, root, models_offline(settings))
-        # Hand whisper the decoded samples, not a path: we already decoded a bounded 16 kHz mono
-        # WAV with ffmpeg, and faster-whisper's own loader (PyAV) breaks across PyAV releases.
-        audio = _read_wav_f32(wav)
-        segments, info = model.transcribe(audio, language=language, vad_filter=True,
-                                          word_timestamps=word_timestamps)
-        segs, parts, total = _collect(segments)
+        # Hand whisper decoded samples, not a path (faster-whisper's own PyAV loader breaks
+        # across PyAV releases), and in 10-minute CHUNKS so memory stays flat however long the
+        # programme is. The language detected on the first chunk is used for the rest.
+        segs: list[Segment] = []
+        parts: list[str] = []
+        total = 0
+        detected, confidence = language, None
+        for offset_s, audio in _wav_chunks(wav, _CHUNK_S):
+            segments, info = model.transcribe(audio, language=detected, vad_filter=True,
+                                              word_timestamps=word_timestamps)
+            if detected is None:
+                detected = getattr(info, "language", None)
+                confidence = getattr(info, "language_probability", None)
+            c_segs, c_parts, c_total = _collect(segments, offset_ms=int(offset_s * 1000),
+                                                budget=_MAX_TRANSCRIPT_CHARS - total)
+            segs += c_segs
+            parts += c_parts
+            total += c_total
+            if total >= _MAX_TRANSCRIPT_CHARS:
+                break
     finally:
         wav.unlink(missing_ok=True)
-    return Transcript(
-        text=" ".join(parts).strip(),
-        language=getattr(info, "language", None),
-        language_confidence=getattr(info, "language_probability", None),
-        segments=segs,
-    )
+    return Transcript(text=" ".join(parts).strip(), language=detected,
+                      language_confidence=confidence, segments=segs)
+
+
+_CHUNK_S = 600
+
+
+def _wav_chunks(path, chunk_s: int):
+    """Yield (offset_s, float32 samples) for consecutive ``chunk_s`` pieces of a 16-bit mono WAV."""
+    import wave
+
+    import numpy as np
+
+    with wave.open(str(path), "rb") as w:
+        if w.getsampwidth() != 2 or w.getnchannels() != 1:
+            raise ConfigError("ASR expects 16-bit mono PCM")
+        sr = w.getframerate()
+        offset = 0.0
+        while True:
+            raw = w.readframes(sr * chunk_s)
+            if not raw:
+                break
+            audio = np.frombuffer(raw, dtype="<i2").astype(np.float32)
+            audio *= 1.0 / 32768.0
+            yield offset, audio
+            offset += len(audio) / sr
 
 
 def _read_wav_f32(path):
@@ -121,20 +155,22 @@ def _read_wav_f32(path):
     return np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
 
 
-def _collect(segments):
-    """Stream whisper segments into (segments, text-parts, total-chars), capping transcript size."""
+def _collect(segments, offset_ms: int = 0, budget: int = _MAX_TRANSCRIPT_CHARS):
+    """Stream whisper segments into (segments, text-parts, total-chars), capping transcript size.
+    ``offset_ms`` shifts a chunk's timestamps onto the programme timeline."""
     segs: list[Segment] = []
     parts: list[str] = []
     total = 0
     for s in segments:
         txt = (s.text or "").strip()
         total += len(txt)
-        if total > _MAX_TRANSCRIPT_CHARS:
+        if total > budget:
             break
-        words = [Word(start_ms=int(w.start * 1000), end_ms=int(w.end * 1000),
+        words = [Word(start_ms=offset_ms + int(w.start * 1000), end_ms=offset_ms + int(w.end * 1000),
                       text=(w.word or "").strip()[:64], probability=getattr(w, "probability", None))
                  for w in (getattr(s, "words", None) or [])][:_MAX_WORDS_PER_SEGMENT]
-        segs.append(Segment(start_ms=int(s.start * 1000), end_ms=int(s.end * 1000), text=txt,
+        segs.append(Segment(start_ms=offset_ms + int(s.start * 1000),
+                            end_ms=offset_ms + int(s.end * 1000), text=txt,
                             words=words, avg_logprob=getattr(s, "avg_logprob", None),
                             no_speech_prob=getattr(s, "no_speech_prob", None)))
         parts.append(txt)
