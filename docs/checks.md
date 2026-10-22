@@ -21,6 +21,7 @@ consumers of the contract key on. It also has a precise rule name in `detail.che
 | `truncation` | `truncation` | the track ends at programme level with no decay | warning (low confidence) |
 | `short_track` | `truncation` | one audio track starts late or ends early on the programme timeline | error |
 | `decode_errors` | `dropout` | the decoder reported corrupt data or CRC failures in this stream | warning, error at 10 or more |
+| `demux_stopped` | `decode_error` | the container could not be read to its end (for example a chained Ogg link that switches codec), so later audio was not measured | error |
 | `duration_mismatch` | `duration` | the container's declared length differs from the decoded audio | warning |
 | `empty_stream` | `silence` | an audio stream contains no samples | critical |
 | `packet_gap` | `dropout` | audio packets are missing from the stream's timeline, including a hole stored as one long sample | warning, error above 10% of the track |

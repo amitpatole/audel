@@ -334,6 +334,12 @@ def evaluate(m: Measurements, settings: Settings, spec: DeliverySpec | str | Non
                                  f"{label}track could not be decoded: {tm.failed}",
                                  _full_span(dur), "track_decode_error", tm, programme=True))
             continue
+        if tm.demux_stopped:
+            issues.append(_issue(
+                IssueKind.DECODE_ERROR, Severity.ERROR,
+                f"{label}the container could not be read to its end (e.g. a chained Ogg link "
+                "that switches codec): audio after that point was not measured",
+                _track_span(tm, dur), "demux_stopped", tm, programme=True))
         if tm.decode_errors:
             issues.append(_issue(
                 IssueKind.DROPOUT, Severity.ERROR if tm.decode_errors >= 10 else Severity.WARNING,

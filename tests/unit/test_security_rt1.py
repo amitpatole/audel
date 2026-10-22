@@ -4019,9 +4019,9 @@ def test_mono_mix_is_chosen_by_layout_type():
 
     assert mono_filter(_st("ambisonic 1", 4)) == "pan=mono|c0=1.000000*c0"  # W only
     five = mono_filter(_st("5.1", 6))                                        # by label (r17)
-    assert "aformat" not in five and "*c3" not in five and "*c4" in five     # LFE out, beds in
+    assert "channel_layouts" not in five and "*c3" not in five and "*c4" in five  # by label
     custom = mono_filter(_st("3 channels (FC+FL+FR)", 3))
-    assert custom.startswith("pan=mono|") and "c0" in custom                # label weights
+    assert "pan=mono|" in custom and "*c0" in custom                        # label weights
     plain = mono_filter(_st("", 5), power=True)
     assert plain.startswith("pan=mono|") and "0.447214" in plain            # 1/sqrt(5)
 
@@ -4183,10 +4183,11 @@ def test_speex_uses_the_deterministic_decoder(monkeypatch):
     from audel.config import Settings
     from audel.errors import DecodeError
 
-    monkeypatch.setattr(mediaguard, "_LIBSPEEX", True)
+    ff = mediaguard._tool("ffmpeg", Settings().ffmpeg_path)
+    monkeypatch.setattr(mediaguard, "_LIBSPEEX", {ff: True})
     assert mediaguard.decoder_args("speex", 1, Settings()) == ["-c:a:1", "libspeex"]
     assert mediaguard.decoder_args("aac", 0, Settings()) == []
-    monkeypatch.setattr(mediaguard, "_LIBSPEEX", False)
+    monkeypatch.setattr(mediaguard, "_LIBSPEEX", {ff: False})
     with pytest.raises(DecodeError):
         mediaguard.decoder_args("speex", 0, Settings())
 
@@ -4247,3 +4248,61 @@ def test_counts_and_ordinary_words_are_kept(text):
     from audel.logging import scrub_text
 
     assert scrub_text(text) == text
+
+
+# ==== round 18, decode surface ================================================================
+
+@requires_ffmpeg
+@pytest.mark.parametrize("codec", ["pcm_s16le", "pcm_s24le"])
+def test_hot_integer_surround_neither_wraps_nor_clips_in_the_asr_mix(tmp_path, codec):
+    import wave
+
+    import numpy as np
+
+    from audel.config import Settings
+    from audel.mediaguard import decode_to_wav
+
+    f = tmp_path / "t51.wav"
+    _ff("-f", "lavfi", "-i", "aevalsrc=0.89*sin(2*PI*1000*t):s=48000:d=3", "-af",
+        "pan=5.1|FL=c0|FR=c0|FC=c0|LFE=0*c0|BL=c0|BR=c0", "-c:a", codec, f)
+    w = decode_to_wav(f, Settings())
+    with wave.open(str(w)) as x:
+        a = np.frombuffer(x.readframes(x.getnframes()), "<i2").astype(float) / 32768
+    w.unlink()
+    a = a[len(a) // 4:]
+    crest = 20 * np.log10(np.max(np.abs(a)) / np.sqrt(np.mean(a * a)))
+    assert crest >= 2.9, crest                       # a sine's 3 dB: not squared off
+    assert int(np.sum(np.abs(np.diff(a)) > 1.0)) == 0  # no wrap-around jumps
+
+
+@requires_ffmpeg
+def test_chained_ogg_codec_switch_is_not_silently_unmeasured(tmp_path):
+    import subprocess
+
+    from audel import check
+
+    a, b, chain = tmp_path / "a.ogg", tmp_path / "b.ogg", tmp_path / "chain.ogg"
+    _ff("-f", "lavfi", "-i", "sine=f=440:d=4:sample_rate=48000", "-af", "volume=0.1",
+        "-c:a", "libopus", a)
+    try:
+        _ff("-f", "lavfi", "-i", "sine=f=440:d=4:sample_rate=48000", "-c:a", "libvorbis", b)
+    except (subprocess.CalledProcessError, AssertionError):
+        pytest.skip("no libvorbis encoder")
+    chain.write_bytes(a.read_bytes() + b.read_bytes())
+    checks = {i.detail.get("check") for i in asyncio.run(check(str(chain))).issues}
+    assert "demux_stopped" in checks, checks
+
+
+def test_decoder_probe_timeout_is_busy_not_a_bad_file(monkeypatch):
+    from audel import mediaguard
+    from audel.config import Settings
+    from audel.errors import BusyError, UnsafeSourceError
+
+    def slow(*a, **k):
+        raise UnsafeSourceError("decode exceeded 15s timeout (possible resource bomb)")
+
+    monkeypatch.setattr(mediaguard, "_LIBSPEEX", {})
+    monkeypatch.setattr(mediaguard, "run", slow)
+    with pytest.raises(BusyError):
+        mediaguard.decoder_args("speex", 0, Settings())
+    assert mediaguard._LIBSPEEX == {}  # nothing cached from a failed probe

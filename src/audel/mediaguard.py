@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import resource
 import shutil
 import subprocess
@@ -164,21 +165,26 @@ MEDIA_SUFFIXES = frozenset({
 })
 
 
-_LIBSPEEX: bool | None = None
+_LIBSPEEX: dict[str, bool] = {}
 
 
 def decoder_args(codec: str, stream: int, settings: Settings) -> list[str]:
     """Input decoder overrides (placed before ``-i``). ffmpeg's built-in Speex decoder reads
     uninitialised memory (same file, different PCM each run) and doubles the duration; libspeex
     is deterministic. Without libspeex a Speex stream is refused, never graded at random."""
-    global _LIBSPEEX
     if codec != "speex":
         return []
-    if _LIBSPEEX is None:
-        ffmpeg = _tool("ffmpeg", settings.ffmpeg_path)
-        proc = run([ffmpeg, "-hide_banner", "-decoders"], timeout_s=15.0)
-        _LIBSPEEX = b" libspeex " in proc.stdout
-    if not _LIBSPEEX:
+    ffmpeg = _tool("ffmpeg", settings.ffmpeg_path)
+    if ffmpeg not in _LIBSPEEX:
+        try:
+            proc = run([ffmpeg, "-hide_banner", "-decoders"], timeout_s=15.0)
+        except UnsafeSourceError:  # the probe timed out: the host, not the media
+            raise BusyError("could not check the ffmpeg decoders: the host is at capacity; "
+                            "retry later") from None
+        if proc.returncode != 0:
+            raise BusyError("could not check the ffmpeg decoders; retry later")
+        _LIBSPEEX[ffmpeg] = b" libspeex " in proc.stdout
+    if not _LIBSPEEX[ffmpeg]:
         raise DecodeError("Speex needs ffmpeg built with libspeex (the built-in decoder is "
                           "nondeterministic)")
     return [f"-c:a:{int(stream)}", "libspeex"]
@@ -412,6 +418,7 @@ def pcm_pipeline(path: Path, settings: Settings, *, stream: int, channels: int,
     out2 = err2.join(5).decode("utf-8", "replace")
     if stats is not None:
         stats["decode_errors"] = _stream_decode_errors(tail1, abs_index)
+        stats["demux_stopped"] = bool(_DEMUX_STOPPED.search(tail1))
     for pipe in (p1.stderr, p2.stderr):
         try:
             pipe.close()
@@ -423,6 +430,11 @@ def pcm_pipeline(path: Path, settings: Settings, *, stream: int, channels: int,
     if p1.returncode not in (0, None, 224, -13):
         raise DecodeError(f"could not decode audio: {_cause(tail1)}")
     return out2
+
+
+# ffmpeg's own anchored line when demuxing ends on an error (e.g. a chained Ogg whose next link
+# switches codec) though the decoder exits 0. Indented metadata lines can't forge it.
+_DEMUX_STOPPED = re.compile(r"^\[in#0/[^\]\n]+\] Error during demuxing", re.MULTILINE)
 
 
 def _cause(tail: str) -> str:
@@ -1303,7 +1315,10 @@ def mono_filter(st: StreamInfo | None, *, power: bool = False) -> str:
     if len(use) <= 2:
         return _weighted(weights, power=False)  # stereo (or 2.1): the plain mean, as ever
     norm = sum(w * w for _i, w in use) ** 0.5
-    return ("pan=mono|c0=" + "+".join(f"{w / norm:.6f}*c{i}" for i, w in use)
+    # pan runs in the SOURCE sample format: on integer PCM the unit-power sum would clip
+    # (24-bit) or wrap (16-bit) before the limiter, so it is mixed in double precision.
+    return ("aformat=sample_fmts=dbl,pan=mono|c0="
+            + "+".join(f"{w / norm:.6f}*c{i}" for i, w in use)
             + ",alimiter=limit=0.9:level=false:attack=5:release=50")
 
 

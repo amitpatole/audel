@@ -121,6 +121,16 @@ All notable changes to Audel are recorded here. The format follows
     at most 2 fetches, in a pool of 8.
   - **Low-Medium.** Work abandoned while waiting on its tenant share still ran later. Abandonment now
     propagates through both waits.
+- Red-team round 18 fixes (decode surface), each pinned by a regression test. The 473-file battery
+  shows no regressions.
+  - **Low-Medium.** The round-17 dialogue-first mono mix ran in the source's own sample format, so
+    hot correlated surround from 16-bit sources wrapped around (and 24-bit sources clipped) before
+    the limiter. Audio-hearing backends received distortion that isn't in the source; grading was
+    unaffected. The mix now runs in double precision.
+  - **Low.** A chained Ogg whose next link switches codec stopped being read there, silently, and
+    was graded on its first link only. It is now reported as `demux_stopped` (error).
+  - **Info.** The libspeex availability check is cached per ffmpeg binary, and a slow check on a
+    busy host is reported as busy (retry), not as a bad file.
 - Red-team round 18 fixes (auth surface), each pinned by a regression test. No auth bypass or
   escalation was found.
   - **Low-Medium.** Log redaction missed compound key names glued to an acronym, digit or
