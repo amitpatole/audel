@@ -99,8 +99,10 @@ audel check ep101_mix.wav --spec /etc/audel/acme_tv.json
 
 Some specs measure loudness over speech only. Audel approximates dialogue gating in three steps.
 It finds speech with the Silero voice-activity detector bundled in faster-whisper, listening to
-each channel on its own: every channel except LFE that is within 30 dB of the loudest. A downmix
-would miss dialogue in some immersive channels, or in channels mixed in antiphase. It then
+every channel except LFE on its own, from one streamed decode high-passed at 100 Hz. A downmix
+would miss dialogue in some immersive channels, or in channels mixed in antiphase. A detected
+passage counts only where its channel is audible in the mix, within 20 dB of the loudest
+channel at that moment, so a voice buried under music elsewhere isn't taken for dialogue. It then
 computes BS.1770 integrated loudness from the main pass's own 400 ms loudness blocks, counting
 only blocks that lie entirely inside speech, with the standard absolute and relative gates. Then
 it grades that value against the target.

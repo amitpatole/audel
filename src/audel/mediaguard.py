@@ -1127,6 +1127,78 @@ def probe_streams(path: Path, settings: Settings) -> dict:
     return out
 
 
+def stream_pcm16(path: Path, settings: Settings, *, stream: int, channels: int,
+                 sample_rate: int = 16000, highpass_hz: int | None = None, chunk_s: int = 60,
+                 timeout_s: float | None = None):
+    """Decode a validated file and YIELD it as int16 frame blocks of ``chunk_s`` seconds,
+    ``(samples, channels)``: no temp file, so a long many-channel track can't hit the write
+    limit, and memory stays at one chunk. Same strict decoding as the main pass (CRC errors
+    drop frames, never concealed), duration-capped, and bounded by ``timeout_s``."""
+    import threading
+    import time
+
+    import numpy as np
+
+    ffmpeg = _tool("ffmpeg", settings.ffmpeg_path)
+    chain = "asetpts=N/SR/TB" + (f",highpass=f={int(highpass_hz)}" if highpass_hz else "")
+    n = max(1, int(channels))
+    argv = [ffmpeg, "-nostdin", "-hide_banner", "-v", "error", "-threads", "1",
+            "-reinit_filter", "0", "-err_detect", "crccheck+explode", *safe_input(path),
+            "-map", f"0:a:{int(stream)}?", "-af", chain, "-t", str(settings.max_duration_s),
+            "-ar", str(sample_rate), "-ac", str(n), "-f", "s16le", "-acodec", "pcm_s16le",
+            "pipe:1"]
+    limit = pass_timeout(settings, settings.max_duration_s)
+    timeout = min(limit, timeout_s) if timeout_s else limit
+    pre = _rlimit_setter(int(timeout) + _RLIMIT_CPU_PAD_S) if os.name == "posix" else None
+    proc = _popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                  preexec_fn=pre)
+    assert proc.stdout is not None and proc.stderr is not None
+    try:
+        err = _BoundedReader(proc.stderr, 64 * 1024, tail=True)
+    except RuntimeError:
+        proc.kill()
+        proc.wait()
+        proc.stdout.close()
+        proc.stderr.close()
+        raise BusyError("could not start the decoder: the host is at capacity; retry later") from None
+    expired, done = threading.Event(), threading.Event()
+    limit_at = time.monotonic() + timeout
+
+    def _watch() -> None:
+        while not done.wait(0.2):
+            if time.monotonic() >= limit_at:
+                expired.set()
+                proc.kill()
+                return
+
+    watcher = threading.Thread(target=_watch, daemon=True, name="audel-pcm-watch")
+    try:
+        watcher.start()
+    except RuntimeError:
+        proc.kill()
+        proc.wait()
+        raise BusyError("could not start the decoder: the host is at capacity; retry later") from None
+    block = sample_rate * n * 2 * max(1, int(chunk_s))
+    try:
+        while True:
+            raw = proc.stdout.read(block)
+            if not raw:
+                break
+            usable = len(raw) - len(raw) % (2 * n)
+            yield np.frombuffer(raw[:usable], dtype="<i2").reshape(-1, n)
+        proc.wait()
+    finally:
+        done.set()
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        proc.stdout.close()
+    if expired.is_set():
+        raise UnsafeSourceError(f"decode exceeded {timeout:.0f}s timeout")
+    if proc.returncode != 0:
+        raise DecodeError(f"could not decode audio: {_cause(err.join(5).decode('utf-8', 'replace'))}")
+
+
 def _mkstemp(prefix: str, settings: Settings) -> tuple[int, str]:
     try:
         return tempfile.mkstemp(suffix=".wav", prefix=prefix, dir=_tmp_dir(settings))

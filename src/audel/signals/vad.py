@@ -13,14 +13,12 @@ programme loudness (LOW confidence) when the VAD is unavailable.
 
 from __future__ import annotations
 
-import wave
 from pathlib import Path
 
 import numpy as np
 
 from ..config import Settings
 from ..logging import get_logger
-from ..mediaguard import decode_to_wav
 
 _log = get_logger("vad")
 _SR = 16000
@@ -28,73 +26,65 @@ _CHUNK_S = 60             # VAD in 1-minute chunks: bounded memory even for 24 c
 
 
 def speech_regions(path: Path, settings: Settings, *, stream: int = 0,
-                   labels: list[str] | None = None, channel_rms: list[float | None] | None = None,
+                   labels: list[str] | None = None, channels: int | None = None,
                    timeout_s: float | None = None) -> list[tuple[float, float]] | None:
     """Speech regions in seconds (decoded track time), or ``None`` when no VAD is installed.
 
-    Every channel that matters is heard on its own (one decode, all channels kept): every
-    non-LFE channel within 30 dB of the loudest. A downmix drops some immersive channels
-    (7.1.4 tops, most of 22.2) and any fixed mix can be cancelled by antiphase content in some
-    channel pairing; individual channels can't. A failure RAISES (BusyError for the host,
-    DecodeError otherwise); it is never a silent "no speech"."""
+    Every channel except LFE is heard on its own, from one streamed, 100 Hz high-passed decode
+    (no temp file). A downmix drops some immersive channels and any fixed mix can be cancelled
+    by antiphase content; individual channels can't. A detected region counts only where its
+    channel is AUDIBLE in the mix: within 20 dB of the loudest channel over the same span (the
+    detector ignores level, so a voice buried under music elsewhere must not turn the music into
+    "dialogue"). The high-pass keeps subsonic content from distorting either test. A failure
+    RAISES (BusyError for the host, DecodeError otherwise); never a silent "no speech"."""
     try:
         from faster_whisper.vad import VadOptions, get_speech_timestamps  # noqa: F401
     except ImportError:
         return None
-    chans = _channels_to_hear(labels or [], channel_rms or [])
-    return merge_regions(_vad_pass(path, settings, stream, chans, timeout_s), 1_000_000)
+    labels = labels or []
+    n = channels or len(labels) or 1
+    use = [i for i in range(n) if not (i < len(labels) and labels[i].upper().startswith("LFE"))]
+    return merge_regions(_vad_pass(path, settings, stream, n, use or [0], timeout_s), 1_000_000)
 
 
-def _channels_to_hear(labels: list[str], rms: list[float | None]) -> list[int] | None:
-    """Indexes of the channels worth listening to (``None`` = all of them)."""
-    if not labels:
-        return None
-    levels = [r for r in rms if r is not None and r > -150]
-    loudest = max(levels) if levels else None
-    keep = []
-    for i, lab in enumerate(labels):
-        if lab.upper().startswith("LFE"):
-            continue  # low-frequency effects: not dialogue, and BS.1770 leaves it out too
-        r = rms[i] if i < len(rms) else None
-        if loudest is not None and r is not None and r < loudest - 30:
-            continue  # 30 dB under the loudest channel: can't carry the programme's dialogue
-        keep.append(i)
-    return keep or None
+_AUDIBLE_DB = 20.0  # a region's channel must be within this of the loudest channel there
 
 
-def _vad_pass(path: Path, settings: Settings, stream: int, chans: list[int] | None,
+def _vad_pass(path: Path, settings: Settings, stream: int, n: int, use: list[int],
               timeout_s: float | None) -> list[tuple[float, float]]:
     import time
 
     from faster_whisper.vad import VadOptions, get_speech_timestamps
 
-    from ..errors import BusyError, DecodeError, UnsafeSourceError
+    from ..errors import AudelError, BusyError, DecodeError, UnsafeSourceError
+    from ..mediaguard import stream_pcm16
 
     end = time.monotonic() + timeout_s if timeout_s else None
-    wav = decode_to_wav(path, settings, sample_rate=_SR, stream=stream, mix="all",
-                        timeout_s=timeout_s)
     regions: list[tuple[float, float]] = []
     opts = VadOptions(min_silence_duration_ms=500, speech_pad_ms=100)
     try:
-        with wave.open(str(wav), "rb") as w:
-            n = max(1, w.getnchannels())
-            use = [c for c in (chans if chans is not None else range(n)) if c < n] or [0]
-            offset = 0.0
-            while True:
-                raw = w.readframes(_SR * _CHUNK_S)
-                if not raw:
-                    break
-                frames = np.frombuffer(raw, dtype="<i2").reshape(-1, n)
-                for c in use:
-                    if end is not None and time.monotonic() > end:
-                        # In-process inference has no ffmpeg timeout: check the file's budget.
-                        raise UnsafeSourceError("analysis exceeded the per-file time budget")
-                    audio = frames[:, c].astype(np.float32) / 32768.0
-                    for ts in get_speech_timestamps(audio, vad_options=opts, sampling_rate=_SR):
-                        regions.append((offset + ts["start"] / _SR, offset + ts["end"] / _SR))
-                offset += frames.shape[0] / _SR
-    except UnsafeSourceError:
+        offset = 0.0
+        for frames in stream_pcm16(path, settings, stream=stream, channels=n, sample_rate=_SR,
+                                   highpass_hz=100, chunk_s=_CHUNK_S, timeout_s=timeout_s):
+            block = frames[:, use].astype(np.float32) / 32768.0
+            for col, _c in enumerate(use):
+                if end is not None and time.monotonic() > end:
+                    # In-process inference has no ffmpeg timeout: check the file's budget.
+                    raise UnsafeSourceError("analysis exceeded the per-file time budget")
+                for ts in get_speech_timestamps(block[:, col], vad_options=opts,
+                                                sampling_rate=_SR):
+                    a, b = int(ts["start"]), int(ts["end"])
+                    seg = block[a:b]
+                    if seg.size == 0:
+                        continue
+                    level = 10 * np.log10(np.mean(seg * seg, axis=0) + 1e-12)
+                    if level[col] >= level.max() - _AUDIBLE_DB:  # audible in the mix there
+                        regions.append((offset + a / _SR, offset + b / _SR))
+            offset += frames.shape[0] / _SR
+    except (UnsafeSourceError, BusyError):
         raise
+    except AudelError as e:
+        raise DecodeError("speech detection could not decode the audio") from e
     except (OSError, MemoryError) as e:  # the host (fds, memory), not the media
         raise BusyError("speech detection could not run: the host is at capacity") from e
     except RuntimeError as e:
@@ -105,8 +95,6 @@ def _vad_pass(path: Path, settings: Settings, stream: int, chans: list[int] | No
     except Exception as e:  # noqa: BLE001 - reported to the grade, never a silent "no speech"
         _log.warning("VAD failed: %s", type(e).__name__)
         raise DecodeError("speech detection failed") from None
-    finally:
-        wav.unlink(missing_ok=True)
     return regions
 
 

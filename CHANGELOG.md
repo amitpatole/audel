@@ -121,6 +121,18 @@ All notable changes to Audel are recorded here. The format follows
     at most 2 fetches, in a pool of 8.
   - **Low-Medium.** Work abandoned while waiting on its tenant share still ran later. Abandonment now
     propagates through both waits.
+- Red-team round 13 fixes (dialogue gating), each pinned by a regression test. 227 files grade
+  as before under both specs.
+  - **Medium.** An inaudible subsonic signal in one channel inflated its raw level, so the real
+    dialogue channels fell outside the "within 30 dB of the loudest" rule and were never heard
+    (a `netflix` FAIL became a PASS). Every non-LFE channel is now heard, from a decode high-passed
+    at 100 Hz.
+  - **Low-Medium.** The speech detector ignores level, so a voice buried far under music in
+    another channel turned the music into "dialogue". A detected passage now counts only where
+    its channel is within 20 dB of the loudest channel at that moment.
+  - **Low-Medium.** Long immersive programmes couldn't be dialogue-gated: the all-channel temp
+    file hit the 2 GiB write limit (22.2 beyond about 47 minutes). Speech detection now streams
+    the decode in one-minute chunks, with no temp file, and decodes as strictly as the main pass.
 - Red-team round 13 fixes (network and auth surfaces), each pinned by a regression test. No
   bypass, escalation, tenant crossing or leak was found; the real-media leak stress returned to
   baseline.

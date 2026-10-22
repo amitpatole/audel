@@ -3307,14 +3307,12 @@ def test_speech_regions_hear_antiphase_dialogue(tmp_path):
     f = tmp_path / "phase.wav"
     _ff("-i", mono, "-af", "pan=stereo|FL=c0|FR=-1*c0", f)
     regions = speech_regions(f, Settings(), stream=0, labels=["FL", "FR"],
-                             channel_rms=[-20.0, -20.0]) or []
+                             channels=2) or []
     assert sum(b - a for a, b in regions) > 5.0
 
 
 def test_a_vad_host_failure_is_busy_not_a_silent_fallback(tmp_path, monkeypatch):
     pytest.importorskip("faster_whisper")
-    import wave
-
     from audel.errors import BusyError
     from audel.signals.vad import speech_regions
 
@@ -3324,9 +3322,11 @@ def test_a_vad_host_failure_is_busy_not_a_silent_fallback(tmp_path, monkeypatch)
     def emfile(*a, **k):
         raise OSError(24, "Too many open files")
 
-    monkeypatch.setattr(wave, "open", emfile)
+    import audel.mediaguard as mg
+
+    monkeypatch.setattr(mg.subprocess, "Popen", emfile)
     with pytest.raises(BusyError):
-        speech_regions(f, Settings(), stream=0, labels=["FL", "FR"], channel_rms=[-20.0, -20.0])
+        speech_regions(f, Settings(), stream=0, labels=["FL", "FR"], channels=2)
 
 
 def test_unmeasurable_dialogue_is_reported_on_a_dialogue_gated_spec():
@@ -3510,15 +3510,19 @@ def test_too_little_dialogue_is_no_speech_not_minus_70():
     assert gated_lufs_from_frames(frames, [(1.0, 1.3)]) is None
 
 
-def test_every_channel_that_matters_is_heard():
-    from audel.signals.vad import _channels_to_hear
+def test_a_decoder_spawn_failure_in_speech_detection_is_busy(tmp_path, monkeypatch):
+    pytest.importorskip("faster_whisper")
+    import audel.mediaguard as mg
+    from audel.errors import BusyError
+    from audel.signals.vad import speech_regions
 
-    labels = ["FL", "FR", "FC", "LFE", "SL", "SR", "TFL", "TFR", "TBL", "TBR", "TSL", "TSR"]
-    rms = [-20.0] * 12
-    chans = _channels_to_hear(labels, rms)
-    assert 3 not in chans and {8, 9} <= set(chans) and len(chans) == 11
-    rms[10] = -80.0                                   # a near-silent channel is skipped
-    assert 10 not in _channels_to_hear(labels, rms)
+    def no_thread(*a, **k):
+        raise OSError(24, "Too many open files")
+
+    f = _real_speech(tmp_path)
+    monkeypatch.setattr(mg, "_popen", no_thread)
+    with pytest.raises(BusyError):
+        speech_regions(f, Settings(), stream=0, labels=["FC"], channels=1)
 
 
 @requires_ffmpeg
@@ -3596,7 +3600,7 @@ def test_speech_detection_respects_the_file_deadline(tmp_path):
     t0 = time.monotonic()
     with pytest.raises(UnsafeSourceError):
         speech_regions(f, Settings(), stream=0, labels=["FL", "FR"],
-                       channel_rms=[-20.0, -20.0], timeout_s=2.0)
+                       channels=2, timeout_s=2.0)
     assert time.monotonic() - t0 < 30
 
 
@@ -3674,3 +3678,56 @@ def test_a_client_request_id_cannot_rename_audit_keys(tmp_path):
     AuditLog(log).write(request_id="abc-token", source="upload", tenant="t", endpoint="/check")
     rec = _json.loads(log.read_text().splitlines()[-1])
     assert rec["source"] == "upload" and "request_id" in rec
+
+
+# ==== round 13, decode surface (dialogue gating) ==============================================
+
+def _surround_with(tmp_path, name, expr):
+    mono = _real_speech(tmp_path)
+    f = tmp_path / name
+    _ff("-i", mono, "-f", "lavfi", "-i", "sine=f=4:d=20", "-filter_complex", expr,
+        "-map", "[out]", f)
+    return f
+
+
+@requires_ffmpeg
+def test_a_subsonic_channel_cannot_hide_the_dialogue_channel(tmp_path):
+    pytest.importorskip("faster_whisper")
+    from audel.core.render import _render_sync
+
+    ctl = _surround_with(tmp_path, "ctl.wav",
+                         "[0]volume=0.05[d];[d]pan=5.1(side)|FC=c0[out]")
+    atk = _surround_with(tmp_path, "atk.wav",
+                         "[0]volume=0.05[d];[1]volume=0.35[s];[d][s]amerge=inputs=2,"
+                         "pan=5.1(side)|FC=c0|SL=c1[out]")
+    a = _render_sync(str(ctl), Settings(), "netflix").measurements.tracks[0].dialogue_lufs
+    b = _render_sync(str(atk), Settings(), "netflix").measurements.tracks[0].dialogue_lufs
+    assert a is not None and b is not None and abs(a - b) < 1.5, (a, b)
+
+
+@requires_ffmpeg
+def test_a_masked_voice_in_another_channel_is_not_dialogue(tmp_path):
+    pytest.importorskip("faster_whisper")
+    from audel.signals.vad import speech_regions
+
+    mono = _real_speech(tmp_path)
+    f = tmp_path / "mask.wav"
+    _ff("-i", mono, "-f", "lavfi", "-i", "anoisesrc=d=20:c=pink:a=0.5", "-filter_complex",
+        "[0]volume=0.01[v];[1][v]amerge=inputs=2,pan=stereo|FL=c0|FR=c1[out]", "-map", "[out]",
+        f)
+    regions = speech_regions(f, Settings(), stream=0, labels=["FL", "FR"], channels=2) or []
+    assert sum(b - a for a, b in regions) < 2.0     # a voice 34 dB under the noise isn't dialogue
+
+
+def test_speech_detection_streams_and_never_writes_a_temp_file(tmp_path, monkeypatch):
+    pytest.importorskip("faster_whisper")
+    import tempfile
+
+    from audel.signals.vad import speech_regions
+
+    def no_temp(*a, **k):
+        raise AssertionError("speech detection must stream, not write a temp WAV")
+
+    f = _real_speech(tmp_path)
+    monkeypatch.setattr(tempfile, "mkstemp", no_temp)
+    assert speech_regions(f, Settings(), stream=0, labels=["FC"], channels=1)
