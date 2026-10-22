@@ -20,7 +20,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from ..config import Settings
-from ..mediaguard import MediaInfo, StreamInfo, _tool, run
+from ..mediaguard import MediaInfo, StreamInfo, _tool, run, safe_input
 from ..signals._parse import (
     parse_astats,
     parse_astats_sections,
@@ -93,7 +93,7 @@ def _main_pass(ffmpeg: str, path, idx: int, st: StreamInfo, settings: Settings) 
     )
     # `-t max_duration_s` bounds how much is actually processed even if the container LIES about
     # its duration (the probe cap trusts metadata; this caps the real decode regardless).
-    argv = [ffmpeg, "-nostdin", "-hide_banner", "-v", "verbose", "-threads", "1", "-i", str(path),
+    argv = [ffmpeg, "-nostdin", "-hide_banner", "-v", "verbose", "-threads", "1", *safe_input(path),
             "-map", f"0:a:{idx}?", "-t", str(settings.max_duration_s), "-af", af, "-f", "null", "-"]
     proc = run(argv, timeout_s=settings.decode_timeout_s)
     err = proc.stderr.decode("utf-8", "replace")
@@ -145,7 +145,7 @@ def _spectral_pass(ffmpeg: str, path, idx: int, tm: TrackMeasurements, settings:
         outs.append("[oms]")
     # Input-side -t: with several outputs an output-side -t would bound only the first one.
     argv = [ffmpeg, "-nostdin", "-hide_banner", "-threads", "1", "-t", str(settings.max_duration_s),
-            "-i", str(path), "-filter_complex", ";".join(graph)]
+            *safe_input(path), "-filter_complex", ";".join(graph)]
     for o in outs:
         argv += ["-map", o, "-f", "null", "-"]
     proc = run(argv, timeout_s=settings.decode_timeout_s)
@@ -168,7 +168,7 @@ def _tail_pass(ffmpeg: str, path, idx: int, tm: TrackMeasurements, settings: Set
     # Truncation cue: RMS of the final 250 ms. A clip that ends loud (no trailing decay/silence)
     # is a likely mid-word cut. Bounded second pass via -sseof.
     tail = run([ffmpeg, "-nostdin", "-hide_banner", "-threads", "1", "-sseof", "-0.25",
-                "-i", str(path), "-map", f"0:a:{idx}?",
+                *safe_input(path), "-map", f"0:a:{idx}?",
                 "-af", "astats=metadata=0:measure_overall=RMS_level:measure_perchannel=none",
                 "-f", "null", "-"], timeout_s=min(30.0, settings.decode_timeout_s))
     tm.tail_rms_dbfs = parse_astats(tail.stderr.decode("utf-8", "replace")).get("rms")

@@ -63,6 +63,38 @@ All notable changes to Audel are recorded here. The format follows
   API, so the request now uses `output_config.effort = "low"` and handles a `refusal` stop reason.
 
 ### Security
+- Red-team round 1 fixes, each pinned by a regression test:
+  - **High.** Uploaded HLS or ffconcat playlists could make ffmpeg read other media files on the
+    host. Every decode now runs with `-protocol_whitelist file` and a demuxer allowlist, and temp
+    files keep only known media extensions.
+  - **Medium.** Tenants from different credential sources shared one namespace. JWT tenants are
+    now `jwt:<claim>`, and `default` is reserved.
+  - **Medium.** A JWT whose algorithm did not match the key type caused a 500 that the lockout
+    did not count. Keys are now filtered by type, and the error is a 401.
+  - **Medium.** The failed-auth lockout keyed on the client address and ran before credentials,
+    so it could lock out every tenant behind a NAT or load balancer. Valid credentials now always
+    pass, and only failures are throttled. IPv6 is grouped by /64.
+  - **Medium.** A `.env` in the working directory could redirect the Ollama cloud key. No `.env`
+    is read unless `AUDEL_ENV_FILE` names one, and the cloud key is sent only over https and never
+    to an on-prem host.
+  - **Medium.** Decode-failure reports echoed server temp paths. Messages are now sanitized.
+  - **Medium.** `/healthz` read request bodies, and the middleware buffered whole bodies. The cap
+    is now enforced on the stream, and `/healthz` reads nothing.
+  - **Medium.** A cancelled or timed-out job freed its concurrency slot while the work kept
+    running. Slots are now held until the work ends.
+  - **Low.** `/doctor` and `/metrics` are admin-only, and `/doctor` honours the egress policy.
+  - **Low.** `X-Forwarded-For` is trusted only from `AUDEL_FORWARDED_ALLOW_IPS`.
+  - **Low.** Shared tokens shorter than 32 characters are refused, and a tenant rate of 0 is
+    rejected.
+  - **Low.** The workspace is 0700. Uploads and the audit log are 0600, created without following
+    symlinks.
+  - **Low.** `/watch` over REST is opt-in (`AUDEL_REST_ALLOW_WATCH`), WebRTC UDP is disabled in
+    capture, and the vetting proxy allows ports 80 and 443 only.
+  - **Low.** IPv6 NAT64, 6to4 and Teredo addresses are unwrapped before SSRF checks.
+  - **Low.** Job error strings are sanitized.
+  - **Deploy.** Helm ingress defaults to the same namespace, DNS egress goes to kube-dns only,
+    token, JWKS and TLS mounts are supported, and the default is one replica. The Dockerfile base
+    is pinned by digest, and GitHub Actions are pinned to commit SHAs.
 - **Per-tenant tokens.** `AUDEL_API_TOKENS_FILE` holds SHA-256 hashes only, and
   `audel token new` mints a token. All tenant hashes are compared in constant time on every
   request.
@@ -81,6 +113,10 @@ All notable changes to Audel are recorded here. The format follows
 - Published threat model: `docs/security.md`.
 - Backend HTTP calls refuse redirects and cap the response size before parsing.
 - Backend URLs with embedded credentials are refused.
+
+### Removed
+- The unused `DEEPGRAM_API_KEY`, `GROQ_API_KEY` and `ASSEMBLYAI_API_KEY` settings. No backends
+  for them existed.
 
 ### Changed
 - `audel doctor` no longer lists Deepgram, Groq or AssemblyAI. No backends for them exist.

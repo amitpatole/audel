@@ -21,7 +21,7 @@ def _app(tmp_path, **settings_kw):
 # ---- auth (constant-time bearer, loopback zero-config) -------------------------
 
 def test_healthz_is_public(tmp_path):
-    c = TestClient(_app(tmp_path, api_token="secrettoken123456"))
+    c = TestClient(_app(tmp_path, api_token="secrettoken123456-padded-to-32-chars-ok"))
     assert c.get("/healthz").status_code == 200
 
 
@@ -31,10 +31,10 @@ def test_loopback_zero_config_no_token(tmp_path):
 
 
 def test_token_required_when_set(tmp_path):
-    c = TestClient(_app(tmp_path, api_token="secrettoken123456"))
+    c = TestClient(_app(tmp_path, api_token="secrettoken123456-padded-to-32-chars-ok"))
     assert c.get("/doctor").status_code == 401                       # missing
     assert c.get("/doctor", headers={"authorization": "Bearer wrong"}).status_code == 401
-    ok = c.get("/doctor", headers={"authorization": "Bearer secrettoken123456"})
+    ok = c.get("/doctor", headers={"authorization": "Bearer secrettoken123456-padded-to-32-chars-ok"})
     assert ok.status_code == 200
 
 
@@ -49,7 +49,7 @@ def test_non_ascii_auth_header_is_401_not_500(tmp_path):
     # check (str hmac.compare_digest would TypeError -> 500). Drive the ASGI app with a raw header.
     import asyncio
 
-    app = _app(tmp_path, api_token="secrettoken123456")
+    app = _app(tmp_path, api_token="secrettoken123456-padded-to-32-chars-ok")
     statuses: list[int] = []
 
     async def drive():
@@ -73,8 +73,8 @@ def test_non_ascii_auth_header_is_401_not_500(tmp_path):
 def test_schema_endpoints_hidden_when_token_set(tmp_path):
     # R1: /openapi.json & /docs are NOT covered by the auth dependency; in exposed mode they must
     # not leak the API surface to unauthenticated callers.
-    hardened = TestClient(_app(tmp_path, api_token="secrettoken123456"))
-    auth = {"authorization": "Bearer secrettoken123456"}
+    hardened = TestClient(_app(tmp_path, api_token="secrettoken123456-padded-to-32-chars-ok"))
+    auth = {"authorization": "Bearer secrettoken123456-padded-to-32-chars-ok"}
     assert hardened.get("/openapi.json").status_code == 401              # unauth: gated
     assert hardened.get("/openapi.json", headers=auth).status_code == 404  # even authed: disabled
     assert hardened.get("/docs", headers=auth).status_code == 404
@@ -95,7 +95,7 @@ def test_unauthenticated_request_rejected_before_body_buffered(tmp_path):
     # R2: auth runs in the middleware BEFORE the body is read, so an unauthenticated caller can't
     # make the server buffer up to max_request_bytes (DoS amplification). No token header -> 401,
     # not 413, even with an over-cap body.
-    c = TestClient(_app(tmp_path, api_token="secrettoken123456", max_request_bytes=100))
+    c = TestClient(_app(tmp_path, api_token="secrettoken123456-padded-to-32-chars-ok", max_request_bytes=100))
     r = c.post("/check", files={"file": ("a.wav", b"X" * 5000, "audio/wav")})
     assert r.status_code == 401  # rejected on auth, body never buffered/capped
 
@@ -131,14 +131,14 @@ def test_allowlisted_backend_is_accepted_offline(media, tmp_path):
 
 @pytest.mark.parametrize("url", ["http://169.254.169.254/", "http://127.0.0.1:22/", "http://10.0.0.1/"])
 def test_watch_internal_url_grades_fail_not_fetched(tmp_path, url):
-    c = TestClient(_app(tmp_path))
+    c = TestClient(_app(tmp_path, rest_allow_watch=True))
     r = c.post("/watch", json={"source": url})
     assert r.status_code == 200 and r.json()["verdict"] == "fail"  # SSRF refused -> graded, not fetched
 
 
 def test_watch_local_path_is_not_read(tmp_path):
     # a bare host path is not http(s); allow_local_files=False -> refused, never read back.
-    c = TestClient(_app(tmp_path))
+    c = TestClient(_app(tmp_path, rest_allow_watch=True))
     r = c.post("/watch", json={"source": "/etc/passwd"})
     assert r.status_code == 200
     body = r.text

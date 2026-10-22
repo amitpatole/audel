@@ -14,21 +14,34 @@ audel serve --host 0.0.0.0 --port 8000
 | Method and path | What it does |
 |---|---|
 | `GET /healthz` | Liveness. The only unauthenticated route. |
-| `GET /doctor` | Environment diagnostics: ffmpeg, ASR, backends, local LLM reachability. |
+| `GET /doctor` | Environment diagnostics: ffmpeg, ASR, backends, local LLM reachability. Admin only. |
 | `GET /specs` | Built-in delivery specs. |
 | `POST /check` | Deterministic grade: hearing. |
 | `POST /listen` | Hearing plus listening. |
 | `POST /analyze` | Signals, ASR and backend critique of brief claims. |
 | `POST /render` | Signals only, per track. |
 | `POST /handoff` | The distilled ears-to-brain handoff. |
-| `POST /watch` | Temporal grade of an http(s) page. SSRF-guarded. |
+| `POST /watch` | Temporal grade of an http(s) page. Off unless `AUDEL_REST_ALLOW_WATCH=true`. |
 | `POST /jobs` | Queue `check`, `listen` or `analyze`. Returns `202` and a `job_id`. |
 | `GET /jobs`, `GET /jobs/{id}`, `DELETE /jobs/{id}` | Your tenant's jobs. Another tenant's job is a 404. |
-| `GET /metrics` | Prometheus metrics. |
+| `GET /metrics` | Prometheus metrics. Admin only. |
 
 Every grading route takes **either** a multipart `file` upload **or** a `url`, never both. Every
 response carries `X-Request-ID`. Send your own (64 characters at most, `[A-Za-z0-9._-]`) to
 correlate with your pipeline, or let Audel generate one.
+
+## Authentication
+
+```bash
+audel token new --tenant newsroom           # prints the token once, plus its hash entry
+export AUDEL_API_TOKENS_FILE=/etc/audel/tokens.json
+export AUDEL_ADMIN_TENANTS='["ops"]'         # who may read /doctor and /metrics
+```
+
+A shared `AUDEL_API_TOKEN` must be at least 32 characters. For OIDC, set `AUDEL_JWT_JWKS_FILE`,
+`AUDEL_JWT_ISSUER` and `AUDEL_JWT_AUDIENCE`, and keep the JWKS file synced from your identity
+provider. JWT tenants appear as `jwt:<claim>`. Behind a reverse proxy, list it in
+`AUDEL_FORWARDED_ALLOW_IPS` so per-address throttling sees real client addresses.
 
 ## Async jobs
 
@@ -115,8 +128,9 @@ loop sessions. Run it from cron or a Kubernetes CronJob.
 
 ```bash
 docker build -t audel:1.0.0rc1 --build-arg EXTRAS=serve,asr --build-arg ASR_MODEL=small .
+printf 'AUDEL_API_TOKEN=%s\n' "$AUDEL_API_TOKEN" > audel.env && chmod 600 audel.env
 docker run --read-only --tmpfs /tmp -v audel-cache:/var/cache/audel \
-  -e AUDEL_API_TOKEN="$AUDEL_API_TOKEN" -p 8000:8000 audel:1.0.0rc1
+  --env-file audel.env -p 8000:8000 audel:1.0.0rc1
 ```
 
 The image runs as uid 10001 and works with a read-only root filesystem. The whisper model is
@@ -134,7 +148,11 @@ helm install qc deploy/helm/audel --set auth.existingSecret=audel-auth \
   --set env.AUDEL_DELIVERY_SPEC=ebu_r128
 ```
 
-The chart refuses to render without `auth.existingSecret`. Pods run non-root with a read-only
+The chart refuses to render without an auth source. That can be `auth.existingSecret`, the shared
+token; `auth.tokensSecret`, a Secret holding `tokens.json`; or `auth.jwt.jwksConfigMap` with
+`issuer` and `audience`. `tls.secretName` serves TLS, and `tls.mutual: true` adds mutual TLS.
+`replicaCount` defaults to 1 because async jobs live in each pod's memory. Ingress defaults to
+pods in the same namespace, and DNS egress is limited to kube-dns. Pods run non-root with a read-only
 root filesystem, all capabilities dropped, the RuntimeDefault seccomp profile, and no
 service-account token. A NetworkPolicy denies egress except DNS by default. Add `egressCIDRs`
 for an on-prem LLM or an object store.

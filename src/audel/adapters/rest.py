@@ -22,13 +22,20 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 import time
 import uuid
 from pathlib import Path
 
-from ..auth import Authenticator, Principal, RateLimiter
+from ..auth import Authenticator, Principal, RateLimiter, client_key
 from ..config import Settings, load_settings
-from ..errors import AudelError, ConfigError, MissingDependencyError, UnsafeSourceError
+from ..errors import (
+    AudelError,
+    ConfigError,
+    MissingDependencyError,
+    UnsafeSourceError,
+    sanitize_message,
+)
 from ..logging import get_logger
 from ..models import Brief, Report
 
@@ -125,45 +132,48 @@ def build_app(settings: Settings | None = None):
             metrics.request(route, resp.status_code)
             return resp
 
-        if request.url.path != "/healthz":
-            client = request.client.host if request.client else "unknown"
-            # An address that has burned its failed-auth budget is refused BEFORE credentials are
-            # checked, so a brute-forcer cannot learn that a guess was right.
-            if auth.required and fail_limiter.blocked(client):
+        if request.url.path == "/healthz":
+            # Liveness never reads the body (unauthenticated: must not buffer anything).
+            return reply(JSONResponse({"status": "ok", "version": __version__}))
+        client = client_key(request.client.host if request.client else None)
+        # Authenticate BEFORE the body is read: an unauthenticated caller must not be able to
+        # make the server read up to max_request_bytes (DoS amplification).
+        principal = auth.authenticate(request.headers.get("authorization"))
+        if principal is None:
+            # Failures are throttled per client address; a VALID credential is never blocked by
+            # someone else's failures (shared NAT / load-balancer addresses).
+            ok_fail, retry_fail = fail_limiter.allow(client)
+            if not ok_fail:
                 return reply(JSONResponse({"detail": "Too many failed attempts."},
-                                          status_code=429, headers={"Retry-After": "60"}))
-            # Authenticate BEFORE buffering the body: an unauthenticated caller must not be able
-            # to make the server read up to max_request_bytes (DoS amplification).
-            principal = auth.authenticate(request.headers.get("authorization"))
-            if principal is None:
-                fail_limiter.allow(client)
-                return reply(JSONResponse({"detail": "Unauthorized"}, status_code=401))
-            ok, retry = limiter.allow(principal.tenant, principal.rate_per_min)
-            if not ok:
-                return reply(JSONResponse({"detail": "Rate limit exceeded."}, status_code=429,
-                                          headers={"Retry-After": str(retry)}))
-            request.state.principal = principal
-        cap = settings.max_request_bytes
+                                          status_code=429, headers={"Retry-After": str(retry_fail)}))
+            return reply(JSONResponse({"detail": "Unauthorized"}, status_code=401))
+        ok, retry = limiter.allow(principal.tenant, principal.rate_per_min)
+        if not ok:
+            return reply(JSONResponse({"detail": "Rate limit exceeded."}, status_code=429,
+                                      headers={"Retry-After": str(retry)}))
+        request.state.principal = principal
         cl = request.headers.get("content-length")
-        if cl and cl.isdigit() and int(cl) > cap:
+        if cl and cl.isdigit() and int(cl) > settings.max_request_bytes:
             return reply(JSONResponse({"detail": "Request body too large."}, status_code=413))
-        # Enforce on the stream too: a chunked request (no Content-Length) would otherwise buffer
-        # unbounded past the header check.
-        total = 0
-        chunks: list[bytes] = []
-        async for chunk in request.stream():
-            total += len(chunk)
-            if total > cap:
-                return reply(JSONResponse({"detail": "Request body too large."}, status_code=413))
-            chunks.append(chunk)
-        body = b"".join(chunks)
-
-        async def _replay():
-            return {"type": "http.request", "body": body, "more_body": False}
-
-        request._body = body
-        request._receive = _replay
+        # The streamed body is capped by _BodyLimit (no whole-body buffering in memory).
         return reply(await call_next(request))
+
+    app.add_middleware(_BodyLimit, cap=settings.max_request_bytes)
+
+    def _admin_only(request: Request) -> None:
+        """/doctor and /metrics expose server internals and cross-tenant totals: when auth is on,
+        only the shared-token principal and AUDEL_ADMIN_TENANTS may read them (others: 404)."""
+        if not auth.required:
+            return
+        p = _principal(request)
+        if p.method == "token" or p.tenant in settings.admin_tenants:
+            return
+        raise HTTPException(status_code=404, detail="Not Found")
+
+    _work_sem = asyncio.Semaphore(settings.max_concurrent_jobs)
+
+    async def _shielded(coro_factory, timeout: float):
+        return await run_shielded(_work_sem, coro_factory, timeout)
 
     async def _job_slot():
         async with _job_sem:
@@ -177,7 +187,8 @@ def build_app(settings: Settings | None = None):
         if isinstance(e, (ConfigError, UnsafeSourceError)):
             # Caller-input validation or an unsafe source. Safe to surface once any workspace
             # path is redacted.
-            return HTTPException(status_code=400, detail=str(e).replace(_ws_marker, "<workspace>"))
+            return HTTPException(status_code=400, detail=sanitize_message(
+                str(e).replace(_ws_marker, "<workspace>")))
         log.warning("request failed: %s", type(e).__name__)
         return HTTPException(status_code=400, detail="Could not decode or grade the source.")
 
@@ -222,12 +233,14 @@ def build_app(settings: Settings | None = None):
         from ..workspace import Workspace
 
         ws = Workspace(settings)
-        suffix = Path(upload.filename or "").suffix[:10] if upload.filename else ""
-        suffix = "".join(c for c in suffix if c.isalnum() or c == ".")  # strip any path chars
+        from ..mediaguard import media_suffix
+
+        suffix = media_suffix(upload.filename)  # known media extensions only (no .m3u8 etc.)
         dest = ws.tmp / f"upload_{uuid.uuid4().hex[:16]}{suffix}"
         total = 0
         cap = settings.max_request_bytes
-        with open(dest, "wb") as fh:
+        fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        with os.fdopen(fd, "wb") as fh:
             while True:
                 chunk = await upload.read(1 << 20)
                 if not chunk:
@@ -287,8 +300,8 @@ def build_app(settings: Settings | None = None):
         digest, size = await asyncio.to_thread(_sha256, path)
         status, verdict, n_issues, err = "ok", None, None, None
         try:
-            report = await asyncio.wait_for(_grade(kind, path, p, gs),
-                                            timeout=settings.request_timeout_s)
+            report = await _shielded(lambda: _grade(kind, path, p, gs),
+                                     settings.request_timeout_s)
             verdict, n_issues = report.verdict.value, len(report.issues)
             return _public(report)
         except TimeoutError:
@@ -315,14 +328,16 @@ def build_app(settings: Settings | None = None):
         return {"status": "ok", "version": __version__}
 
     @app.get("/doctor")
-    def doctor_ep():
+    def doctor_ep(request: Request):
+        _admin_only(request)
         from .doctor import run_checks
 
         return {"checks": [{"name": c.name, "ok": c.ok, "detail": c.detail}
                            for c in run_checks(settings)]}
 
     @app.get("/metrics")
-    def metrics_ep():
+    def metrics_ep(request: Request):
+        _admin_only(request)
         if not settings.metrics_enabled:
             raise HTTPException(status_code=404, detail="Not Found")
         metrics.queued = sum(1 for j in jobs._jobs.values() if j.status == "queued")
@@ -434,6 +449,8 @@ def build_app(settings: Settings | None = None):
         """Temporal grade of an http(s) URL (does the audio play THROUGH?). SSRF-guarded."""
         from ..core import watch
 
+        if not settings.rest_allow_watch:
+            raise HTTPException(status_code=403, detail="watch is disabled on this server.")
         source = body.get("source")
         if not isinstance(source, str) or not source:
             raise HTTPException(status_code=400, detail="watch requires a JSON {\"source\": url}.")
@@ -525,6 +542,75 @@ def build_app(settings: Settings | None = None):
     return app
 
 
+async def run_shielded(sem: asyncio.Semaphore, coro_factory, timeout: float):
+    """Run grading so its concurrency slot is held until the work REALLY ends.
+
+    A request timeout or a job cancel must not free the slot while ffmpeg/ASR threads keep
+    running (that would let a caller pile up unbounded background work). Work abandoned before it
+    acquired a slot is skipped entirely."""
+    abandoned = asyncio.Event()
+
+    async def guarded():
+        async with sem:
+            if abandoned.is_set():
+                return None
+            return await coro_factory()
+
+    task = asyncio.create_task(guarded())
+    try:
+        return await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+    except (TimeoutError, asyncio.CancelledError):
+        abandoned.set()
+        raise
+
+
+class _BodyLimit:
+    """Pure-ASGI request-body cap, enforced on the STREAM as it is read (chunked uploads
+    included) without buffering the whole body in memory. Past the cap the app's response is
+    replaced by 413."""
+
+    def __init__(self, app, cap: int) -> None:
+        self.app, self.cap = app, cap
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        total = 0
+        exceeded = False
+        sent_ours = False
+
+        async def recv():
+            nonlocal total, exceeded
+            msg = await receive()
+            if msg.get("type") == "http.request":
+                total += len(msg.get("body", b""))
+                if total > self.cap:
+                    exceeded = True
+                    return {"type": "http.disconnect"}
+            return msg
+
+        async def snd(msg):
+            nonlocal sent_ours
+            if not exceeded:
+                return await send(msg)
+            if sent_ours:
+                return None
+            sent_ours = True
+            body = b'{"detail":"Request body too large."}'
+            await send({"type": "http.response.start", "status": 413,
+                        "headers": [(b"content-type", b"application/json"),
+                                    (b"content-length", str(len(body)).encode())]})
+            await send({"type": "http.response.body", "body": body})
+
+        try:
+            await self.app(scope, recv, snd)
+        except Exception:
+            if not exceeded:
+                raise
+        if exceeded and not sent_ours:
+            await snd({"type": "http.response.start"})
+
+
 _ROUTES = frozenset({"/healthz", "/doctor", "/metrics", "/specs", "/check", "/analyze", "/listen",
                      "/render", "/handoff", "/watch", "/jobs"})
 
@@ -550,7 +636,11 @@ def serve(host: str = "127.0.0.1", port: int = 8000) -> None:
         tls = {"ssl_certfile": str(s.tls_certfile), "ssl_keyfile": str(s.tls_keyfile)}
         if s.tls_client_ca:
             tls.update(ssl_ca_certs=str(s.tls_client_ca), ssl_cert_reqs=ssl.CERT_REQUIRED)
-    uvicorn.run(build_app(), host=host, port=port, **tls)
+    # X-Forwarded-For is trusted ONLY from proxies the operator lists (default: none).
+    fwd: dict = {"proxy_headers": bool(s.forwarded_allow_ips)}
+    if s.forwarded_allow_ips:
+        fwd["forwarded_allow_ips"] = ",".join(s.forwarded_allow_ips)
+    uvicorn.run(build_app(), host=host, port=port, **tls, **fwd)
 
 
 def main() -> None:

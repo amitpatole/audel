@@ -34,11 +34,31 @@ def _normalize(ip):
     return ip
 
 
+_NAT64 = [ipaddress.ip_network("64:ff9b::/96"), ipaddress.ip_network("64:ff9b:1::/48")]
+
+
+def _embedded_ipv4(ip) -> list:
+    """IPv4 addresses carried inside IPv6 transition formats (NAT64, 6to4, Teredo). A routable
+    IPv6 address must not smuggle an internal IPv4 destination past the checks."""
+    if not isinstance(ip, ipaddress.IPv6Address):
+        return []
+    out = []
+    if any(ip in n for n in _NAT64):
+        out.append(ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF))
+    if ip.sixtofour is not None:
+        out.append(ip.sixtofour)
+    if ip.teredo is not None:
+        out.extend(ip.teredo)
+    return out
+
+
 def ip_is_blocked(addr: str) -> bool:
     """True if a literal address is internal / metadata / unparseable (fail closed)."""
     try:
         ip = _normalize(ipaddress.ip_address(addr))
     except ValueError:
+        return True
+    if any(ip_is_blocked(str(v4)) for v4 in _embedded_ipv4(ip)):
         return True
     if str(ip) in _METADATA or addr in _METADATA:
         return True

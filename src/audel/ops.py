@@ -101,8 +101,10 @@ class AuditLog:
         if self._path is None:
             return
         with self._lock:
-            fd = os.open(self._path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            fd = os.open(self._path, os.O_WRONLY | os.O_APPEND | os.O_CREAT
+                         | getattr(os, "O_NOFOLLOW", 0), 0o600)
             try:
+                os.fchmod(fd, 0o600)  # also tighten a pre-existing file
                 os.write(fd, (line + "\n").encode("utf-8"))
             finally:
                 os.close(fd)

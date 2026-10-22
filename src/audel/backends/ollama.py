@@ -42,6 +42,16 @@ class OllamaBackend:
         if not key:
             raise BackendAuthError("no Ollama key (set OLLAMA_API_KEY or ~/.config/ollama/key)")
         url = self._settings.ollama_base_url.rstrip("/") + "/chat/completions"
+        from urllib.parse import urlsplit
+
+        from ..errors import UnsafeSourceError
+
+        u = urlsplit(url)
+        if u.scheme != "https":
+            raise UnsafeSourceError("the Ollama cloud key is only ever sent over https")
+        if (u.hostname or "").lower() in {h.lower() for h in self._settings.trusted_backend_hosts}:
+            raise UnsafeSourceError("the Ollama cloud key is never sent to an on-prem host; "
+                                    "use the keyless ollama-local backend for LAN servers")
         assert_backend_url(url, self._settings.trusted_backend_hosts, self._settings)  # SSRF: vet the endpoint
         return await asyncio.to_thread(self._post, url, key, system, user)
 

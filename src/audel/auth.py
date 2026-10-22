@@ -48,6 +48,10 @@ _MAX_TENANTS = 10_000
 _ASYMMETRIC = frozenset({"RS256", "RS384", "RS512", "PS256", "PS384", "PS512",
                          "ES256", "ES384", "ES512", "EdDSA"})
 _MAX_BEARER = 8192
+_MIN_SHARED_TOKEN = 32
+_RESERVED = frozenset({"default", "anonymous", "admin"})
+# JWT algorithm family -> JWK key type it must be verified with (no cross-type key use).
+_ALG_KTY = {"RS": "RSA", "PS": "RSA", "ES": "EC", "Ed": "OKP"}
 
 
 @dataclass(frozen=True)
@@ -84,14 +88,25 @@ def load_tenants(path: Path) -> dict[str, tuple[bytes, int | None]]:
     for name, entry in tenants.items():
         if not valid_tenant(str(name)) or not isinstance(entry, dict):
             raise ConfigError(f"invalid tenant entry {str(name)[:64]!r}")
+        if str(name).lower() in _RESERVED:
+            raise ConfigError(f"tenant name {name!r} is reserved")
         h = str(entry.get("sha256", "")).lower()
         if not re.fullmatch(r"[0-9a-f]{64}", h):
             raise ConfigError(f"tenant {name!r}: sha256 must be 64 hex characters")
         rate = entry.get("rate_per_min")
-        if rate is not None and (not isinstance(rate, int) or rate < 0 or rate > 1_000_000):
-            raise ConfigError(f"tenant {name!r}: rate_per_min must be a non-negative integer")
+        if rate is not None and (not isinstance(rate, int) or isinstance(rate, bool)
+                                 or rate < 1 or rate > 1_000_000):
+            raise ConfigError(f"tenant {name!r}: rate_per_min must be an integer from 1")
         out[str(name)] = (bytes.fromhex(h), rate)
     return out
+
+
+def _jwk_fits(k, kty: str | None, alg: str) -> bool:
+    """A JWKS key may verify this token only if its type matches the alg family and its own
+    declared alg/use (when present) agree. Prevents cross-type key use and type-confusion crashes."""
+    data = getattr(k, "_jwk_data", None) or {}
+    return (data.get("kty") == kty and data.get("alg") in (None, alg)
+            and data.get("use") in (None, "sig"))
 
 
 class _JWTVerifier:
@@ -121,9 +136,11 @@ class _JWTVerifier:
         try:
             header = jwt.get_unverified_header(token)
             alg, kid = header.get("alg"), header.get("kid")
-            if alg not in self._algs:
+            if not isinstance(alg, str) or alg not in self._algs:
                 return None
-            keys = [k for k in self._jwks.keys if kid is None or k.key_id == kid]
+            kty = _ALG_KTY.get(alg[:2])
+            keys = [k for k in self._jwks.keys
+                    if (kid is None or k.key_id == kid) and _jwk_fits(k, kty, alg)]
             if not keys:
                 return None
             for k in keys:
@@ -133,23 +150,27 @@ class _JWTVerifier:
                         issuer=self._s.jwt_issuer, leeway=self._s.jwt_leeway_s,
                         options={"require": ["exp", "iat", "iss", "aud"]})
                     break
-                except jwt.InvalidSignatureError:
+                except (jwt.InvalidSignatureError, jwt.InvalidKeyError, TypeError, ValueError):
                     continue
             else:
                 return None
-        except jwt.PyJWTError:
+        except (jwt.PyJWTError, TypeError, ValueError, KeyError):
             return None
         if float(claims["exp"]) - float(claims["iat"]) > self._s.jwt_max_lifetime_s:
             return None
         tenant = claims.get(self._s.jwt_tenant_claim)
         if not isinstance(tenant, str) or not valid_tenant(tenant):
             return None
-        return Principal(tenant=tenant, method="jwt")
+        # Namespaced: a JWT tenant can never equal a token tenant (names can't contain ':').
+        return Principal(tenant=f"jwt:{tenant}", method="jwt")
 
 
 class Authenticator:
     def __init__(self, settings: Settings) -> None:
         self._s = settings
+        if settings.api_token is not None and len(settings.api_token) < _MIN_SHARED_TOKEN:
+            raise ConfigError(f"AUDEL_API_TOKEN must be at least {_MIN_SHARED_TOKEN} characters "
+                              "(generate one with: openssl rand -hex 32)")
         self._tenants = load_tenants(settings.api_tokens_file) if settings.api_tokens_file else {}
         self._jwt = _JWTVerifier(settings) if settings.jwt_jwks_file else None
 
@@ -226,3 +247,19 @@ class RateLimiter:
             while len(self._b) > self._max:
                 self._b.popitem(last=False)
         return ok, (0 if ok else max(1, int((1.0 - tokens) / refill) + 1))
+
+
+def client_key(host: str | None) -> str:
+    """Rate-limit key for a client address: IPv6 is bucketed by /64 (one subscriber's prefix),
+    so rotating addresses inside a prefix does not buy fresh attempts."""
+    import ipaddress
+
+    if not host:
+        return "unknown"
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return host[:64]
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is None:
+        return str(ipaddress.ip_network(f"{ip}/64", strict=False))
+    return str(ip.ipv4_mapped or ip) if isinstance(ip, ipaddress.IPv6Address) else str(ip)

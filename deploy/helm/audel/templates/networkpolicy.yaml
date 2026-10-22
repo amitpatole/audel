@@ -10,11 +10,18 @@ spec:
   policyTypes: [Ingress, Egress]
   ingress:
     - ports: [{port: 8000, protocol: TCP}]
-      {{- with .Values.networkPolicy.ingressFrom }}
-      from: {{- toYaml . | nindent 8 }}
+      {{- if .Values.networkPolicy.ingressFrom }}
+      from: {{- toYaml .Values.networkPolicy.ingressFrom | nindent 8 }}
+      {{- else }}
+      from: [{podSelector: {}}]   # same namespace only
       {{- end }}
   egress:
-    - ports: [{port: 53, protocol: UDP}, {port: 53, protocol: TCP}]
+    - to:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: {{ .Values.networkPolicy.dnsNamespace }}}
+          podSelector:
+            matchLabels: {{- toYaml .Values.networkPolicy.dnsPodLabels | nindent 14 }}
+      ports: [{port: 53, protocol: UDP}, {port: 53, protocol: TCP}]
     {{- range .Values.networkPolicy.egressCIDRs }}
     - to: [{ipBlock: {cidr: {{ . | quote }}}}]
     {{- end }}

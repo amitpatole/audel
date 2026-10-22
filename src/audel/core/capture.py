@@ -49,7 +49,12 @@ def _launch_args(settings: Settings) -> dict:
     even a 127.0.0.1 / localhost subresource is forced through the vetting proxy (and refused) —
     without it the proxy could be side-stepped for loopback (SSRF).
     """
-    args = ["--disable-dev-shm-usage", "--proxy-bypass-list=<-loopback>"]
+    args = ["--disable-dev-shm-usage", "--proxy-bypass-list=<-loopback>",
+            # WebRTC / STUN is UDP and would bypass the HTTP proxy (internal-address discovery,
+            # UDP to internal hosts). Allow only proxied, TCP-relayed WebRTC: none.
+            "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+            "--webrtc-ip-handling-policy=disable_non_proxied_udp",
+            "--disable-features=WebRtcHideLocalIpsWithMdns"]
     if not settings.chromium_sandbox:
         # Only a trusted/contained env should set this; we never flip it silently.
         args.append("--no-sandbox")

@@ -1,6 +1,10 @@
-{{- if not .Values.auth.existingSecret }}
-{{- fail "auth.existingSecret is required: Audel refuses to serve a routable interface without auth" }}
+{{- if not (or .Values.auth.existingSecret .Values.auth.tokensSecret .Values.auth.jwt.jwksConfigMap) }}
+{{- fail "an auth source is required (auth.existingSecret, auth.tokensSecret or auth.jwt.jwksConfigMap): Audel refuses to serve a routable interface without auth" }}
 {{- end }}
+{{- if and .Values.auth.jwt.jwksConfigMap (not (and .Values.auth.jwt.issuer .Values.auth.jwt.audience)) }}
+{{- fail "auth.jwt.issuer and auth.jwt.audience are required with a JWKS" }}
+{{- end }}
+{{- $scheme := ternary "HTTPS" "HTTP" (ne .Values.tls.secretName "") }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -32,29 +36,80 @@ spec:
             {{- range $k, $v := .Values.env }}
             - {name: {{ $k }}, value: {{ $v | quote }}}
             {{- end }}
+            {{- if .Values.auth.existingSecret }}
             - name: AUDEL_API_TOKEN
               valueFrom:
                 secretKeyRef: {name: {{ .Values.auth.existingSecret }}, key: AUDEL_API_TOKEN}
+            {{- end }}
+            {{- if .Values.auth.tokensSecret }}
+            - {name: AUDEL_API_TOKENS_FILE, value: /etc/audel/auth/tokens.json}
+            {{- end }}
+            {{- if .Values.auth.jwt.jwksConfigMap }}
+            - {name: AUDEL_JWT_JWKS_FILE, value: /etc/audel/jwks/jwks.json}
+            - {name: AUDEL_JWT_ISSUER, value: {{ .Values.auth.jwt.issuer | quote }}}
+            - {name: AUDEL_JWT_AUDIENCE, value: {{ .Values.auth.jwt.audience | quote }}}
+            {{- end }}
+            {{- with .Values.auth.adminTenants }}
+            - {name: AUDEL_ADMIN_TENANTS, value: {{ toJson . | quote }}}
+            {{- end }}
+            {{- if .Values.tls.secretName }}
+            - {name: AUDEL_TLS_CERTFILE, value: /etc/audel/tls/tls.crt}
+            - {name: AUDEL_TLS_KEYFILE, value: /etc/audel/tls/tls.key}
+            {{- if .Values.tls.mutual }}
+            - {name: AUDEL_TLS_CLIENT_CA, value: /etc/audel/tls/ca.crt}
+            {{- end }}
+            {{- end }}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities: {drop: ["ALL"]}
+          {{- if .Values.tls.mutual }}
+          # mTLS rejects probes without a client certificate: check the port instead.
           readinessProbe:
-            httpGet: {path: /healthz, port: http}
+            tcpSocket: {port: http}
             periodSeconds: 10
           livenessProbe:
-            httpGet: {path: /healthz, port: http}
+            tcpSocket: {port: http}
+            periodSeconds: 30
+          {{- else }}
+          readinessProbe:
+            httpGet: {path: /healthz, port: http, scheme: {{ $scheme }}}
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /healthz, port: http, scheme: {{ $scheme }}}
             periodSeconds: 30
             failureThreshold: 3
+          {{- end }}
           resources: {{- toYaml .Values.resources | nindent 12 }}
           volumeMounts:
             - {name: cache, mountPath: /var/cache/audel}
             - {name: tmp, mountPath: /tmp}
+            {{- if .Values.auth.tokensSecret }}
+            - {name: tokens, mountPath: /etc/audel/auth, readOnly: true}
+            {{- end }}
+            {{- if .Values.auth.jwt.jwksConfigMap }}
+            - {name: jwks, mountPath: /etc/audel/jwks, readOnly: true}
+            {{- end }}
+            {{- if .Values.tls.secretName }}
+            - {name: tls, mountPath: /etc/audel/tls, readOnly: true}
+            {{- end }}
       volumes:
         - name: cache
           emptyDir: {sizeLimit: {{ .Values.cacheSizeLimit }}}
         - name: tmp
           emptyDir: {sizeLimit: 1Gi}
+        {{- if .Values.auth.tokensSecret }}
+        - name: tokens
+          secret: {secretName: {{ .Values.auth.tokensSecret }}, defaultMode: 0400}
+        {{- end }}
+        {{- if .Values.auth.jwt.jwksConfigMap }}
+        - name: jwks
+          configMap: {name: {{ .Values.auth.jwt.jwksConfigMap }}}
+        {{- end }}
+        {{- if .Values.tls.secretName }}
+        - name: tls
+          secret: {secretName: {{ .Values.tls.secretName }}, defaultMode: 0400}
+        {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector: {{- toYaml . | nindent 8 }}
       {{- end }}

@@ -3,14 +3,23 @@ image:
   tag: "1.0.0rc1"
   pullPolicy: IfNotPresent
 
-# Sync grading scales horizontally. Async jobs (/jobs) live in each pod's memory: keep
-# replicaCount 1 for the jobs API, or route a tenant's job calls to one pod (see docs).
-replicaCount: 2
+# Async jobs (/jobs) live in each pod's memory, so the default is ONE replica. Raise it only for
+# sync grading behind a load balancer, or with tenant-affine routing for /jobs (see docs).
+replicaCount: 1
 
+# At least one auth source is required; the chart never generates or embeds a credential.
 auth:
-  # Name of an existing Secret with key AUDEL_API_TOKEN (and optionally AUDEL_API_TOKENS_FILE
-  # contents mounted below). The chart never generates or embeds a token.
-  existingSecret: ""
+  existingSecret: ""        # Secret with key AUDEL_API_TOKEN (shared token, >= 32 chars)
+  tokensSecret: ""          # Secret with key tokens.json (per-tenant SHA-256 hashes)
+  jwt:
+    jwksConfigMap: ""       # ConfigMap with key jwks.json
+    issuer: ""
+    audience: ""
+  adminTenants: []          # tenants allowed to read /doctor and /metrics
+
+tls:
+  secretName: ""            # kubernetes.io/tls Secret (tls.crt, tls.key); add ca.crt for mTLS
+  mutual: false
 
 env:
   AUDEL_DELIVERY_SPEC: ""
@@ -35,9 +44,12 @@ service:
 
 networkPolicy:
   enabled: true
-  # Default: egress denied except DNS. Add CIDRs for an on-prem LLM or object store.
+  # Default: egress denied except DNS to kube-dns. Add CIDRs for an on-prem LLM or object store.
   egressCIDRs: []
-  ingressFrom: []   # podSelector/namespaceSelector entries allowed to call the service
+  # Callers allowed in. Empty = pods in this namespace only (never "everyone").
+  ingressFrom: []
+  dnsNamespace: kube-system
+  dnsPodLabels: {k8s-app: kube-dns}
 
 podDisruptionBudget:
   enabled: true

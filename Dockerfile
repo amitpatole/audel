@@ -11,8 +11,9 @@
 #
 # Build:  docker build -t audel:1.0 --build-arg EXTRAS=serve,asr --build-arg ASR_MODEL=small .
 # Run:    docker run --read-only --tmpfs /tmp -v audel-cache:/var/cache/audel \
-#           -e AUDEL_API_TOKEN=... -p 8000:8000 audel:1.0
-FROM python:3.12-slim AS base
+#           --env-file audel.env -p 8000:8000 audel:1.0      (keeps the token out of `docker inspect` args)
+# Base pinned by digest (python:3.12-slim); bump deliberately.
+FROM python:3.12-slim@sha256:6c4dd321d176d61ea848dc8c73a4f7dbae8f70e0ee48bb411ea2f045b599fa8e AS base
 
 ARG EXTRAS=serve,asr
 ARG ASR_MODEL=base

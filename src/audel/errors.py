@@ -38,3 +38,18 @@ class ConfigError(AudelError):
 
 class EgressDeniedError(UnsafeSourceError):
     """The egress policy (``AUDEL_EGRESS``) forbids this network call."""
+
+
+_PATHLIKE = None
+
+
+def sanitize_message(msg: str, *, limit: int = 300) -> str:
+    """Strip anything that looks like a filesystem path or IP:port from a message that may reach
+    a remote caller (tool stderr echoes input paths). Keeps the human-readable reason."""
+    import re
+
+    global _PATHLIKE
+    if _PATHLIKE is None:
+        _PATHLIKE = re.compile(r"(?:[A-Za-z]:)?(?:/[^\s'\"():,]+){2,}|/[^\s'\"():,]+\.[A-Za-z0-9]{1,8}"
+                               r"|\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b")
+    return _PATHLIKE.sub("<path>", str(msg))[:limit]

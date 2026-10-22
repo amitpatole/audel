@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
 import time
@@ -57,8 +58,14 @@ class Workspace:
         self.artifacts = self.root / "artifacts"
         self.sessions = self.root / "sessions"
         self.tmp = self.root / "tmp"
+        # Private to the service user: uploads may be unreleased media.
+        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         for d in (self.artifacts, self.sessions, self.tmp):
-            d.mkdir(parents=True, exist_ok=True)
+            d.mkdir(parents=True, exist_ok=True, mode=0o700)
+            try:
+                os.chmod(d, 0o700)
+            except OSError:
+                pass
 
     # ---- artifact cache (inputs-addressed) -------------------------------------
 

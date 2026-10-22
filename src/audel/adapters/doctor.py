@@ -66,7 +66,7 @@ def _local_llm(s: Settings) -> Check:
 
     url = s.local_llm_url.rstrip("/") + "/api/version"
     try:
-        assert_backend_url(url, s.trusted_backend_hosts)
+        assert_backend_url(url, s.trusted_backend_hosts, s)
         opener = urllib.request.build_opener(_NoRedirect())
         with opener.open(url, timeout=3) as resp:
             version = json.loads(resp.read(4096)).get("version", "?")

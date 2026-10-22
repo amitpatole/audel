@@ -20,6 +20,7 @@ Signed URLs carry secrets in the query string. They are never logged or echoed: 
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 import urllib.request
 import uuid
@@ -98,7 +99,8 @@ def _download(url: str, dest: Path, proxy_url: str, settings: Settings) -> int:
         declared = resp.headers.get("Content-Length")
         if declared and declared.isdigit() and int(declared) > cap:
             raise UnsafeSourceError(f"remote object is {declared} bytes, over the {cap}-byte cap")
-        with open(dest, "wb") as fh:
+        fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        with os.fdopen(fd, "wb") as fh:
             while True:
                 if time.monotonic() > deadline:
                     raise UnsafeSourceError("download exceeded the ingest time limit")
@@ -117,8 +119,9 @@ def _download(url: str, dest: Path, proxy_url: str, settings: Settings) -> int:
 async def fetch_to_file(url: str, tmp_dir: Path, settings: Settings) -> Path:
     """Download ``url`` into ``tmp_dir`` under a server-chosen name. Caller deletes the file."""
     validate_ingest_url(url, settings)
-    suffix = Path(urlsplit(url).path).suffix[:10]
-    suffix = "".join(c for c in suffix if c.isalnum() or c == ".")
+    from .mediaguard import media_suffix
+
+    suffix = media_suffix(urlsplit(url).path)
     dest = Path(tmp_dir) / f"ingest_{uuid.uuid4().hex[:16]}{suffix}"
     proxy = VettingProxy(max_connections=settings.proxy_max_connections,
                          idle_timeout_s=settings.proxy_idle_timeout_s)

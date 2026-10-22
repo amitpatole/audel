@@ -37,11 +37,18 @@ DSP_CAPABILITIES = [
 
 
 def _decode_error(source, e: Exception) -> Report:
+    # Tool stderr echoes input paths: the report (which may go to a remote caller) gets a
+    # sanitized reason; the full text goes to the server log only.
+    from ..errors import sanitize_message
+    from ..logging import get_logger
+
+    get_logger("check").info("decode failed: %s", e)
+    reason = sanitize_message(str(e), limit=200)
     return Report(
         verdict=Verdict.FAIL,
-        summary=f"could not decode: {e}",
-        issues=[Issue.make(IssueKind.DECODE_ERROR, Severity.CRITICAL, str(e),
-                           span=Span(start_ms=0, end_ms=0))],
+        summary=f"could not decode: {reason}",
+        issues=[Issue.make(IssueKind.DECODE_ERROR, Severity.CRITICAL, reason,
+                           span=Span(start_ms=0, end_ms=0), detail={"check": "decode_error"})],
         capabilities=DSP_CAPABILITIES, backend="dsp", audio_path=str(source),
     )
 

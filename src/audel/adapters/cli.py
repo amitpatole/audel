@@ -139,8 +139,10 @@ def token_new(tenant: str = typer.Option(..., help="Tenant name ([A-Za-z0-9._-],
 
     from ..auth import token_hash, valid_tenant
 
-    if not valid_tenant(tenant):
-        raise typer.BadParameter("tenant must be 1-64 chars of [A-Za-z0-9._-]")
+    if not valid_tenant(tenant) or tenant.lower() in ("default", "anonymous", "admin"):
+        raise typer.BadParameter("tenant must be 1-64 chars of [A-Za-z0-9._-] and not reserved")
+    if rate_per_min is not None and rate_per_min < 1:
+        raise typer.BadParameter("--rate-per-min must be at least 1")
     tok = secrets.token_urlsafe(32)
     entry: dict = {"sha256": token_hash(tok)}
     if rate_per_min is not None:
@@ -328,8 +330,8 @@ def stream(source: str,
 @app.command()
 def serve(host: str = typer.Option("127.0.0.1", help="Bind host. Non-loopback requires AUDEL_API_TOKEN."),
           port: int = typer.Option(8000, help="Bind port.")) -> None:
-    """Start the REST service (needs audel[serve]). Loopback is zero-config; a routable bind
-    refuses to start without AUDEL_API_TOKEN (fail closed)."""
+    """Start the REST service (needs the serve extra). Loopback is zero-config; a routable bind
+    refuses to start without auth (AUDEL_API_TOKEN, AUDEL_API_TOKENS_FILE or a JWKS)."""
     from .rest import serve as _serve
 
     _serve(host=host, port=port)

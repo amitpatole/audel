@@ -16,29 +16,31 @@ DSP-grounded, no LLM key), then loops against the fixed version and prints
 
 ## What it does
 
-| Capability | What you get |
+| Layer | What you get |
 |---|---|
-| **Hear & report** | A machine verdict (`pass`/`warn`/`fail`) + **time-grounded** issues — loudness (EBU R128), clipping, silence/dropouts, A/V desync — DSP-grounded, no key needed. |
-| **[Match intent](quickstart.md)** | Grade audio against a brief — language, phrase coverage, duration — via local faster-whisper ASR. PASS means *"it says what I meant,"* not just *"it has sound."* |
-| **Listen & critique** | `analyze` adds acoustic + LLM judgment (Ollama Cloud text critique, or key-gated Anthropic / Gemini-audio / CLAP) for subjective claims — egress only here; `check` stays offline. |
-| **Streaming / temporal** | `watch` grades behavior over time; `StreamMonitor` grades live PCM chunks — playthrough, dropouts, liveness — bounded by construction. |
-| **Ears → brain handoff** | A distilled `{verdict, next_action, todo}` signal any agent/brain acts on. |
+| **[Hear](checks.md)** | `check` grades every track against a [delivery spec](specs.md): loudness (integrated, short-term, momentary, LRA), true peak, clipping, silence, truncation, dead, inverted or out-of-phase channels, DC offset, mains hum and noise floor. It is deterministic, time-grounded and never uses the network. |
+| **[Listen](listening.md)** | `listen` grades what was said: script adherence, required and forbidden wording, pace, dead air, intelligibility, captions and language per track. It runs offline on local ASR. |
+| **[Understand](listening.md#understanding-opt-in)** | Opt-in model judgment: did the key messages land, what is the takeaway, and does the delivery match the brief. It can run fully [on-prem](on-prem.md). |
+| **[Operate](deployment.md)** | REST and MCP, async jobs, signed-URL ingestion, metrics, an audit log, tenants, JWT and mTLS, an egress policy, plus a hardened container and Helm chart. |
+| **Ears to brain** | A distilled `{verdict, next_action, todo}` handoff any agent or brain acts on. |
 
 ## Where to go next
 
 <div class="grid cards" markdown>
 
 - :material-rocket-launch: **[Quickstart](quickstart.md)** — install, system deps, first run.
-- :material-console: **CLI** — `demo` · `check` · `analyze` · `watch` · `render` · `diff` · `stream` · `serve` · `doctor`.
-- :material-cog: **Adapters** — REST (FastAPI) and MCP (9 tools) service surfaces.
+- :material-console: **[CLI](cli.md)** — `check` · `listen` · `qc` · `specs` · `bench` · `serve` · `demo` and more.
+- :material-cog: **[Running as a service](deployment.md)** — REST, async jobs, metrics, container and Helm.
+- :material-shield: **[Security](security.md)** — threat model and hardening checklist.
 
 </div>
 
 ## Offline by construction
 
-`check` never touches the network — loudness, clipping, silence, dropout and A/V-desync grading
-run entirely on local DSP (ffmpeg filters) and local ASR (faster-whisper). Egress happens **only**
-on `analyze`, and only to a backend you name; transcripts are treated as untrusted input. The base
+`check` and offline `listen` never touch the network. They run on local DSP (ffmpeg's BS.1770
+meters) and local ASR (faster-whisper). Model-assisted steps reach only the backend you name, and
+`ollama-local` keeps them on your own network. `AUDEL_EGRESS=deny` makes Audel fully offline.
+Transcripts are treated as untrusted input. The base
 install is light (ffmpeg + DSP, no torch) — ML lives behind extras: `[asr]`, `[render]`, `[cloud]`,
 `[clap]`.
 

@@ -20,7 +20,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from audel.adapters.rest import build_app  # noqa: E402
 
-TOKEN = "t0ken-for-tests-123456"
+TOKEN = "t0ken-for-tests-123456-padded-to-32-chars"
 AUTH = {"authorization": f"Bearer {TOKEN}"}
 
 
@@ -224,6 +224,7 @@ def origin(monkeypatch):
         return "127.0.0.1" if host in ("127.0.0.1", "localhost") else await real(host, port)
 
     monkeypatch.setattr(proxy_mod, "resolve_safe_ip", allow_local)
+    monkeypatch.setattr(proxy_mod, "_ALLOWED_PORTS", frozenset(range(1, 65536)))  # local origin
     srv = http.server.HTTPServer(("127.0.0.1", 0), _Srv)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     yield f"http://127.0.0.1:{srv.server_address[1]}"

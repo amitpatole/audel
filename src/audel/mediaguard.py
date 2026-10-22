@@ -80,6 +80,33 @@ class StreamInfo:
         return [f"ch{i + 1}" for i in range(self.channels)]
 
 
+# Demuxers Audel will let ffmpeg/ffprobe use on untrusted input. Container formats that make
+# ffmpeg open OTHER files or URLs (HLS/DASH playlists, ffconcat, image sequences, tee, subfile...)
+# are deliberately absent: a small playlist upload must never become a host-file read.
+DEMUXER_ALLOWLIST = (
+    "wav,w64,rf64,mp3,flac,ogg,matroska,webm,mov,mp4,m4a,3gp,aac,ac3,eac3,aiff,caf,mxf,mpegts,"
+    "avi,asf,amr,dts,truehd,mlp,wv,ape,tta,mpeg,flv,au,opus"
+)
+# Media extensions a server-named temp file may keep (helps demuxer detection; nothing else).
+MEDIA_SUFFIXES = frozenset({
+    ".wav", ".w64", ".rf64", ".mp3", ".flac", ".ogg", ".oga", ".opus", ".mkv", ".mka", ".webm",
+    ".mov", ".mp4", ".m4a", ".m4v", ".3gp", ".aac", ".ac3", ".eac3", ".aif", ".aiff", ".caf",
+    ".mxf", ".ts", ".m2ts", ".mts", ".avi", ".wma", ".wmv", ".asf", ".amr", ".dts", ".thd",
+    ".wv", ".ape", ".tta", ".mpg", ".mpeg", ".flv", ".au",
+})
+
+
+def safe_input(path) -> list[str]:
+    """``-i`` for untrusted media: local-file protocol only, allowlisted demuxers only."""
+    return ["-protocol_whitelist", "file", "-format_whitelist", DEMUXER_ALLOWLIST, "-i", str(path)]
+
+
+def media_suffix(name: str | None) -> str:
+    """The lowercase extension of ``name`` if it is a known media extension, else ``""``."""
+    suf = Path(name or "").suffix.lower()[:10]
+    return suf if suf in MEDIA_SUFFIXES else ""
+
+
 @dataclass(frozen=True)
 class MediaInfo:
     duration_s: float
@@ -185,7 +212,7 @@ def probe(path: Path, settings: Settings) -> MediaInfo:
         "-show_entries",
         "format=duration:stream=codec_type,codec_name,sample_rate,channels,channel_layout"
         ":stream_tags=language,title",
-        "-i", str(path),
+        *safe_input(path),
     ]
     proc = run(argv, timeout_s=min(30.0, settings.decode_timeout_s))
     if proc.returncode != 0:
@@ -260,7 +287,7 @@ def probe_streams(path: Path, settings: Settings) -> dict:
     """Per-stream durations/start times (audio + video) for A/V desync analysis. Best-effort."""
     ffprobe = _tool("ffprobe", settings.ffmpeg_path and str(Path(settings.ffmpeg_path).with_name("ffprobe")))
     argv = [ffprobe, "-v", "error", "-print_format", "json",
-            "-show_entries", "stream=codec_type,duration,start_time", "-i", str(path)]
+            "-show_entries", "stream=codec_type,duration,start_time", *safe_input(path)]
     proc = run(argv, timeout_s=min(30.0, settings.decode_timeout_s))
     out: dict = {"audio": None, "video": None}
     if proc.returncode != 0:
@@ -292,7 +319,7 @@ def decode_to_wav(path: Path, settings: Settings, *, sample_rate: int = 16000,
     fd, name = tempfile.mkstemp(suffix=".wav", prefix="audel-asr-")
     os.close(fd)
     out = Path(name)
-    argv = [ffmpeg, "-nostdin", "-hide_banner", "-threads", "1", "-i", str(path),
+    argv = [ffmpeg, "-nostdin", "-hide_banner", "-threads", "1", *safe_input(path),
             "-map", f"0:a:{int(stream)}?", "-t", str(settings.max_duration_s),
             "-ar", str(sample_rate), "-ac", "1", "-f", "wav", "-y", str(out)]
     proc = run(argv, timeout_s=settings.decode_timeout_s)
@@ -312,7 +339,7 @@ def excerpt_wav(path: Path, settings: Settings, *, start_s: float, dur_s: float,
     os.close(fd)
     out = Path(name)
     argv = [ffmpeg, "-nostdin", "-hide_banner", "-threads", "1", "-ss", f"{max(0.0, start_s):.3f}",
-            "-i", str(path), "-map", f"0:a:{int(stream)}?", "-t", f"{dur:.3f}",
+            *safe_input(path), "-map", f"0:a:{int(stream)}?", "-t", f"{dur:.3f}",
             "-ar", str(sample_rate), "-ac", "1", "-f", "wav", "-y", str(out)]
     proc = run(argv, timeout_s=min(60.0, settings.decode_timeout_s))
     if proc.returncode != 0 or out.stat().st_size == 0:

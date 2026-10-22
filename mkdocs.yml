@@ -72,3 +72,6 @@ nav:
   - On-prem inference: on-prem.md
   - Running as a service: deployment.md
   - Security: security.md
+  - Reference:
+      - CLI: cli.md
+      - Python API: api.md

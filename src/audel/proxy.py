@@ -18,6 +18,7 @@ from .logging import get_logger
 from .netguard import resolve_safe_ip
 
 log = get_logger("proxy")
+_ALLOWED_PORTS = frozenset({80, 443})  # web ports only: no tunnelling to arbitrary services
 
 
 class VettingProxy:
@@ -69,11 +70,15 @@ class VettingProxy:
                 port = int(port_b or b"443")
             except ValueError:
                 return await _reply_close(writer, b"400 Bad Request")
+            if port not in _ALLOWED_PORTS:
+                return await _reply_close(writer, b"403 Forbidden")
             await self._tunnel(reader, writer, host.decode("latin1"), port)
         else:  # plain HTTP, absolute-form request line
             u = urlsplit(target.decode("latin1"))
             if u.scheme != "http" or not u.hostname:
                 return await _reply_close(writer, b"400 Bad Request")
+            if (u.port or 80) not in _ALLOWED_PORTS:
+                return await _reply_close(writer, b"403 Forbidden")
             await self._http(reader, writer, u.hostname, u.port or 80, method,
                              u.path or "/", u.query, rest)
 

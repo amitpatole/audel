@@ -32,9 +32,6 @@ KEY_FILES = {
     "ollama": Path.home() / ".config" / "ollama" / "key",
     "anthropic": Path.home() / ".config" / "Anthropic" / "key",
     "gemini": Path.home() / ".config" / "Google" / "key",
-    "deepgram": Path.home() / ".config" / "Deepgram" / "key",
-    "groq": Path.home() / ".config" / "Groq" / "key",
-    "assemblyai": Path.home() / ".config" / "AssemblyAI" / "key",
 }
 
 
@@ -67,7 +64,9 @@ class Settings(BaseSettings):
 
     model_config = SettingsConfigDict(
         env_prefix="AUDEL_",
-        env_file=".env",
+        # No implicit .env from the working directory: an untrusted checkout must not be able to
+        # redirect backends or keys. Opt in explicitly with AUDEL_ENV_FILE=/path/to/file.
+        env_file=None,
         env_file_encoding="utf-8",
         extra="ignore",
         populate_by_name=True,  # aliased fields (api_token, provider keys) settable by name too,
@@ -85,9 +84,14 @@ class Settings(BaseSettings):
     ollama_api_key: str | None = Field(default=None, validation_alias="OLLAMA_API_KEY")
     anthropic_api_key: str | None = Field(default=None, validation_alias="ANTHROPIC_API_KEY")
     google_api_key: str | None = Field(default=None, validation_alias="GOOGLE_API_KEY")
-    deepgram_api_key: str | None = Field(default=None, validation_alias="DEEPGRAM_API_KEY")
-    groq_api_key: str | None = Field(default=None, validation_alias="GROQ_API_KEY")
-    assemblyai_api_key: str | None = Field(default=None, validation_alias="ASSEMBLYAI_API_KEY")
+
+    # Admin-only diagnostics (/doctor, /metrics) when auth is on: these tenants (plus the shared
+    # AUDEL_API_TOKEN principal) may read them; everyone else gets 404.
+    admin_tenants: list[str] = Field(default_factory=list)
+    # Reverse proxies whose X-Forwarded-For is trusted (uvicorn forwarded_allow_ips). Empty = none.
+    forwarded_allow_ips: list[str] = Field(default_factory=list)
+    # /watch drives a headless browser against caller URLs: operator opt-in over REST.
+    rest_allow_watch: bool = False
 
     # Egress policy (Phase 12): allow | local-only (trusted on-prem hosts only) | deny (offline).
     egress: str = "allow"
@@ -220,9 +224,6 @@ class Settings(BaseSettings):
             "anthropic": self.anthropic_api_key,
             "gemini": self.google_api_key,
             "gemini-audio": self.google_api_key,
-            "deepgram": self.deepgram_api_key,
-            "groq": self.groq_api_key,
-            "assemblyai": self.assemblyai_api_key,
         }.get(backend)
         if not key:
             f = KEY_FILES.get(backend if backend != "gemini-audio" else "gemini")
@@ -239,8 +240,14 @@ class Settings(BaseSettings):
 
 
 def load_settings(**overrides) -> Settings:
-    """Build a Settings object, applying any explicit overrides last."""
-    s = Settings(**{k: v for k, v in overrides.items() if v is not None})
+    """Build a Settings object, applying any explicit overrides last.
+
+    An env file is read only when ``AUDEL_ENV_FILE`` names one explicitly."""
+    import os
+
+    env_file = os.environ.get("AUDEL_ENV_FILE")
+    kw = {k: v for k, v in overrides.items() if v is not None}
+    s = Settings(_env_file=env_file, **kw) if env_file else Settings(**kw)  # type: ignore[call-arg]
     if s.api_token:
         from .logging import register_secret
 

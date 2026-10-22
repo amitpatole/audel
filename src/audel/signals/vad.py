@@ -20,7 +20,7 @@ import numpy as np
 
 from ..config import Settings
 from ..logging import get_logger
-from ..mediaguard import _tool, decode_to_wav, run
+from ..mediaguard import _tool, decode_to_wav, run, safe_input
 from ._parse import parse_ebur128
 
 _log = get_logger("vad")
@@ -81,7 +81,7 @@ def speech_gated_lufs(path: Path, settings: Settings, regions: list[tuple[float,
         return None
     expr = "+".join(f"between(t\\,{a:.3f}\\,{b:.3f})" for a, b in regions)
     ffmpeg = _tool("ffmpeg", settings.ffmpeg_path)
-    argv = [ffmpeg, "-nostdin", "-hide_banner", "-threads", "1", "-i", str(path),
+    argv = [ffmpeg, "-nostdin", "-hide_banner", "-threads", "1", *safe_input(path),
             "-map", f"0:a:{int(stream)}?", "-t", str(settings.max_duration_s),
             "-af", f"aselect={expr},asetpts=N/SR/TB,ebur128=framelog=quiet", "-f", "null", "-"]
     proc = run(argv, timeout_s=settings.decode_timeout_s)
