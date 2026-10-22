@@ -28,7 +28,7 @@ _CHUNK_S = 60             # VAD in 1-minute chunks: bounded memory even for 24 c
 def speech_regions(path: Path, settings: Settings, *, stream: int = 0,
                    labels: list[str] | None = None, channels: int | None = None,
                    timeout_s: float | None = None,
-                   layout: str = "") -> list[tuple[float, float]] | None:
+                   layout: str = "", codec: str = "") -> list[tuple[float, float]] | None:
     """Speech regions in seconds (decoded track time), or ``None`` when no VAD is installed.
 
     Every channel except LFE is heard on its own, from one streamed, 100 Hz high-passed decode
@@ -45,7 +45,8 @@ def speech_regions(path: Path, settings: Settings, *, stream: int = 0,
     labels = labels or []
     n = channels or len(labels) or 1
     use = [i for i in range(n) if not (i < len(labels) and labels[i].upper().startswith("LFE"))]
-    return merge_regions(_vad_pass(path, settings, stream, n, use or [0], timeout_s, layout),
+    return merge_regions(_vad_pass(path, settings, stream, n, use or [0], timeout_s, layout,
+                                   codec),
                          1_000_000)
 
 
@@ -53,7 +54,8 @@ _AUDIBLE_DB = 20.0  # a region's channel must be within this of the loudest chan
 
 
 def _vad_pass(path: Path, settings: Settings, stream: int, n: int, use: list[int],
-              timeout_s: float | None, layout: str = "") -> list[tuple[float, float]]:
+              timeout_s: float | None, layout: str = "",
+              codec: str = "") -> list[tuple[float, float]]:
     import time
 
     from faster_whisper.vad import VadOptions, get_speech_timestamps
@@ -68,7 +70,7 @@ def _vad_pass(path: Path, settings: Settings, stream: int, n: int, use: list[int
         offset = 0.0
         for frames in stream_pcm16(path, settings, stream=stream, channels=n, sample_rate=_SR,
                                    highpass_hz=100, chunk_s=_CHUNK_S, timeout_s=timeout_s,
-                                   layout=layout):
+                                   layout=layout, codec=codec):
             block = frames[:, use].astype(np.float32) / 32768.0
             for col, _c in enumerate(use):
                 if end is not None and time.monotonic() > end:

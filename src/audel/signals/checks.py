@@ -211,11 +211,13 @@ def _channels(tm, dur, settings, label) -> list[Issue]:
     out: list[Issue] = []
     live = tm.rms_dbfs is not None and tm.rms_dbfs != -math.inf and tm.rms_dbfs > settings.silence_dbfs
     if live and len(tm.channels) >= 2:
-        ambisonic = (tm.stream.layout or "").lower().startswith("ambisonic")
+        from ..mediaguard import ambisonic_components
+
+        amb = ambisonic_components(tm.stream)
         for i, ch in enumerate(tm.channels):
             if ch.label.startswith("LFE"):
                 continue  # an empty LFE / LFE2 is normal for dialogue-led mixes
-            if ambisonic and i > 0:
+            if 0 < i < amb:
                 continue  # a silent directional component (e.g. Z in a horizontal mix) is valid
             dead = ch.rms_dbfs is None or ch.rms_dbfs == -math.inf or \
                 ch.rms_dbfs <= settings.silence_dbfs - _DEAD_CHANNEL_MARGIN_DB

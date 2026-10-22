@@ -3957,7 +3957,10 @@ def test_asr_decode_keeps_an_unlabelled_lcr_centre(tmp_path):
         w.unlink()
         return 20 * np.log10(np.sqrt(np.mean(a ** 2)) / 32768 + 1e-12)
 
-    assert abs(level(m0) - level(lab)) < 3.0        # the centre isn't dropped (was ~15 dB low)
+    # The labelled file gets the dialogue-first (centre-weighted) mix, the unlabelled one the
+    # plain mean: they differ by design, but the centre is never dropped (it read ~15 dB low).
+    m0_db, lab_db = level(m0), level(lab)
+    assert lab_db >= m0_db and lab_db - m0_db < 9.0, (m0_db, lab_db)
 
 
 # ==== round 16, auth surface ==================================================================
@@ -4014,8 +4017,9 @@ def _st(layout, n):
 def test_mono_mix_is_chosen_by_layout_type():
     from audel.mediaguard import mono_filter
 
-    assert mono_filter(_st("ambisonic 1", 4)) == "pan=mono|c0=c0"          # W only
-    assert mono_filter(_st("5.1", 6)) == "aformat=channel_layouts=mono"     # ffmpeg's downmix
+    assert mono_filter(_st("ambisonic 1", 4)) == "pan=mono|c0=1.000000*c0"  # W only
+    five = mono_filter(_st("5.1", 6))                                        # by label (r17)
+    assert "aformat" not in five and "*c3" not in five and "*c4" in five     # LFE out, beds in
     custom = mono_filter(_st("3 channels (FC+FL+FR)", 3))
     assert custom.startswith("pan=mono|") and "c0" in custom                # label weights
     plain = mono_filter(_st("", 5), power=True)
@@ -4123,3 +4127,86 @@ def test_pair_and_keyword_floods_stay_bounded(unit):
         scrub_text(text)
         best = min(best, time.process_time() - t0)
     assert best < 0.015, best
+
+
+# ==== round 17, decode surface ================================================================
+
+@pytest.mark.parametrize("layout,n", [("7.1.4", 12), ("5.1.4", 10), ("7.2.3", 12), ("cube", 8),
+                                      ("hexadecagonal", 16), ("22.2", 24)])
+def test_every_channel_of_a_named_layout_reaches_the_mono_mix(layout, n):
+    from audel.mediaguard import mono_filter
+
+    st = _st(layout, n)
+    labels = st.channel_labels()
+    for power in (False, True):
+        mix = mono_filter(st, power=power)
+        for i, lab in enumerate(labels):
+            assert (f"*c{i}+" in mix or f"*c{i}," in mix or mix.endswith(f"*c{i}")) \
+                != lab.upper().startswith("LFE"), (layout, lab, mix)
+
+
+def test_ambisonic_plus_stereo_keeps_and_checks_the_head_locked_pair():
+    from audel.mediaguard import ambisonic_components, lr_pair, mono_filter
+
+    st = _st("ambisonic 1+stereo", 6)
+    assert ambisonic_components(st) == 4
+    assert lr_pair(st) == (4, 5)
+    mix = mono_filter(st)
+    assert "*c0" in mix and "*c4" in mix and "*c5" in mix and "*c1" not in mix
+    assert ambisonic_components(_st("ambisonic 2", 9)) == 9
+
+
+def test_lfe_only_layout_never_builds_an_empty_mix():
+    from audel.mediaguard import mono_filter
+
+    for power in (False, True):
+        assert mono_filter(_st("2 channels (LFE+LFE2)", 2), power=power).startswith(
+            "pan=mono|c0=1.000000*c0")
+
+
+@requires_ffmpeg
+def test_hum_in_height_channels_is_heard(tmp_path):
+    from audel import check
+
+    f = tmp_path / "h.mov"
+    mapping = "|".join(f"c{i}=" + ("c0" if i == 2 else "0.3*c1" if i in (10, 11) else "0*c0")
+                       for i in range(12))
+    _ff("-f", "lavfi", "-i", "anoisesrc=d=8:c=pink:a=0.05", "-f", "lavfi",
+        "-i", "sine=f=50:d=8:sample_rate=48000", "-filter_complex",
+        f"[0][1]amerge=inputs=2,pan=7.1.4|{mapping}[o]", "-map", "[o]", "-c:a", "pcm_s24le", f)
+    checks = {i.detail.get("check") for i in asyncio.run(check(str(f))).issues}
+    assert "hum" in checks, checks
+
+
+def test_speex_uses_the_deterministic_decoder(monkeypatch):
+    from audel import mediaguard
+    from audel.config import Settings
+    from audel.errors import DecodeError
+
+    monkeypatch.setattr(mediaguard, "_LIBSPEEX", True)
+    assert mediaguard.decoder_args("speex", 1, Settings()) == ["-c:a:1", "libspeex"]
+    assert mediaguard.decoder_args("aac", 0, Settings()) == []
+    monkeypatch.setattr(mediaguard, "_LIBSPEEX", False)
+    with pytest.raises(DecodeError):
+        mediaguard.decoder_args("speex", 0, Settings())
+
+
+@requires_ffmpeg
+def test_speex_decodes_identically_every_run(tmp_path):
+    import hashlib
+    import subprocess
+
+    from audel.config import Settings
+    from audel.mediaguard import decode_to_wav
+
+    f = tmp_path / "s.ogg"
+    try:
+        _ff("-f", "lavfi", "-i", "anoisesrc=d=3:c=pink:a=0.2:r=16000", "-c:a", "libspeex", f)
+    except (subprocess.CalledProcessError, AssertionError):
+        pytest.skip("no libspeex encoder")
+    digests = set()
+    for _ in range(4):
+        out = decode_to_wav(f, Settings())
+        digests.add(hashlib.sha256(out.read_bytes()).hexdigest())
+        out.unlink()
+    assert len(digests) == 1

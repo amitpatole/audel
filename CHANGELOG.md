@@ -121,6 +121,21 @@ All notable changes to Audel are recorded here. The format follows
     at most 2 fetches, in a pool of 8.
   - **Low-Medium.** Work abandoned while waiting on its tenant share still ran later. Abandonment now
     propagates through both waits.
+- Red-team round 17 fixes (multichannel decode), each pinned by a regression test. The 456-file
+  battery shows no regressions.
+  - **Medium.** The round-16 mono mix used ffmpeg's own downmix for named layouts, which silently
+    gives some channels zero weight (top-back on 5.1.4 / 7.1.4 / 9.1.4 / cube, top-back-centre on
+    7.2.3, six channels of hexadecagonal, 14 of 24 in 22.2), so hum, hiss and dialogue there were
+    missed. The mono mix is now built by channel label for every layout and never drops a
+    channel: centre-weighted and power-normalised (with a limiter) for transcription and excerpts,
+    equal power over every non-LFE channel for the hum and noise checks. Stereo is unchanged.
+  - **Medium.** `ambisonic N+stereo` streams (a sound field plus a head-locked stereo pair, common
+    for 360 video) analysed W only, so narration or hum in the head-locked pair was missed. The
+    pair is now mixed in, and it is the pair the phase and polarity checks use.
+  - **Medium.** ffmpeg's built-in Speex decoder is nondeterministic (the same file decoded to
+    different audio on different runs, sometimes reading +10 LUFS and impossible peaks) and
+    doubles the duration. Speex is now decoded with libspeex, and refused when ffmpeg lacks it.
+  - **Info.** A layout of only LFE channels no longer builds an empty mix.
 - Red-team round 17 fixes (auth surface), each pinned by a regression test. No auth bypass or
   escalation was found.
   - **Low-Medium.** Key/value pair redaction in logs tried every key name at every bracket, so

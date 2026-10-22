@@ -135,7 +135,7 @@ def _pipe(path, st: StreamInfo, settings: Settings, analysis: list[str], dur_s: 
     return pcm_pipeline(path, settings, stream=st.index, channels=st.channels or 1,
                         sample_rate=_rate(st), layout=st.layout, analysis=analysis,
                         timeout_s=timeout, pre_input=pre_input, verbose=verbose, stats=stats,
-                        abs_index=st.abs_index)
+                        abs_index=st.abs_index, codec=st.codec)
 
 
 def _main_pass(ffmpeg: str, path, idx: int, st: StreamInfo, settings: Settings,

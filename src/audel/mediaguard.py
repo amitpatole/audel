@@ -164,6 +164,26 @@ MEDIA_SUFFIXES = frozenset({
 })
 
 
+_LIBSPEEX: bool | None = None
+
+
+def decoder_args(codec: str, stream: int, settings: Settings) -> list[str]:
+    """Input decoder overrides (placed before ``-i``). ffmpeg's built-in Speex decoder reads
+    uninitialised memory (same file, different PCM each run) and doubles the duration; libspeex
+    is deterministic. Without libspeex a Speex stream is refused, never graded at random."""
+    global _LIBSPEEX
+    if codec != "speex":
+        return []
+    if _LIBSPEEX is None:
+        ffmpeg = _tool("ffmpeg", settings.ffmpeg_path)
+        proc = run([ffmpeg, "-hide_banner", "-decoders"], timeout_s=15.0)
+        _LIBSPEEX = b" libspeex " in proc.stdout
+    if not _LIBSPEEX:
+        raise DecodeError("Speex needs ffmpeg built with libspeex (the built-in decoder is "
+                          "nondeterministic)")
+    return [f"-c:a:{int(stream)}", "libspeex"]
+
+
 def safe_input(path) -> list[str]:
     """``-i`` for untrusted media: local-file protocol only, allowlisted demuxers only."""
     return ["-protocol_whitelist", "file", "-format_whitelist", DEMUXER_ALLOWLIST, "-i", str(path)]
@@ -308,7 +328,7 @@ def pcm_pipeline(path: Path, settings: Settings, *, stream: int, channels: int,
                  sample_rate: int, analysis: list[str], timeout_s: float,
                  pre_input: list[str] | None = None, layout: str = "",
                  verbose: bool = False, max_stderr: int = 128 * 1024 * 1024,
-                 stats: dict | None = None, abs_index: int = -1) -> str:
+                 stats: dict | None = None, abs_index: int = -1, codec: str = "") -> str:
     """Decode the untrusted file to raw float PCM in one process and ANALYSE it in another.
 
     The analysing ffmpeg only ever sees a raw PCM stream (no container, no metadata, no tags), so
@@ -333,7 +353,7 @@ def pcm_pipeline(path: Path, settings: Settings, *, stream: int, channels: int,
     # never counted. -err_detect crccheck makes CRC-protected codecs report corruption.
     decode = [ffmpeg, "-nostdin", "-hide_banner", "-v", "verbose", "-threads", "1",
               "-reinit_filter", "0", "-err_detect", "crccheck+explode",
-              *(pre_input or []), *safe_input(path),
+              *(pre_input or []), *decoder_args(codec, stream, settings), *safe_input(path),
               "-map", f"0:a:{int(stream)}",
               # Restamp by SAMPLE COUNT before the -t cap: a forward timestamp jump must not end
               # decoding early (and leave the audio after it unmeasured).
@@ -1138,7 +1158,7 @@ def probe_streams(path: Path, settings: Settings) -> dict:
 
 def stream_pcm16(path: Path, settings: Settings, *, stream: int, channels: int,
                  sample_rate: int = 16000, highpass_hz: int | None = None, chunk_s: int = 60,
-                 timeout_s: float | None = None, layout: str = ""):
+                 timeout_s: float | None = None, layout: str = "", codec: str = ""):
     """Decode a validated file and YIELD it as int16 frame blocks of ``chunk_s`` seconds,
     ``(samples, channels)``: no temp file, so a long many-channel track can't hit the write
     limit, and memory stays at one chunk. Same strict decoding as the main pass (CRC errors
@@ -1152,7 +1172,8 @@ def stream_pcm16(path: Path, settings: Settings, *, stream: int, channels: int,
     chain = "asetpts=N/SR/TB" + (f",highpass=f={int(highpass_hz)}" if highpass_hz else "")
     n = max(1, int(channels))
     argv = [ffmpeg, "-nostdin", "-hide_banner", "-v", "error", "-threads", "1",
-            "-reinit_filter", "0", "-err_detect", "crccheck+explode", *safe_input(path),
+            "-reinit_filter", "0", "-err_detect", "crccheck+explode",
+            *decoder_args(codec, stream, settings), *safe_input(path),
             "-map", f"0:a:{int(stream)}?", "-af", chain, "-t", str(settings.max_duration_s),
             "-ar", str(sample_rate), *_keep_layout(layout, n), "-f", "s16le",
             "-acodec", "pcm_s16le", "pipe:1"]
@@ -1222,43 +1243,79 @@ def is_ambisonic(st: StreamInfo | None) -> bool:
     return bool(st is not None and (st.layout or "").lower().startswith("ambisonic"))
 
 
-def mono_filter(st: StreamInfo | None, *, power: bool = False) -> str:
-    """The mono mix a single-channel analysis hears, chosen by layout type:
+def ambisonic_components(st: StreamInfo | None) -> int:
+    """How many leading channels are ambisonic components ((order+1)**2); the rest of an
+    ``ambisonic N+stereo`` stream is a head-locked pair. 0 for any other layout."""
+    if not is_ambisonic(st):
+        return 0
+    assert st is not None
+    import re
 
-    * ambisonic: the W (omni) component only. A mean of W/Y/Z/X cancels a source to the right
-      or behind (Y or X = -W).
-    * a named layout (5.1, 7.1.4, a custom FL+FR+FC order...): ffmpeg's own downmix, which
-      weights a centre and its beds as a listener hears them (a flat mean dilutes dialogue).
-    * plain unlabelled channels: the mean by index (``power``: 1/sqrt(N) weights, so a hum or
-      hiss in one channel isn't read 20*log10(N) dB low)."""
+    m = re.match(r"ambisonic\s+(\d{1,2})", (st.layout or "").lower())
+    n = (int(m.group(1)) + 1) ** 2 if m else 1
+    return max(1, min(n, st.channels))
+
+
+def _weighted(weights: list[float], *, power: bool) -> str:
+    use = [(i, w) for i, w in enumerate(weights) if w > 0] or [(0, 1.0)]
+    if power:
+        # Power-preserving: a hum or hiss in ONE channel reads 10*log10(N) low, not 20*log10(N).
+        g = 1.0 / (len(use) ** 0.5)
+        return "pan=mono|c0=" + "+".join(f"{g:.6f}*c{i}" for i, _w in use)
+    total = sum(w for _i, w in use)
+    return "pan=mono|c0=" + "+".join(f"{w / total:.6f}*c{i}" for i, w in use)
+
+
+def mono_filter(st: StreamInfo | None, *, power: bool = False) -> str:
+    """The mono mix a single-channel analysis hears, built by LABEL for every layout (ffmpeg's
+    own downmix silently drops height, wide and 22.2 channels, and rejects custom orders):
+
+    * ambisonic: the W (omni) component, plus a head-locked stereo pair when there is one. A
+      mean of W/Y/Z/X cancels a source to the right or behind (Y or X = -W).
+    * named layouts: centre 1.0, front L/R -3 dB, every other channel about -9 dB, LFE out, so
+      centre dialogue isn't diluted against its beds and no channel is ever dropped.
+    * plain unlabelled channels: the mean by index.
+
+    ``power``: equal power-preserving weights over every non-LFE channel (W and the head-locked
+    pair for ambisonics), for the hum and noise checks."""
     if st is None or st.channels <= 1:
         return "anull"
-    if is_ambisonic(st):
-        return "pan=mono|c0=c0"
+    labels = [lab.upper() for lab in st.channel_labels()]
+    amb = ambisonic_components(st)
+    if amb:
+        extra = list(range(amb, st.channels))
+        weights = [0.0] * st.channels
+        weights[0] = 1.0 if not extra else 0.5
+        for i in extra:
+            weights[i] = 0.5 / len(extra)
+        return _weighted(weights, power=power)
     lay = channel_layout_arg(st.layout, st.channels)
-    labels = st.channel_labels()
-    if not lay.startswith("USR"):
-        if "+" not in lay:
-            return "aformat=channel_layouts=mono"  # a native layout: ffmpeg's own downmix
-        # A custom order (FC+FL+FR, LFE-first...): ffmpeg's resampler rejects it, so the same
-        # downmix weights by label: fronts 1.0, centre and everything else -3 dB, LFE out.
-        weights = [0.0 if lab.upper().startswith("LFE") else
-                   1.0 if lab.upper() in ("FL", "FR") else 0.7071 for lab in labels]
-        total = sum(weights) or 1.0
-        return "pan=mono|c0=" + "+".join(f"{w / total:.6f}*c{i}"
-                                         for i, w in enumerate(weights) if w > 0)
-    if not power:
+    if lay.startswith("USR") and not power:
         return mono_pan(labels)
-    use = [i for i, lab in enumerate(labels) if not lab.upper().startswith("LFE")] or [0]
-    w = 1.0 / (len(use) ** 0.5)
-    return "pan=mono|c0=" + "+".join(f"{w:.6f}*c{i}" for i in use)
+    if power:
+        return _weighted([0.0 if lab.startswith("LFE") else 1.0 for lab in labels], power=True)
+    # Dialogue-first: centre 1.0, front L/R -3 dB, every other channel about -9 dB, scaled to
+    # unit POWER (a sum-normalised mix left 7.1.4 dialogue too quiet to transcribe), then a
+    # limiter so correlated loud material can't clip the 16-bit decode.
+    weights = [0.0 if lab.startswith("LFE") else 1.0 if lab == "FC" else
+               0.7071 if lab in ("FL", "FR") else 0.35 for lab in labels]
+    use = [(i, w) for i, w in enumerate(weights) if w > 0] or [(0, 1.0)]
+    if len(use) <= 2:
+        return _weighted(weights, power=False)  # stereo (or 2.1): the plain mean, as ever
+    norm = sum(w * w for _i, w in use) ** 0.5
+    return ("pan=mono|c0=" + "+".join(f"{w / norm:.6f}*c{i}" for i, w in use)
+            + ",alimiter=limit=0.9:level=false:attack=5:release=50")
 
 
 def lr_pair(st: StreamInfo | None) -> tuple[int, int] | None:
-    """Indexes of the real front-left / front-right pair, for mid/side (phase, polarity) checks;
-    ``None`` for ambisonics (W/Y are not a stereo pair)."""
-    if st is None or is_ambisonic(st) or st.channels < 2:
+    """Indexes of the real front-left / front-right pair, for mid/side (phase, polarity) checks:
+    the labelled FL / FR, the head-locked pair of an ``ambisonic N+stereo`` stream, or the first
+    two plain channels; ``None`` for pure ambisonics (W/Y are not a stereo pair)."""
+    if st is None or st.channels < 2:
         return None
+    amb = ambisonic_components(st)
+    if amb:
+        return (amb, amb + 1) if st.channels - amb >= 2 else None
     labels = [lab.upper() for lab in st.channel_labels()]
     if "FL" in labels and "FR" in labels:
         return labels.index("FL"), labels.index("FR")
@@ -1307,11 +1364,12 @@ def decode_to_wav(path: Path, settings: Settings, *, sample_rate: int = 16000,
     # can't leave one behind.
     st = _stream_info(path, settings, stream)
     pan = mono_filter(st)
+    dec = decoder_args(st.codec if st is not None else "", stream, settings)
     fd, name = _mkstemp("audel-asr-", settings)
     os.close(fd)
     out = Path(name)
     argv = [ffmpeg, "-nostdin", "-hide_banner", "-threads", "1", "-reinit_filter", "0",
-            *safe_input(path),
+            *dec, *safe_input(path),
             "-map", f"0:a:{int(stream)}?", "-af", f"{pan},asetpts=N/SR/TB",
             "-t", str(settings.max_duration_s),
             "-ar", str(sample_rate), "-c:a", "pcm_s16le", "-f", "wav", "-y", str(out)]
@@ -1335,11 +1393,12 @@ def excerpt_wav(path: Path, settings: Settings, *, start_s: float, dur_s: float,
     dur = max(0.5, min(60.0, float(dur_s)))
     st = _stream_info(path, settings, stream)
     pan = mono_filter(st)
+    dec = decoder_args(st.codec if st is not None else "", stream, settings)
     fd, name = _mkstemp("audel-excerpt-", settings)
     os.close(fd)
     out = Path(name)
     argv = [ffmpeg, "-nostdin", "-hide_banner", "-threads", "1", "-reinit_filter", "0",
-            "-ss", f"{max(0.0, start_s):.3f}", *safe_input(path), "-map", f"0:a:{int(stream)}?",
+            "-ss", f"{max(0.0, start_s):.3f}", *dec, *safe_input(path), "-map", f"0:a:{int(stream)}?",
             "-t", f"{dur:.3f}", "-af", pan, "-ar", str(sample_rate), "-f", "wav", "-y", str(out)]
     try:
         proc = run(argv, timeout_s=min(60.0, settings.decode_timeout_s))
