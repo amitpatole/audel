@@ -255,7 +255,7 @@ def measure_track(path, st: StreamInfo, settings: Settings, dur_s: float = 0.0,
 
 
 def _scan(path, st: StreamInfo, settings: Settings, deadline: float, stop=None,
-          fold: bool = True):
+          fold: bool = True, restarts: bool = False):
     """The packet scan, inside the per-file budget (it may not outlive the file's deadline)."""
     import time
 
@@ -264,7 +264,8 @@ def _scan(path, st: StreamInfo, settings: Settings, deadline: float, stop=None,
     left = deadline - time.monotonic()
     if left <= 1:
         raise UnsafeSourceError("analysis exceeded the per-file time budget")
-    return scan_packets(path, settings, st.abs_index, timeout_s=left, stop=stop, fold=fold)
+    return scan_packets(path, settings, st.abs_index, timeout_s=left, stop=stop, fold=fold,
+                        restarts=restarts)
 
 
 def _shared_clock(scans) -> None:
@@ -326,7 +327,7 @@ def measure(path, info: MediaInfo, settings: Settings) -> Measurements:
     try:
         for st in streams:
             futures.append(pool.submit(_scan, path, st, settings, deadline, stop,
-                                       info.estimated_durations))
+                                       info.estimated_durations, info.chained))
     except RuntimeError:  # the host can't start another thread: retry later, leave nothing
         stop.set()
         pool.shutdown(wait=False, cancel_futures=True)
@@ -409,6 +410,8 @@ def measure(path, info: MediaInfo, settings: Settings) -> Measurements:
     live = [t for t in m.tracks if not t.failed]
     if live and info.packets_declare_end and all(("end", t.stream.index) in placed for t in live):
         declared = max(placed[("end", t.stream.index)] for t in live)
+    elif info.byte_clock and not all(t.stream.codec.startswith("pcm") for t in live):
+        declared = 0.0  # AVI sizes compressed audio by a nominal byte rate: not a real claim
     elif live and all(t.stream.declared_end_s is not None for t in live):
         declared = max((t.stream.declared_end_s or 0.0) - origin for t in live)
     elif info.has_video:

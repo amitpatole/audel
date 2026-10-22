@@ -3002,7 +3002,7 @@ def test_a_busy_host_during_the_packet_scan_is_retried_not_downgraded(media, mon
     from audel.mediaguard import scan_packets
 
     _busy_spawn(monkeypatch, lambda argv: "ffprobe" in str(argv[0]) and "-show_entries" in argv
-                and "packet=pts_time,duration_time" in argv)
+                and any(str(a).startswith("packet=pts_time") for a in argv))
     with pytest.raises(BusyError):
         scan_packets(media["good"], Settings(), 0, timeout_s=10)
 
@@ -3086,3 +3086,76 @@ def test_a_single_run_field_is_not_blanked_from_the_log():
 
     out = _clip("/x/" + "%2541/" * 2000)
     assert out.startswith("/x/%2541") and "truncated" in out
+
+
+# ==== round 10, decode surface ================================================================
+
+@pytest.mark.parametrize("fold", [True, False])
+def test_undoing_a_strays_gap_never_shortens_the_track(fold):
+    from audel.mediaguard import _GapScanner
+
+    d, sc = 0.0213, _GapScanner(0.1, 50, fold=fold)
+    t = 0.0
+    while t < 300:                                   # 300 s of audio...
+        sc.add(t, d)
+        t += d
+    old_end, t = t, t + 1800                          # ...then an 1800 s hole
+    for i in range(16_000):                           # audio resumes; a decoy every 8 packets
+        sc.add(t, d)
+        t += d
+        if i % 8 == 7:
+            sc.add(old_end, d)
+            old_end += d
+    sc.add(t, 60.0)                                   # a long final packet to pad the extent
+    res = sc.finish()
+    decoded = (300 + 16_000 * d) + 2000 * d + 60
+    shortfall = res.extent_s - (decoded - res.overlap_s) - res.gap_total_s
+    excess = (decoded - res.overlap_s) - res.extent_s
+    if fold:   # MPEG-TS folds long jumps as splices: the interleaved clocks show as excess audio
+        assert excess > 300 or res.gap_total_s + max(0.0, shortfall) > 1700, res
+    else:      # elsewhere the hole is accounted for (as a gap or shortfall): it can't vanish
+        assert res.gap_total_s + max(0.0, shortfall) > 1700, res
+
+
+def test_discarded_preroll_packets_are_not_on_the_timeline():
+    from audel.mediaguard import _parse_packet
+
+    assert _parse_packet(b"-0.021333,0.021333,KD_,") is None
+    assert _parse_packet(b"0.000000,0.021333,K__") == (0.0, 0.021333)
+
+
+@requires_ffmpeg
+@pytest.mark.parametrize("codec", ["libvorbis", "libopus"])
+def test_chained_ogg_links_are_one_programme(tmp_path, codec):
+    from audel import check
+
+    links = []
+    for i in range(3):
+        f = tmp_path / f"l{i}.ogg"
+        _ff("-f", "lavfi", "-i", f"sine=f={300 + 100 * i}:d=6", "-af", "volume=0.3",
+            "-c:a", codec, f)
+        links.append(f.read_bytes())
+    chain = tmp_path / "chain.ogg"
+    chain.write_bytes(b"".join(links))
+    r = asyncio.run(check(str(chain)))
+    assert not [i for i in r.issues if i.detail.get("check") in
+                ("timeline_excess", "timeline_shortfall", "packet_gap")], \
+        [i.message for i in r.issues]
+
+
+@requires_ffmpeg
+@pytest.mark.parametrize("codec", ["adpcm_ima_wav", "adpcm_ms"])
+def test_adpcm_avi_has_no_false_duration_mismatch(tmp_path, codec):
+    from audel import check
+
+    f = tmp_path / "a.avi"
+    _ff("-f", "lavfi", "-i", "sine=d=12", "-c:a", codec, f)
+    assert not _checks(asyncio.run(check(str(f))), "duration_mismatch")
+
+
+def test_decoder_cause_ignores_metadata_tag_lines():
+    from audel.mediaguard import _cause
+
+    tail = ("  Metadata:\n    title           : ERROR invalid stream failed\n"
+            "[aac @ 0x1] Changing audio frame properties on the fly is not supported.\n")
+    assert "Changing audio frame properties" in _cause(tail)

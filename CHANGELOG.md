@@ -121,6 +121,19 @@ All notable changes to Audel are recorded here. The format follows
     at most 2 fetches, in a pool of 8.
   - **Low-Medium.** Work abandoned while waiting on its tenant share still ran later. Abandonment now
     propagates through both waits.
+- Red-team round 10 fixes (decode and accuracy), each pinned by a regression test. 212 legitimate
+  and edge-case files grade with no new integrity findings.
+  - **Medium.** Undoing a stray packet's gap also pulled the track's end back, so a sustained decoy
+    pattern could erase a hole from the timeline. The track now runs to the latest packet end ever
+    seen, which no revert lowers.
+  - **Low-Medium.** MP4 files with multi-entry edit lists got a false shortfall (up to a FAIL):
+    ffmpeg's preroll packets are flagged as discarded and never decode. Discarded packets are no
+    longer on the timeline.
+  - **Low-Medium.** Chained Ogg (concatenated links, as in radio dumps) got a false excess. A link
+    that restarts at the stream's start continues the timeline.
+  - **Low.** ADPCM in AVI got a false duration mismatch: AVI sizes compressed audio by a nominal
+    byte rate, so that declared length is not trusted.
+  - **Info.** The reason reported for a refused decode skips the decoder's metadata dump.
 - Red-team round 10 fixes (network surface), each pinned by a regression test. An attacker can't
   make their own file look like a busy host; every busy signal is host-level.
   - **Medium.** A crafted MPEG-TS with more than 2,000 splices overflowed the splice list, which

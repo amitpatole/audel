@@ -186,6 +186,7 @@ class MediaInfo:
     estimated_durations: bool = False   # MPEG-TS/PS: stream durations are bitrate estimates
     decode_cap_s: float = 0.0           # per-stream decode cap (0 = settings.max_duration_s)
     byte_clock: bool = False            # AVI: packet times come from byte positions
+    chained: bool = False               # Ogg: links may be concatenated (each restarts at 0)
     packets_declare_end: bool = False   # per-stream durations unreliable (TS/PS estimates, ASF
                                         # copies the file's): the packets are the declaration
 
@@ -395,7 +396,8 @@ def pcm_pipeline(path: Path, settings: Settings, *, stream: int, channels: int,
 
 def _cause(tail: str) -> str:
     """The decoder's own reason, not its closing statistics: the last error-like line."""
-    lines = [ln.strip() for ln in tail.splitlines() if ln.strip()]
+    # Indented lines are ffmpeg's metadata dump (tag text the file controls), never its reason.
+    lines = [ln.strip() for ln in tail.splitlines() if ln.strip() and not ln[:1].isspace()]
     keys = ("error", "invalid", "not supported", "failed", "unsupported", "corrupt")
     for ln in reversed(lines):
         low = ln.lower()
@@ -466,7 +468,7 @@ class _GapScanner:
     _OUTLIER_WINDOW = 8
 
     def __init__(self, min_gap_s: float, limit: int, *, fold: bool = True,
-                 max_gap_s: float = 86400.0) -> None:
+                 max_gap_s: float = 86400.0, restarts: bool = False) -> None:
         self.min_gap, self.limit, self.fold, self.max_gap = min_gap_s, limit, fold, max_gap_s
         self.scan = PacketScan()
         self.typical: float | None = None
@@ -476,13 +478,18 @@ class _GapScanner:
         self._pending: tuple[float, float | None] | None = None
         self._anchor: dict | None = None  # the clock before the last jump, while it is suspect
         self._run = 0  # packets on the current clock since the last jump
+        self._max_end: float | None = None  # latest packet end ever seen (never reverted)
+        self._first_raw: float | None = None
+        self.restarts = restarts  # Ogg: a step back to the stream start is a new chained link
         self.overflow = False
         self.scan.max_s = max_gap_s
 
     def add(self, pts: float, dur: float | None) -> None:
+        if self._first_raw is None:
+            self._first_raw = pts
         if self.scan.first_pts is None:
             self.scan.first_pts = pts
-        if not self.fold and pts < self.scan.first_pts:
+        if not self.fold and not self.restarts and pts < self.scan.first_pts:
             # Outside MPEG-TS the clock never restarts: the track starts at its EARLIEST packet
             # (a stray packet far ahead can't move the start or shrink the extent).
             self.scan.first_pts = pts
@@ -497,7 +504,10 @@ class _GapScanner:
         if self.typical is None:
             self._calibrate(exclude_last=True)
         self.scan.gaps.sort()
-        self.scan.last_end = self._prev_end
+        # The track runs to the latest packet end ever seen: undoing a stray's gap must never
+        # pull the end back (or a decoy pattern could erase a hole from the extent).
+        self.scan.last_end = (self._prev_end if self._max_end is None or self._prev_end is None
+                              else max(self._prev_end, self._max_end))
         return self.scan
 
     def _calibrate(self, *, exclude_last: bool) -> None:
@@ -543,7 +553,11 @@ class _GapScanner:
         if self._prev_end is not None:
             delta = c - self._prev_end
             impossible = delta > self.max_gap  # longer than any file may run: a corrupt stamp
-            if impossible or (self.fold and (delta < -tol or delta > _MAX_PACKET_GAP_S)):
+            # A chained Ogg link restarts its clock at the stream's start: continue the timeline
+            # (this can only lengthen it, never hide a hole).
+            restart = (self.restarts and delta < -tol and self._first_raw is not None
+                       and pts <= self._first_raw + 1.0)
+            if impossible or restart or (self.fold and (delta < -tol or delta > _MAX_PACKET_GAP_S)):
                 if impossible and not self.fold:
                     self.scan.jumps += 1
                 # Only an ESTABLISHED clock can be returned to: otherwise a leading decoy (or a
@@ -576,6 +590,8 @@ class _GapScanner:
         self._pending = (c, dur)
         self._run += 1
         end = c + d
+        if self._max_end is None or end > self._max_end:
+            self._max_end = end
         self._prev_end = end if (self._prev_end is None or jumped) else max(self._prev_end, end)
 
     def _arm(self, kind: str) -> None:
@@ -603,6 +619,8 @@ class _GapScanner:
 
 def _parse_packet(line: bytes) -> tuple[float, float | None] | None:
     parts = line.strip().split(b",")
+    if len(parts) > 2 and b"D" in parts[2]:
+        return None  # flagged discard (edit-list preroll): never decoded, not on the timeline
     try:
         pts = float(parts[0])
     except (ValueError, IndexError):
@@ -621,7 +639,7 @@ def _parse_packet(line: bytes) -> tuple[float, float | None] | None:
 
 def scan_packets(path: Path, settings: Settings, abs_index: int, *, min_gap_s: float = 0.1,
                  limit: int = 2000, timeout_s: float | None = None, stop=None,
-                 fold: bool = True) -> PacketScan | None:
+                 fold: bool = True, restarts: bool = False) -> PacketScan | None:
     """Read a stream's packet timeline (``None`` when the stream has no container index).
 
     Streamed line by line, so memory stays flat however many packets a file has; the wall
@@ -633,7 +651,8 @@ def scan_packets(path: Path, settings: Settings, abs_index: int, *, min_gap_s: f
         return None
     ffprobe = _tool("ffprobe", settings.ffmpeg_path and str(Path(settings.ffmpeg_path).with_name("ffprobe")))
     argv = [ffprobe, "-v", "error", "-select_streams", str(abs_index),
-            "-show_entries", "packet=pts_time,duration_time", "-of", "csv=p=0", *safe_input(path)]
+            "-show_entries", "packet=pts_time,duration_time,flags", "-of", "csv=p=0",
+            *safe_input(path)]
     timeout = timeout_s or min(120.0, settings.decode_timeout_s)
     pre = _rlimit_setter(int(timeout) + _RLIMIT_CPU_PAD_S) if os.name == "posix" else None
     try:
@@ -662,7 +681,8 @@ def scan_packets(path: Path, settings: Settings, abs_index: int, *, min_gap_s: f
         proc.wait()
         proc.stdout.close()
         raise BusyError("could not start analysis: the host is at capacity; retry later") from None
-    sc = _GapScanner(min_gap_s, limit, fold=fold, max_gap_s=settings.max_duration_s)
+    sc = _GapScanner(min_gap_s, limit, fold=fold, max_gap_s=settings.max_duration_s,
+                     restarts=restarts)
     try:
         for line in iter(lambda: proc.stdout.readline(256), b""):  # type: ignore[union-attr]
             if stop is not None and stop.is_set():
@@ -861,6 +881,7 @@ def probe(path: Path, settings: Settings) -> MediaInfo:
                      has_video=has_video, container_shortfall_s=shortfall,
                      estimated_durations=fmt.split(",")[0] in ("mpegts", "mpeg", "mpegvideo"),
                      decode_cap_s=decode_cap, byte_clock=fmt.split(",")[0] == "avi",
+                     chained=fmt.split(",")[0] == "ogg",
                      packets_declare_end=fmt.split(",")[0] in ("mpegts", "mpeg", "mpegvideo",
                                                                "asf"))
 
