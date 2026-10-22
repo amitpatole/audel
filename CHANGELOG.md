@@ -121,6 +121,18 @@ All notable changes to Audel are recorded here. The format follows
     at most 2 fetches, in a pool of 8.
   - **Low-Medium.** Work abandoned while waiting on its tenant share still ran later. Abandonment now
     propagates through both waits.
+- Red-team round 12 fixes (dialogue gating), each pinned by a regression test. 227 files grade
+  without new integrity findings under both the default and `netflix` specs.
+  - **Medium.** Dialogue in channels a mono downmix drops (the top channels of 7.1.4, most of
+    22.2) was never heard, and 5.1 dialogue in antiphase outside L/R cancelled in every pass, so
+    a `netflix` grade could pass. Speech is now detected on each channel that matters.
+  - **Low-Medium.** Dialogue loudness is now computed from the main pass's own 400 ms loudness
+    blocks lying entirely inside speech, with BS.1770 gating. This removes the 200-region cap
+    (which turned long programmes into programme loudness), stops speech regions spilling into
+    adjacent music (a false FAIL), and drops a decode pass.
+  - **Low.** Fewer than 0.4 s of dialogue is reported as `dialogue_unmeasured` instead of reading
+    the meter's -70 LUFS floor.
+  - **Info.** Opus packet gaps (silence suppression, as in WebRTC recordings) stay a warning.
 - Red-team round 12 fixes (auth surface), each pinned by a regression test. No bypass,
   escalation, credential disclosure or log forgery was found.
   - **Low-Medium.** JWT-like floods still cost about 8x ordinary text to scrub. Header checks and

@@ -98,13 +98,18 @@ audel check ep101_mix.wav --spec /etc/audel/acme_tv.json
 ## Dialogue gating
 
 Some specs measure loudness over speech only. Audel approximates dialogue gating in three steps.
-It finds speech regions with the Silero voice-activity detector bundled in faster-whisper. It
-measures BS.1770 integrated loudness over those regions with ffmpeg. Then it grades that value
-against the target.
+It finds speech with the Silero voice-activity detector bundled in faster-whisper, listening to
+each channel on its own: every channel except LFE that is within 30 dB of the loudest. A downmix
+would miss dialogue in some immersive channels, or in channels mixed in antiphase. It then
+computes BS.1770 integrated loudness from the main pass's own 400 ms loudness blocks, counting
+only blocks that lie entirely inside speech, with the standard absolute and relative gates. Then
+it grades that value against the target.
 
 The finding records `basis: "speech-gated"` and `dialogue_coverage`, the fraction of the
-programme that is speech. Confidence is `medium`. Without the `[asr]` extra, Audel falls back to
-programme loudness and marks the finding `low` confidence.
+programme that is speech. Confidence is `medium`. If no dialogue is detected (less than 0.4 s), or
+the measurement fails, the grade says so (`dialogue_unmeasured`) and uses programme loudness.
+Without the `[asr]` extra, Audel falls back to programme loudness and marks the finding `low`
+confidence.
 
 !!! warning "This is an approximation"
     Speech-gated loudness is not Dolby Dialogue Intelligence. When a contract requires a licensed

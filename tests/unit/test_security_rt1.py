@@ -3050,7 +3050,7 @@ def test_dialogue_gate_skips_failed_tracks_and_keeps_the_grade(monkeypatch):
         return [(0.0, 5.0)]
 
     monkeypatch.setattr(vad, "speech_regions", regions)
-    monkeypatch.setattr(vad, "speech_gated_lufs", lambda *a, **k: -23.0)
+    monkeypatch.setattr(vad, "gated_lufs_from_frames", lambda *a, **k: -23.0)
     _dialogue_gate("x", m, Settings())
     assert m.tracks[0].dialogue_lufs == -23.0 and m.tracks[2].dialogue_lufs is None
 
@@ -3286,15 +3286,29 @@ def _speech_like(path, *, invert_right=False, gain=0.05):
         "[1]aformat=channel_layouts=stereo[n];[0][n]amix=inputs=2:normalize=0", path)
 
 
+def _real_speech(tmp_path):
+    """Synthesized speech (espeak-ng), mono, 48 kHz, about 20 s."""
+    if shutil.which("espeak-ng") is None:
+        pytest.skip("espeak-ng not installed")
+    raw = tmp_path / "say.wav"
+    subprocess.run(["espeak-ng", "-w", str(raw), "-s", "150",
+                    "The quick brown fox jumps over the lazy dog. " * 6], check=True,
+                   capture_output=True)
+    out = tmp_path / "speech.wav"
+    _ff("-i", raw, "-ar", "48000", "-ac", "1", "-t", "20", out)
+    return out
+
+
 def test_speech_regions_hear_antiphase_dialogue(tmp_path):
     pytest.importorskip("faster_whisper")
     from audel.signals.vad import speech_regions
 
-    f = tmp_path / "phase.flac"
-    _speech_like(f, invert_right=True, gain=0.3)
-    mono_only = speech_regions(f, Settings(), stream=0, channels=1) or []
-    both = speech_regions(f, Settings(), stream=0, channels=2) or []
-    assert sum(b - a for a, b in both) > sum(b - a for a, b in mono_only)
+    mono = _real_speech(tmp_path)
+    f = tmp_path / "phase.wav"
+    _ff("-i", mono, "-af", "pan=stereo|FL=c0|FR=-1*c0", f)
+    regions = speech_regions(f, Settings(), stream=0, labels=["FL", "FR"],
+                             channel_rms=[-20.0, -20.0]) or []
+    assert sum(b - a for a, b in regions) > 5.0
 
 
 def test_a_vad_host_failure_is_busy_not_a_silent_fallback(tmp_path, monkeypatch):
@@ -3312,7 +3326,7 @@ def test_a_vad_host_failure_is_busy_not_a_silent_fallback(tmp_path, monkeypatch)
 
     monkeypatch.setattr(wave, "open", emfile)
     with pytest.raises(BusyError):
-        speech_regions(f, Settings(), stream=0, channels=2)
+        speech_regions(f, Settings(), stream=0, labels=["FL", "FR"], channel_rms=[-20.0, -20.0])
 
 
 def test_unmeasurable_dialogue_is_reported_on_a_dialogue_gated_spec():
@@ -3472,3 +3486,65 @@ def test_credential_like_request_ids_are_replaced_not_blanked():
 def test_uvicorn_error_records_keep_their_arguments():
     out = _emit("Uvicorn running on %s://%s:%d", "http", "127.0.0.1", 8000, name="uvicorn.error")
     assert out == "Uvicorn running on http://127.0.0.1:8000"
+
+
+# ==== round 12, decode surface (dialogue gating) ==============================================
+
+def test_dialogue_loudness_counts_only_blocks_inside_speech_with_no_region_cap():
+    from audel.signals.vad import gated_lufs_from_frames
+
+    frames, regions = [], []
+    for k in range(1200):                       # 1200 alternating 2 s speech / 2 s music lines
+        a = k * 4.0
+        regions.append((a, a + 2.0))
+    for i in range(1, 48_000):
+        t = round(i * 0.1, 1)
+        frames.append((t, -30.0 if (t % 4.0) <= 2.0 else -20.0, None, None))
+    assert abs(gated_lufs_from_frames(frames, regions) - (-30.0)) < 0.05   # no spill, no cap
+
+
+def test_too_little_dialogue_is_no_speech_not_minus_70():
+    from audel.signals.vad import gated_lufs_from_frames
+
+    frames = [(round(0.1 * i, 1), -25.0, None, None) for i in range(1, 100)]
+    assert gated_lufs_from_frames(frames, [(1.0, 1.3)]) is None
+
+
+def test_every_channel_that_matters_is_heard():
+    from audel.signals.vad import _channels_to_hear
+
+    labels = ["FL", "FR", "FC", "LFE", "SL", "SR", "TFL", "TFR", "TBL", "TBR", "TSL", "TSR"]
+    rms = [-20.0] * 12
+    chans = _channels_to_hear(labels, rms)
+    assert 3 not in chans and {8, 9} <= set(chans) and len(chans) == 11
+    rms[10] = -80.0                                   # a near-silent channel is skipped
+    assert 10 not in _channels_to_hear(labels, rms)
+
+
+@requires_ffmpeg
+def test_dialogue_in_dropped_or_cancelled_channels_is_measured(tmp_path):
+    pytest.importorskip("faster_whisper")
+    from audel.core.render import _render_sync
+
+    mono = _real_speech(tmp_path)
+    for layout, expr in (("7.1.4", "TBL=c0|TBR=c0"), ("5.1", "BL=c0|BR=-1*c0"),
+                         ("5.1", "FC=c0|FL=-0.707*c0|FR=-0.707*c0")):
+        f = tmp_path / f"{layout}.wav"
+        _ff("-i", mono, "-af", f"pan={layout}|{expr}", f)
+        rr = _render_sync(str(f), Settings(), "netflix")
+        assert rr.measurements.tracks[0].dialogue_lufs is not None, layout
+
+
+def test_opus_silence_suppression_is_not_an_error():
+    from audel.mediaguard import MediaInfo, StreamInfo
+    from audel.signals.checks import evaluate
+    from audel.signals.measure import Measurements, TrackMeasurements
+
+    st = StreamInfo(index=0, codec="opus", sample_rate=48000, channels=2)
+    m = Measurements(info=MediaInfo(duration_s=10, sample_rate=48000, channels=2, codec="opus",
+                                    has_audio=True, streams=(st,)))
+    m.tracks = [TrackMeasurements(stream=st, decoded_s=6.0, extent_s=10.0, gap_total_s=4.0,
+                                  gaps=[(3.0, 7.0)], frames=[(0.1, -23.0, -23.0, -3.0)],
+                                  rms_dbfs=-20.0)]
+    sev = {i.severity.value for i in evaluate(m, Settings()) if i.detail.get("check") == "packet_gap"}
+    assert sev == {"warning"}

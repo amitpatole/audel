@@ -345,8 +345,9 @@ def evaluate(m: Measurements, settings: Settings, spec: DeliverySpec | str | Non
                 "are listed)", _track_span(tm, dur), "packet_gap_total", tm,
                 conf=Confidence.MEDIUM, programme=True, gap_s=round(tm.gap_total_s, 3)))
         # Missing packets scale like spread loss: above 10% of the track it is an error.
+        # Opus may omit packets in silence by design (DTX, as WebRTC records): never an error.
         gap_sev = (Severity.ERROR if tm.extent_s > 0 and tm.gap_total_s > 0.1 * tm.extent_s
-                   else Severity.WARNING)
+                   and tm.stream.codec != "opus" else Severity.WARNING)
         for a, b in tm.gaps[:_MAX_SPANS]:
             issues.append(_issue(
                 IssueKind.DROPOUT, gap_sev,

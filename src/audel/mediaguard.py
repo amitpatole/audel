@@ -1145,13 +1145,14 @@ def decode_to_wav(path: Path, settings: Settings, *, sample_rate: int = 16000,
     fd, name = _mkstemp("audel-asr-", settings)
     os.close(fd)
     out = Path(name)
-    # "side" (L minus R) hears what a mono downmix cancels: speech in antiphase.
-    chain = "asetpts=N/SR/TB" if mix == "mono" else "pan=mono|c0=0.5*c0-0.5*c1,asetpts=N/SR/TB"
+    # mono: ffmpeg's downmix (what ASR hears). all: every channel kept, so speech detection can
+    # hear each one (a downmix drops some immersive channels and cancels antiphase content).
+    channels = [] if mix == "all" else ["-ac", "1"]
     argv = [ffmpeg, "-nostdin", "-hide_banner", "-threads", "1", "-reinit_filter", "0",
             *safe_input(path),
-            "-map", f"0:a:{int(stream)}?", "-af", chain,
+            "-map", f"0:a:{int(stream)}?", "-af", "asetpts=N/SR/TB",
             "-t", str(settings.max_duration_s),
-            "-ar", str(sample_rate), "-ac", "1", "-f", "wav", "-y", str(out)]
+            "-ar", str(sample_rate), *channels, "-c:a", "pcm_s16le", "-f", "wav", "-y", str(out)]
     limit = pass_timeout(settings, settings.max_duration_s)
     try:
         proc = run(argv, timeout_s=min(limit, timeout_s) if timeout_s else limit)

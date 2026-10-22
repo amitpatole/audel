@@ -69,7 +69,7 @@ def _dialogue_gate(path, m: Measurements, settings: Settings) -> None:
     import time
 
     from ..errors import AudelError, BusyError, UnsafeSourceError
-    from ..signals.vad import speech_gated_lufs, speech_regions
+    from ..signals.vad import gated_lufs_from_frames, speech_regions
 
     if 0 < m.info.decode_cap_s < settings.max_duration_s:  # the same per-stream cap as measure()
         settings = settings.model_copy(update={"max_duration_s": m.info.decode_cap_s})
@@ -82,18 +82,15 @@ def _dialogue_gate(path, m: Measurements, settings: Settings) -> None:
             raise UnsafeSourceError("analysis exceeded the per-file time budget")
         try:
             regions = speech_regions(path, settings, stream=tm.stream.index,
-                                     channels=tm.stream.channels, timeout_s=left)
+                                     labels=tm.stream.channel_labels(),
+                                     channel_rms=[c.rms_dbfs for c in tm.channels],
+                                     timeout_s=left)
             if regions is None:
                 return  # no VAD installed: graders fall back to programme loudness
             speech_s = sum(b - a for a, b in regions)
             tm.dialogue_coverage = (speech_s / dur) if dur > 0 else None
-            if not regions:
-                tm.dialogue_status = "no_speech"
-                continue
-            left = (m.deadline - time.monotonic()) if m.deadline is not None else None
-            tm.dialogue_lufs = speech_gated_lufs(path, settings, regions, stream=tm.stream.index,
-                                                 timeout_s=left)
-            tm.dialogue_status = "ok" if tm.dialogue_lufs is not None else "failed"
+            tm.dialogue_lufs = gated_lufs_from_frames(tm.frames, regions)
+            tm.dialogue_status = "ok" if tm.dialogue_lufs is not None else "no_speech"
         except (BusyError, UnsafeSourceError):
             raise
         except AudelError:
