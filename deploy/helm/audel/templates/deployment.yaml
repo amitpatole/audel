@@ -18,6 +18,9 @@
 {{- if and (has .Values.service.type (list "LoadBalancer" "NodePort")) (not .Values.tls.secretName) (ne $plain "true") }}
 {{- fail "service.type exposes Audel outside the cluster without TLS: set tls.secretName (or service.allowPlaintext=true behind your own TLS)" }}
 {{- end }}
+{{- if has "*" .Values.forwardedAllowIps }}
+{{- fail "forwardedAllowIps may not contain '*': list your ingress / load balancer addresses" }}
+{{- end }}
 {{- $scheme := ternary "HTTPS" "HTTP" (ne .Values.tls.secretName "") }}
 apiVersion: apps/v1
 kind: Deployment

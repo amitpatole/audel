@@ -95,6 +95,10 @@ All notable changes to Audel are recorded here. The format follows
   - **Deploy.** Helm ingress defaults to the same namespace, DNS egress goes to kube-dns only,
     token, JWKS and TLS mounts are supported, and the default is one replica. The Dockerfile base
     is pinned by digest, and GitHub Actions are pinned to commit SHAs.
+- Red-team round 5 fixes (auth surface): a character-variety floor on token bodies, so patterned
+  bodies are refused even when wrapped in a valid checksum, and an honest description of what the
+  format check proves. Minted tokens are redacted from logs wherever they appear, including when
+  misplaced in a URL. `forwarded_allow_ips` refuses `*` in config and in Helm.
 - Red-team round 4 fixes (decode and measurement surface), each pinned by a regression test:
   - **High.** A forward timestamp jump larger than the duration cap ended decoding early, because
     `-t` counts timestamps, so the audio after it was never measured and a clipping file could PASS.
@@ -129,9 +133,11 @@ All notable changes to Audel are recorded here. The format follows
   - **Medium.** The shape-based token check accepted chosen secrets, such as sentences or a hash of
     "password", and tenant-file hashes could not be checked at all, so guessing was bounded only by
     throughput. Tokens are now minted only by `audel token new`, in the form
-    `audel_<256 random bits>_<checksum>`. Anything else is refused before comparison, including a
-    chosen secret whose hash is placed in the tokens file. **Breaking:** regenerate tokens with
-    `audel token new`. Running it without `--tenant` prints a shared `AUDEL_API_TOKEN`.
+    `audel_<256 random bits>_<checksum>`. Anything not in that format is refused before comparison,
+    including a password whose hash is placed in the tokens file. The checksum is public, so the
+    format catches typos and non-minted values but cannot prove randomness: always mint.
+    **Breaking:** regenerate tokens with `audel token new`. Running it without `--tenant` prints a
+    shared `AUDEL_API_TOKEN`.
   - **Low-Medium.** In Helm, a `tls.mutual` of `"True"` or `"yes"` silently disabled mTLS. Values are
     now normalised, and anything other than true or false fails.
   - **Low.** Log scrubbing collapsed record args and broke uvicorn's access-log lines. Arguments are

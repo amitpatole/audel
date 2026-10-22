@@ -1545,3 +1545,28 @@ def test_frame_cap_follows_the_configured_duration():
     line = "[Parsed_ebur128_0 @ 0x1] t: {t}   TARGET:-23 LUFS    M: -20.0 S: -20.0\n"
     text = "".join(line.format(t=i / 10) for i in range(50))
     assert len(parse_frames(text, max_frames=10)) == 10 and len(parse_frames(text)) == 50
+
+
+# ==== round 5, auth surface ===================================================================
+
+def test_patterned_bodies_fail_even_with_a_valid_checksum():
+    from audel.auth import _checksum, new_token, strong_token
+
+    for body in ("A" * 43, ("password" * 6)[:43]):
+        assert not strong_token(f"audel_{body}_{_checksum(body)}")
+    assert all(strong_token(new_token()) for _ in range(2000))
+
+
+def test_minted_tokens_are_redacted_wherever_they_appear():
+    from audel.auth import new_token
+    from audel.logging import scrub_text
+
+    t = new_token()
+    for text in (f'"GET /specs?auth={t} HTTP/1.1"', f"/x/{t}", f"Authorization: {t}",
+                 f"Basic {t}"):
+        assert t not in scrub_text(text)
+
+
+def test_wildcard_forwarded_proxies_refused():
+    with pytest.raises(ValueError):
+        Settings(forwarded_allow_ips=["*"])

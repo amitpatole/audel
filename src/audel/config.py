@@ -12,7 +12,7 @@ from enum import Enum
 from pathlib import Path
 
 import platformdirs
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 APP_NAME = "audel"
@@ -216,6 +216,13 @@ class Settings(BaseSettings):
     # Workspace
     cache_dir: Path = Field(default_factory=default_cache_dir)
     session_ttl_s: float = 60 * 60 * 24 * 7  # 7 days
+
+    @field_validator("forwarded_allow_ips")
+    @classmethod
+    def _no_wildcard_proxies(cls, v: list[str]) -> list[str]:
+        if any(x.strip() == "*" for x in v):
+            raise ValueError("forwarded_allow_ips may not be '*': list your proxies' addresses")
+        return v
 
     def model_for(self, backend: str) -> str:
         return {

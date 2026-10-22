@@ -12,7 +12,8 @@ import os
 import re
 
 _SECRET_RE = re.compile(
-    r"(sk-[A-Za-z0-9_\-]{8,}|AIza[A-Za-z0-9_\-]{8,}"
+    r"(audel_[A-Za-z0-9_\-]{43}_[a-z2-7]{8}"                       # minted Audel tokens, anywhere
+    r"|sk-[A-Za-z0-9_\-]{8,}|AIza[A-Za-z0-9_\-]{8,}"
     r"|[Bb]earer\s+[A-Za-z0-9._~+/=\-]{8,}"
     r"|(?:api[_-]?key|token|secret|password)[\"'`:=\s]+[A-Za-z0-9._\-]{6,})",
     re.IGNORECASE,

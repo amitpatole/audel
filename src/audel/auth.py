@@ -85,24 +85,30 @@ def _checksum(body: str) -> str:
 def new_token() -> str:
     """Mint a token: ``audel_<43 chars = 256 random bits>_<8-char checksum>``.
 
-    The self-checking format is what makes "valid credentials always pass" safe: anything a person
-    chose (a sentence, a hash of a password, a word hashed into the tokens file) does not carry a
-    valid checksum and is refused before any comparison, so only minted 256-bit tokens work."""
+    The format catches typos and anything that was not produced in this shape (a password, a
+    sentence, a hash of a word placed in the tokens file): those are refused before any
+    comparison. The checksum is public, so it cannot PROVE randomness; a deliberately crafted
+    token would still need to pass the character-variety floor below. Always mint tokens."""
     import secrets
 
     body = secrets.token_urlsafe(32)
     return f"audel_{body}_{_checksum(body)}"
 
 
+_MIN_DISTINCT = 18  # minted bodies use >= 22 distinct characters in 200k samples
+
+
 def strong_token(token: str) -> bool:
-    """True only for a token minted by :func:`new_token` (format + checksum)."""
+    """True for a token in the minted format (``audel_<43>_<checksum>``) whose body also looks
+    random (enough distinct characters). A format check, not a proof of randomness: mint tokens
+    with ``audel token new``."""
     import re
 
     global _TOKEN_RE
     if _TOKEN_RE is None:
         _TOKEN_RE = re.compile(r"\Aaudel_([A-Za-z0-9_-]{43})_([a-z2-7]{8})\Z")
     m = _TOKEN_RE.match(token or "")
-    if m is None:
+    if m is None or len(set(m.group(1))) < _MIN_DISTINCT:
         return False
     return hmac.compare_digest(_checksum(m.group(1)), m.group(2))
 
