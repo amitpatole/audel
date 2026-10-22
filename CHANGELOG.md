@@ -121,6 +121,18 @@ All notable changes to Audel are recorded here. The format follows
     at most 2 fetches, in a pool of 8.
   - **Low-Medium.** Work abandoned while waiting on its tenant share still ran later. Abandonment now
     propagates through both waits.
+- Red-team round 19 fixes (decode surface), each pinned by a regression test. The 473-file battery
+  shows no regressions.
+  - **Medium.** A fragmented MP4 with one damaged box between fragments stopped being read there
+    with no error, so the rest of the programme (in the reproduction, 14 s of clipped audio) was
+    never graded. The same happened in MXF, where only a duration warning was raised.
+  - **Low-Medium.** The round-18 `demux_stopped` check read ffmpeg's log text. That falsely failed
+    complete WavPack files with a trailing tag or padding, and a crafted Matroska tag could fake
+    the line.
+  - `demux_stopped` now compares where the demuxer stopped with what the file still holds: after
+    the furthest packet read, it looks for the container's own media markers (a new Ogg link,
+    an MP4 fragment, an MXF essence element, a WavPack block; Matroska resyncs on its own). Trailing tags
+    and padding carry none, and file text can't trigger it.
 - Red-team round 19 fixes (REST availability and log redaction), each pinned by a regression
   test. No auth bypass, escalation or tenant crossing was found.
   - **Medium.** After the round-18b change, `POST /watch` (when enabled) took a grading slot

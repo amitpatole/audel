@@ -318,6 +318,13 @@ def evaluate(m: Measurements, settings: Settings, spec: DeliverySpec | str | Non
             "(incomplete transfer?)", span=Span(start_ms=_ms(dur), end_ms=_ms(dur + miss)),
             source=IssueSource.DSP, detail={"check": "container_truncated",
                                             "missing_s": round(miss, 3)}))
+    if m.unread_at is not None:
+        issues.append(Issue.make(
+            IssueKind.DECODE_ERROR, Severity.ERROR,
+            f"the container could not be read to its end: media data after byte {m.unread_at} "
+            "was never read (a damaged box or a chained link that switches codec), so that "
+            "audio was not measured", span=_full_span(dur), source=IssueSource.DSP,
+            detail={"check": "demux_stopped", "unread_from_byte": m.unread_at}))
     if m.declared_s is not None:
         issues.append(Issue.make(
             IssueKind.DURATION, Severity.WARNING,
@@ -334,12 +341,6 @@ def evaluate(m: Measurements, settings: Settings, spec: DeliverySpec | str | Non
                                  f"{label}track could not be decoded: {tm.failed}",
                                  _full_span(dur), "track_decode_error", tm, programme=True))
             continue
-        if tm.demux_stopped:
-            issues.append(_issue(
-                IssueKind.DECODE_ERROR, Severity.ERROR,
-                f"{label}the container could not be read to its end (e.g. a chained Ogg link "
-                "that switches codec): audio after that point was not measured",
-                _track_span(tm, dur), "demux_stopped", tm, programme=True))
         if tm.decode_errors:
             issues.append(_issue(
                 IssueKind.DROPOUT, Severity.ERROR if tm.decode_errors >= 10 else Severity.WARNING,

@@ -66,7 +66,6 @@ class TrackMeasurements:
     series_60: list[float] = field(default_factory=list)
     decoded_s: float = 0.0                   # audio actually decoded (last loudness frame)
     decode_errors: int = 0                   # problems the decoder reported (corrupt data)
-    demux_stopped: bool = False              # the container stopped early: the rest is unmeasured
     gaps: list[tuple[float, float]] = field(default_factory=list)  # missing-packet gaps (s)
     start_s: float = 0.0                     # start on the programme timeline
     failed: str | None = None                # this track could not be decoded (reason)
@@ -116,6 +115,7 @@ class Measurements:
     deadline: float | None = None  # the per-file deadline (later passes stay inside it)
     tracks: list[TrackMeasurements] = field(default_factory=list)
     declared_s: float | None = None          # set when the container's duration was wrong
+    unread_at: int | None = None             # byte where media the demuxer never read begins
 
 
 def _rate(st: StreamInfo) -> int:
@@ -158,7 +158,6 @@ def _main_pass(ffmpeg: str, path, idx: int, st: StreamInfo, settings: Settings,
     tm.integrated_lufs, tm.lra, tm.true_peak_dbtp = eb.get("I"), eb.get("LRA"), eb.get("true_peak")
     tm.frames = parse_frames(err, max_frames=int(settings.max_duration_s * 10) + 1000)
     tm.decode_errors = int(stats.get("decode_errors", 0))
-    tm.demux_stopped = bool(stats.get("demux_stopped", False))
     tm.decoded_s = max((f[0] for f in tm.frames), default=0.0)
     if tm.decoded_s >= settings.max_duration_s - 0.5:
         # Decoding reached the cap: audio beyond it would go unmeasured. Fail closed.
@@ -387,6 +386,10 @@ def measure(path, info: MediaInfo, settings: Settings) -> Measurements:
 
     m.tracks = []
     m.deadline = deadline
+    from ..mediaguard import unread_media_at
+
+    m.unread_at = unread_media_at(path, settings, info.container,
+                                  timeout_s=max(1.0, min(120.0, deadline - time.monotonic())))
     try:
         for st in streams:
             try:

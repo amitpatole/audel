@@ -4435,3 +4435,57 @@ def test_ordinary_flags_and_flag_pairs_are_kept(text):
     from audel.logging import scrub_text
 
     assert scrub_text(text) == text
+
+
+# ==== round 19, decode surface (unread media after the demuxer stops) =========================
+
+def _demux_stopped(path):
+    from audel import check
+
+    return any(i.detail.get("check") == "demux_stopped" for i in asyncio.run(check(str(path))).issues)
+
+
+@requires_ffmpeg
+def test_fragmented_mp4_that_stops_early_is_caught(tmp_path):
+    f = tmp_path / "f.mp4"
+    _ff("-f", "lavfi", "-i", "sine=f=440:d=8:sample_rate=48000", "-c:a", "aac", "-movflags",
+        "+frag_keyframe+empty_moov", "-frag_duration", "1000000", f)
+    assert not _demux_stopped(f)
+    data = bytearray(f.read_bytes())
+    second = data.find(b"moof", data.find(b"moof") + 4)
+    assert second > 0
+    data[second - 4:second] = (7).to_bytes(4, "big")  # a damaged box: ffmpeg stops, exit 0
+    cut = tmp_path / "cut.mp4"
+    cut.write_bytes(bytes(data))
+    assert _demux_stopped(cut)
+
+
+@requires_ffmpeg
+@pytest.mark.parametrize("trailer", [b"TAG" + b"\0" * 125, b"\0" * 4096])
+def test_wavpack_with_a_trailing_tag_or_padding_is_not_flagged(tmp_path, trailer):
+    f = tmp_path / "a.wv"
+    try:
+        _ff("-f", "lavfi", "-i", "sine=f=440:d=4", "-c:a", "wavpack", "-metadata", "title=Song", f)
+    except (subprocess.CalledProcessError, AssertionError):
+        pytest.skip("no wavpack encoder")
+    g = tmp_path / "b.wv"
+    g.write_bytes(f.read_bytes() + trailer)
+    assert not _demux_stopped(g)
+
+
+@requires_ffmpeg
+def test_intact_and_same_codec_chained_ogg_are_not_flagged(tmp_path):
+    a, b = tmp_path / "a.ogg", tmp_path / "b.ogg"
+    _ff("-f", "lavfi", "-i", "sine=f=440:d=4:sample_rate=48000", "-c:a", "libopus", a)
+    _ff("-f", "lavfi", "-i", "sine=f=330:d=4:sample_rate=48000", "-c:a", "libopus", b)
+    chain = tmp_path / "chain.ogg"
+    chain.write_bytes(a.read_bytes() + b.read_bytes())
+    assert not _demux_stopped(a) and not _demux_stopped(chain)
+
+
+def test_demux_stop_is_not_read_from_decoder_log_text():
+    import inspect
+
+    from audel import mediaguard
+
+    assert "Error during demuxing" not in inspect.getsource(mediaguard)  # forgeable by tag text

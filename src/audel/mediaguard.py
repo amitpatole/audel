@@ -101,7 +101,6 @@ _LAYOUT_CACHE: dict[str, list[str]] | None = None
 
 def _mask_inner(layout: str) -> str:
     """ffprobe prints a non-standard channel mask as ``N channels (A+B+...)``: return ``A+B+...``."""
-    import re
 
     m = re.fullmatch(r"\d+ channels \(([A-Za-z0-9+]+)\)", layout or "")
     return m.group(1) if m else layout
@@ -219,6 +218,7 @@ class MediaInfo:
     chained: bool = False               # Ogg: links may be concatenated (each restarts at 0)
     packets_declare_end: bool = False   # per-stream durations unreliable (TS/PS estimates, ASF
                                         # copies the file's): the packets are the declaration
+    container: str = ""                 # ffprobe's first format name (ogg, mov, mxf...)
 
 
 def _tool(name: str, override: str | None = None) -> str:
@@ -418,7 +418,6 @@ def pcm_pipeline(path: Path, settings: Settings, *, stream: int, channels: int,
     out2 = err2.join(5).decode("utf-8", "replace")
     if stats is not None:
         stats["decode_errors"] = _stream_decode_errors(tail1, abs_index)
-        stats["demux_stopped"] = bool(_DEMUX_STOPPED.search(tail1))
     for pipe in (p1.stderr, p2.stderr):
         try:
             pipe.close()
@@ -430,11 +429,6 @@ def pcm_pipeline(path: Path, settings: Settings, *, stream: int, channels: int,
     if p1.returncode not in (0, None, 224, -13):
         raise DecodeError(f"could not decode audio: {_cause(tail1)}")
     return out2
-
-
-# ffmpeg's own anchored line when demuxing ends on an error (e.g. a chained Ogg whose next link
-# switches codec) though the decoder exits 0. Indented metadata lines can't forge it.
-_DEMUX_STOPPED = re.compile(r"^\[in#0/[^\]\n]+\] Error during demuxing", re.MULTILINE)
 
 
 def _cause(tail: str) -> str:
@@ -456,7 +450,6 @@ def _stream_decode_errors(text: str, abs_index: int) -> int:
     """ffmpeg's own count for ONE stream, from its anchored end-of-run summary line
     (``[in#0/...]   Input stream #0:K (audio): ... N decode errors``). Metadata dump lines are
     indented and can't start a line with ``[in#0/``, so tag text can't forge this."""
-    import re
 
     k = abs_index if abs_index >= 0 else r"\d+"
     rx = re.compile(r"^\[in#0/[^\]\n]+\]\s+Input stream #0:" + str(k)
@@ -745,11 +738,86 @@ def scan_packets(path: Path, settings: Settings, abs_index: int, *, min_gap_s: f
     return result
 
 
+# Sync markers of media data for containers whose demuxer can stop early with exit 0 and no
+# error (a damaged box / KLV / chained link): if one appears AFTER the last packet read, media
+# was left unread. Trailing tags and padding (ID3v1, APE, zeros) carry none. Not Matroska: its
+# demuxer resyncs past damage, and some muxers' packet positions aren't file offsets.
+_MEDIA_MARKERS = {
+    # Ogg packet positions are page starts (not byte exact): only a NEW link's first page
+    # (version 0, beginning-of-stream flag) after them means a chained link was never read.
+    "ogg": (b"OggS\x00\x02",),
+    "wv": (b"wvpk",),
+    "mov": (b"moof", b"mdat"),
+    "mxf": (b"\x06\x0e\x2b\x34\x01\x02\x01\x01\x0d\x01\x03\x01",),  # essence element
+}
+
+
+def unread_media_at(path: Path, settings: Settings, container: str, *,
+                    timeout_s: float | None = None) -> int | None:
+    """Byte offset after the furthest packet the demuxer read, when the rest of the file holds
+    more media data of this container (``None`` when nothing was left unread, or the container
+    has no reliable marker). One streamed packet listing over every stream, then a chunked byte
+    search of the remainder; both bounded."""
+    import threading
+    import time
+
+    markers = _MEDIA_MARKERS.get(container)
+    if not markers:
+        return None
+    try:
+        size = path.stat().st_size
+    except OSError:
+        raise BusyError("could not read the file: the host is at capacity; retry later") from None
+    ffprobe = _tool("ffprobe", settings.ffmpeg_path and str(Path(settings.ffmpeg_path).with_name("ffprobe")))
+    argv = [ffprobe, "-v", "error", "-show_entries", "packet=pos,size", "-of", "csv=p=0",
+            *safe_input(path)]
+    timeout = timeout_s or min(120.0, settings.decode_timeout_s)
+    pre = _rlimit_setter(int(timeout) + _RLIMIT_CPU_PAD_S) if os.name == "posix" else None
+    proc = _popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                  stderr=subprocess.DEVNULL, preexec_fn=pre)
+    assert proc.stdout is not None
+    killer = threading.Timer(timeout, proc.kill)
+    try:
+        killer.start()
+    except RuntimeError:
+        proc.kill()
+        proc.wait()
+        proc.stdout.close()
+        raise BusyError("could not start analysis: the host is at capacity; retry later") from None
+    end = 0
+    t0 = time.monotonic()
+    try:
+        for line in iter(lambda: proc.stdout.readline(64), b""):  # type: ignore[union-attr]
+            pos, _, sz = line.strip().partition(b",")
+            if pos.isdigit() and sz.isdigit():
+                end = max(end, int(pos) + int(sz))
+    finally:
+        killer.cancel()
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+        proc.stdout.close()
+    if time.monotonic() - t0 >= timeout or proc.returncode != 0 or end <= 0 or size - end < 16:
+        return None  # an incomplete listing proves nothing; the timeline checks still apply
+    chunk = 1 << 20
+    keep = max(len(m) for m in markers) - 1
+    with open(path, "rb") as fh:
+        fh.seek(end)
+        prev = b""
+        while True:
+            buf = fh.read(chunk)
+            if not buf:
+                return None
+            hay = prev + buf
+            if any(m in hay for m in markers):
+                return end
+            prev = hay[-keep:]
+
+
 def channel_layout_arg(layout: str, channels: int) -> str:
     """The -ch_layout to decode and analyse with: the stream's own layout name when ffmpeg knows
     it (probe output, charset-filtered), else a custom layout of N named channels (ffmpeg's
     loudness meter rejects 'unknown' layouts; a remix to a default layout would mislabel)."""
-    import re
 
     n = max(1, int(channels))
     layout = _mask_inner(layout)
@@ -931,7 +999,8 @@ def probe(path: Path, settings: Settings) -> MediaInfo:
                      decode_cap_s=decode_cap, byte_clock=fmt.split(",")[0] == "avi",
                      chained=fmt.split(",")[0] == "ogg",
                      packets_declare_end=fmt.split(",")[0] in ("mpegts", "mpeg", "mpegvideo",
-                                                               "asf"))
+                                                               "asf"),
+                     container=fmt.split(",")[0])
 
 
 _W64_RIFF = bytes.fromhex("726966662e91cf11a5d628db04c10000")
@@ -1261,7 +1330,6 @@ def ambisonic_components(st: StreamInfo | None) -> int:
     if not is_ambisonic(st):
         return 0
     assert st is not None
-    import re
 
     m = re.match(r"ambisonic\s+(\d{1,2})", (st.layout or "").lower())
     n = (int(m.group(1)) + 1) ** 2 if m else 1
