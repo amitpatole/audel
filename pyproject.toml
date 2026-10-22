@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "audel"
-version = "0.1.0"
+version = "1.0.0rc1"
 description = "Ears for AI Agents — a machine-graded audio feedback loop coding agents consume to self-correct before claiming done."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -12,7 +12,7 @@ license = { text = "MIT" }
 authors = [{ name = "Amit Patole", email = "amit.patole@gmail.com" }]
 keywords = ["ai", "agents", "audio", "speech", "asr", "llm", "voice", "mcp"]
 classifiers = [
-    "Development Status :: 2 - Pre-Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3.11",

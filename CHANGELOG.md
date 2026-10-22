@@ -6,6 +6,10 @@ All notable changes to Audel are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.0.0rc1] - 2026-10-22
+
+First release candidate for 1.0.
+
 ### Added
 - **Delivery specs as data.** Built-in EBU R128, R128 s1, ATSC A/85, OP-59, ARIB TR-B32,
   Netflix-style speech-gated, Spotify, YouTube, Apple Music, Apple Podcasts and podcast specs, plus
@@ -121,6 +125,21 @@ All notable changes to Audel are recorded here. The format follows
     at most 2 fetches, in a pool of 8.
   - **Low-Medium.** Work abandoned while waiting on its tenant share still ran later. Abandonment now
     propagates through both waits.
+- Red-team round 20 fixes, each pinned by a regression test. No auth bypass, escalation or tenant
+  crossing was found.
+  - **Medium.** The round-19 unread-media check trusted the furthest packet end in the file, so one
+    packet whose declared size reached the end (an MXF element with an oversized length, or an MP4
+    fragment's samples relocated to the end) hid every region the demuxer never read. Every media
+    region (an Ogg link, an MP4 fragment or `mdat`, an MXF essence element, a WavPack block) must
+    now contain a packet that was read. Avid MXF essence keys are recognised, and the packet
+    listing reads ffprobe's named fields (its CSV column order is not the requested one).
+  - **Low.** A timed-out request or a deleted job returned its disk reservation while the abandoned
+    grading still had the file open. Files now stay counted until that work really ends.
+  - **Low.** The derived per-tenant disk share could be smaller than one URL fetch plus its form,
+    so URL ingest was refused for good on some settings. The derived share now always fits one
+    request, and an explicit share below that is logged at start-up.
+  - **Info.** Flags that point at a credential rather than carry it (`--password-file`,
+    `--password-stdin`, `--passphrase-fd`, `--ssh-key-file`) are no longer redacted.
 - Red-team round 19 fixes (decode surface), each pinned by a regression test. The 473-file battery
   shows no regressions.
   - **Medium.** A fragmented MP4 with one damaged box between fragments stopped being read there

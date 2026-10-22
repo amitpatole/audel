@@ -21,7 +21,7 @@ entirely on your own hardware through an on-prem Ollama server.
 ## Install
 
 ```bash
-pip install audel                 # light base: ffmpeg + DSP
+pip install --pre audel           # light base: ffmpeg + DSP (--pre: 1.0.0rc1)
 pip install "audel[asr]"          # local faster-whisper: listening
 pip install "audel[serve,oidc]"   # REST service with JWT auth
 audel doctor

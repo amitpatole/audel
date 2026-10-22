@@ -177,13 +177,13 @@ for an on-prem LLM or an object store.
 
 ## Throughput
 
-These figures come from one 4-core laptop grading eight 2-minute stereo programmes against
-`ebu_r128` through `/jobs`:
+These figures were measured for 1.0.0rc1 on a shared 4-core host under heavy load (load average
+about 14), grading eight 2-minute stereo programmes against `ebu_r128` through `/jobs`:
 
 | `AUDEL_MAX_CONCURRENT_JOBS` | Wall time | Realtime factor | Files per hour |
 |---|---|---|---|
-| 1 | 30.2 s | 32x | about 950 |
-| 4 | 18.7 s | 51x | about 1,540 |
+| 1 | 22.6 s | 43x | about 1,280 |
+| 4 | 16.6 s | 58x | about 1,730 |
 
 Each grade is single-threaded, so set `AUDEL_MAX_CONCURRENT_JOBS` to the number of cores you give
 the pod. `listen` adds transcription time, which depends on the whisper model and on whether a

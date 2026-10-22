@@ -6,7 +6,7 @@
 > **self-corrects before it claims done.**
 
 ```bash
-pip install audel
+pip install --pre audel          # --pre: the 1.0.0rc1 release candidate
 audel demo                       # no API key required
 ```
 
