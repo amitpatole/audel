@@ -160,8 +160,9 @@ class JobStore:
 def _public_error(e: Exception) -> str:
     from .errors import BusyError, ConfigError, UnsafeSourceError, sanitize_message
 
-    if isinstance(e, BusyError):
-        return "Server busy; resubmit later."
+    if isinstance(e, (BusyError, OSError, MemoryError)) or (
+            isinstance(e, RuntimeError) and "can't start new thread" in str(e)):
+        return "Server busy; resubmit later."  # the host at its limits, as the REST handler says
     if isinstance(e, (UnsafeSourceError, ConfigError)):
         return sanitize_message(str(e))
     return "Could not decode or grade the source."

@@ -121,6 +121,14 @@ All notable changes to Audel are recorded here. The format follows
     at most 2 fetches, in a pool of 8.
   - **Low-Medium.** Work abandoned while waiting on its tenant share still ran later. Abandonment now
     propagates through both waits.
+- Red-team round 12 fixes (network surface), each pinned by a regression test. A crafted-file
+  corpus of 480 grades never produced a busy signal, and a cancellation fuzz of about 1,900
+  requests left every slot and counter at baseline.
+  - **Low.** Hashing an upload for a job, or writing a URL download, while the host is out of
+    file descriptors, memory or disk was reported as a bad file (and the job wrote no audit row).
+    Both are now a retry, and audited.
+  - **Low.** Speech detection checks the file's deadline between chunks and channels, so it
+    can't run past the budget. It reads 1-minute chunks, so memory stays bounded for 24 channels.
 - Red-team round 12 fixes (dialogue gating), each pinned by a regression test. 227 files grade
   without new integrity findings under both the default and `netflix` specs.
   - **Medium.** Dialogue in channels a mono downmix drops (the top channels of 7.1.4, most of

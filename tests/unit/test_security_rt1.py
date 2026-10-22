@@ -3548,3 +3548,53 @@ def test_opus_silence_suppression_is_not_an_error():
                                   rms_dbfs=-20.0)]
     sev = {i.severity.value for i in evaluate(m, Settings()) if i.detail.get("check") == "packet_gap"}
     assert sev == {"warning"}
+
+
+# ==== round 12, network surface ===============================================================
+
+def test_job_hash_failure_is_busy_and_audited(tmp_path, media, monkeypatch):
+    import audel.adapters.rest as rest
+
+    log = tmp_path / "audit.jsonl"
+    s = Settings(cache_dir=tmp_path / "ws", audit_log=log)
+
+    def emfile(path):
+        raise OSError(24, "Too many open files")
+
+    with TestClient(build_app(settings=s)) as c:
+        monkeypatch.setattr(rest, "_sha256", emfile)
+        r = c.post("/check", files={"file": ("a.wav", media["good"].read_bytes(), "audio/wav")})
+        jid = c.post("/jobs", files={"file": ("a.wav", media["good"].read_bytes(), "audio/wav")}
+                     ).json()["job_id"]
+        for _ in range(100):
+            j = c.get(f"/jobs/{jid}").json()
+            if j["status"] in ("failed", "done"):
+                break
+            time.sleep(0.05)
+    assert r.status_code == 429 and "busy" in (j.get("error") or "").lower(), (r.text, j)
+    assert log.exists() and '"BusyError"' in log.read_text()
+
+
+def test_download_host_exhaustion_is_busy(tmp_path, monkeypatch):
+    import audel.ingest as ing
+    from audel.errors import BusyError
+
+    def inner(*a, **k):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(ing, "_download_inner", inner)
+    with pytest.raises(BusyError):
+        ing._download("https://x/a.wav", tmp_path / "d.wav", "http://127.0.0.1:1", Settings())
+
+
+def test_speech_detection_respects_the_file_deadline(tmp_path):
+    pytest.importorskip("faster_whisper")
+    from audel.signals.vad import speech_regions
+
+    f = tmp_path / "long.flac"
+    _ff("-f", "lavfi", "-i", "anoisesrc=d=600:c=pink:a=0.1", "-ac", "2", f)
+    t0 = time.monotonic()
+    with pytest.raises(UnsafeSourceError):
+        speech_regions(f, Settings(), stream=0, labels=["FL", "FR"],
+                       channel_rms=[-20.0, -20.0], timeout_s=2.0)
+    assert time.monotonic() - t0 < 30

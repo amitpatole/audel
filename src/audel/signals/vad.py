@@ -24,7 +24,7 @@ from ..mediaguard import decode_to_wav
 
 _log = get_logger("vad")
 _SR = 16000
-_CHUNK_S = 600            # VAD in 10-minute chunks (bounded memory on a 3 h programme)
+_CHUNK_S = 60             # VAD in 1-minute chunks: bounded memory even for 24 channels
 
 
 def speech_regions(path: Path, settings: Settings, *, stream: int = 0,
@@ -64,10 +64,13 @@ def _channels_to_hear(labels: list[str], rms: list[float | None]) -> list[int] |
 
 def _vad_pass(path: Path, settings: Settings, stream: int, chans: list[int] | None,
               timeout_s: float | None) -> list[tuple[float, float]]:
+    import time
+
     from faster_whisper.vad import VadOptions, get_speech_timestamps
 
-    from ..errors import BusyError, DecodeError
+    from ..errors import BusyError, DecodeError, UnsafeSourceError
 
+    end = time.monotonic() + timeout_s if timeout_s else None
     wav = decode_to_wav(path, settings, sample_rate=_SR, stream=stream, mix="all",
                         timeout_s=timeout_s)
     regions: list[tuple[float, float]] = []
@@ -83,10 +86,15 @@ def _vad_pass(path: Path, settings: Settings, stream: int, chans: list[int] | No
                     break
                 frames = np.frombuffer(raw, dtype="<i2").reshape(-1, n)
                 for c in use:
+                    if end is not None and time.monotonic() > end:
+                        # In-process inference has no ffmpeg timeout: check the file's budget.
+                        raise UnsafeSourceError("analysis exceeded the per-file time budget")
                     audio = frames[:, c].astype(np.float32) / 32768.0
                     for ts in get_speech_timestamps(audio, vad_options=opts, sampling_rate=_SR):
                         regions.append((offset + ts["start"] / _SR, offset + ts["end"] / _SR))
                 offset += frames.shape[0] / _SR
+    except UnsafeSourceError:
+        raise
     except (OSError, MemoryError) as e:  # the host (fds, memory), not the media
         raise BusyError("speech detection could not run: the host is at capacity") from e
     except RuntimeError as e:

@@ -113,9 +113,19 @@ def _download(url: str, dest: Path, proxy_url: str, settings: Settings,
               stop: threading.Event | None = None) -> int:
     try:
         return _download_inner(url, dest, proxy_url, settings, stop)
-    except BaseException:
+    except OSError as e:
         dest.unlink(missing_ok=True)  # the thread removes what IT created, however it ends
+        if e.errno in _HOST_ERRNOS:  # out of fds / memory / disk here: retry, not a bad source
+            raise BusyError("could not download: the host is at capacity; retry later") from None
         raise
+    except BaseException:
+        dest.unlink(missing_ok=True)
+        raise
+
+
+_HOST_ERRNOS = frozenset(getattr(__import__("errno"), n) for n in
+                         ("EMFILE", "ENFILE", "ENOSPC", "ENOMEM", "EDQUOT")
+                         if hasattr(__import__("errno"), n))
 
 
 def _download_inner(url: str, dest: Path, proxy_url: str, settings: Settings,

@@ -455,9 +455,13 @@ def build_app(settings: Settings | None = None):
                              gs: Settings, principal: Principal, request_id: str,
                              job_id: str | None = None, as_handoff: bool = False) -> dict:
         t0 = time.monotonic()
-        digest, size = await asyncio.to_thread(_sha256, path)
+        digest = size = None
         status, verdict, n_issues, err = "ok", None, None, None
         try:
+            try:
+                digest, size = await asyncio.to_thread(_sha256, path)
+            except (OSError, MemoryError, RuntimeError) as e:
+                raise BusyError("Server busy; retry later.") from e
             report = await _shielded(lambda: _grade(kind, path, p, gs),
                                      settings.request_timeout_s, principal.tenant)
             verdict, n_issues = report.verdict.value, len(report.issues)
