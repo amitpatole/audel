@@ -3848,3 +3848,46 @@ def test_antiphase_across_a_quad_rear_pair_is_still_heard(tmp_path):
     a = _render_sync(str(ctl), Settings(), "netflix").measurements.tracks[0].dialogue_lufs
     b = _render_sync(str(atk), Settings(), "netflix").measurements.tracks[0].dialogue_lufs
     assert a is not None and b is not None and abs(a - b) < 1.0, (a, b)
+
+
+# ==== round 15, auth surface ==================================================================
+
+@pytest.mark.parametrize("text", [
+    "İ password=hunter2XYZ", 'İzmir "password": "x y"', "İ [('x-api-key','abc123')]",
+    "token:abc;password:hunterxyz", "credential:none,secret:topsecret",
+    "signature:ok;api_key:hunterxyz", "[(b'x-amz-security-token', b'SECRETX')]",
+    "[('x-auth-token', 'SECRETX')]", "[('x-goog-api-key', 'SECRETX')]",
+    "[(b'proxy-authorization', b'Basic SECRETX')]",
+    "[('username', 'bob'), ('password', 'hunter2')]", "[(b'api_key', b'zz9sss')]",
+    "key " * 130 + "password='a b SECRETX'", "key " * 130 + "[(b'x-api-key', b'SECRETX')]",
+    "key " * 130 + "cookie: session=abcSECRETX"])
+def test_round15_redaction_gaps_are_closed(text):
+    from audel.logging import scrub_text
+
+    out = scrub_text(text)
+    for secret in ("hunter", "SECRETX", "topsecret", "abc123", "zz9sss", "x y"):
+        assert secret not in out, out
+
+
+def test_double_encoded_json_credentials_are_redacted():
+    import json as _json
+
+    from audel.logging import scrub_text
+
+    for key in ("password", "api_key", "client_secret"):
+        text = _json.dumps({"cfg": _json.dumps({key: "hunter2"})})
+        assert "hunter2" not in scrub_text(text)
+
+
+def test_turkish_text_does_not_desync_redaction_in_workspace_state(tmp_path):
+    import json as _json
+
+    from audel.workspace import Workspace
+
+    ws = Workspace(Settings(cache_dir=tmp_path / "ws"))
+    sess = ws.new_session() if hasattr(ws, "new_session") else None
+    from audel.logging import scrub_text
+
+    payload = _json.dumps({"summary": "İzmir promo spot", "notes": "client_secret=hunter2XYZ"})
+    assert "hunter2XYZ" not in scrub_text(payload)
+    del sess

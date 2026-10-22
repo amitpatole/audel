@@ -121,6 +121,15 @@ All notable changes to Audel are recorded here. The format follows
     at most 2 fetches, in a pool of 8.
   - **Low-Medium.** Work abandoned while waiting on its tenant share still ran later. Abandonment now
     propagates through both waits.
+- Red-team round 15 fixes (auth surface), each pinned by a regression test. No bypass,
+  escalation or leak was found, and an origin can't set the proxy's busy flag.
+  - **Low-Medium.** A Turkish dotted capital I (`İ`) anywhere before a credential shifted every
+    keyword position, because it lower-cases to two characters, so keyword redaction stopped for
+    the rest of the field. Positions are now found on a same-length fold.
+  - **Low.** Several key/value forms are redacted again: a strong key right after weak-key prose
+    (`token:abc;password:...`), header and key tuples such as `('x-amz-security-token', ...)` or
+    `('password', ...)`, short quoted values, quoted and tuple values past the keyword budget, and
+    credentials inside JSON that was serialised twice.
 - Red-team round 14 fixes (channel layouts), each pinned by a regression test. 227 files grade
   unchanged under both specs.
   - **Medium-High.** Speech detection decoded with a plain channel count, which makes ffmpeg remix

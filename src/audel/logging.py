@@ -46,15 +46,22 @@ _KV = re.compile(
 # all: ``"password": "correct horse"``, ``{'password': b'x'}``, ``('x-api-key', 'abc')``.
 _KVQ = re.compile(
     _KEY_START + r"((?:" + _KEYS + r"|authorization|cookie|set-cookie)[\"'`]?+[ \t]*+[:=][ \t]*+b?([\"'`]))"
-    r"((?:[^\"'`\n\\]|\\.|(?!\2)[\"'`]){4,4096}+)(?=\2)",
+    r"((?:[^\"'`\n\\]|\\.|(?!\2)[\"'`]){1,4096}+)(?=\2)",
     re.IGNORECASE)
 _HEADER_KEYS = (r"(?:proxy-)?authorization|set-cookie|cookie|x-api-key|api-key|apikey|x-auth-token"
                 r"|x-amz-security-token|x-goog-api-key|private-token")
 # Header tuples: ``(b'authorization', b'Basic ...')``, ``('x-api-key', 'abc')``. Only in a tuple
 # or list opening, so a bare "pass" in ``['pass', 'warn']`` doesn't redact its neighbour.
+_TUPLE_KEYS = (_HEADER_KEYS + r"|password|passwd|passphrase|secret|client[_-]?secret"
+               r"|api[_-]?key|access[_-]?key|private[_-]?key|auth[_-]?token")
+_TUPLE_HINT_RE = re.compile(r"[\(\[][ \t]*+b?[\"']", re.IGNORECASE)
 _KVT = re.compile(
-    r"([\(\[][ \t]*+b?[\"'](?:" + _HEADER_KEYS + r")[\"'][ \t]*+,"
+    r"([\(\[][ \t]*+b?[\"'](?:" + _TUPLE_KEYS + r")[\"'][ \t]*+,"
     r"[ \t]*+b?([\"']))((?:[^\"'\n\\]|\\.|(?!\2)[\"']){1,4096}+)(?=\2)", re.IGNORECASE)
+# Double-encoded JSON: ``{\"password\": \"hunter2\"}`` inside another JSON string.
+_KVQE = re.compile(
+    _KEY_START + r"(" + _KEYS + r"\\?+[\"']?+[ \t]*+[:=][ \t]*+\\([\"']))"
+    r"([^\"'\\\n]{1,4096}+)(?=\\\2)", re.IGNORECASE)
 _MAX_KEYWORDS = 128   # keyword positions matched with the patterns; beyond, a linear fallback
 _KEY_BACK = 8         # a key starts at most this far before its hint ("client_" + "secret")
 _KV_HINT = ("pass", "pwd", "secret", "key", "credential", "signature", "sig", "token",
@@ -124,7 +131,7 @@ def _jwt_in(run: str, budget: _Budget) -> bool:
         while j > 0 and seg[j - 1] in _TOKCH:   # the maximal token-character tail
             j -= 1
         tail = seg[j:]
-        low_t = tail.lower()
+        low_t = _fold(tail)
         for m in _JWT_ANY.finditer(low_t):
             k = m.start()
             if len(tail) - k < 8:
@@ -195,16 +202,28 @@ def _kv(m: re.Match) -> str:
 
 
 _HINT_RE = re.compile("|".join(_KV_HINT))
+
+
+def _fold(text: str) -> str:
+    """Lower-case with the SAME length as ``text``, so indexes found in it address ``text``.
+    (``"İ".lower()`` is two characters; such a character is kept as it is.)"""
+    low = text.lower()
+    if len(low) == len(text):
+        return low
+    return "".join(c if len(c.lower()) != 1 else c.lower() for c in text)
 _VALUE_END = frozenset(" \t\r\n\"'`&")
 _KEY_FIRST = frozenset("pscaxt([")  # first characters of every key, and of a tuple opening
 
 
-def _scrub_keywords(text: str) -> str:
+def _scrub_keywords(text: str) -> str:  # noqa: C901 - one linear pass, kept together
     """Key/value credentials, in linear time: the patterns run only at keyword positions (found
     with plain substring search), anchored, for the first ``_MAX_KEYWORDS``; any beyond get a
     cheap value-only redaction. Nothing is blanked wholesale, so a flood of keywords can't hide
     the rest of a line (the route of a probing request), nor make matching costly."""
-    low = text.lower()
+    if ("(" in text or "[" in text) and _TUPLE_HINT_RE.search(text):
+        # Header / key tuples anchor on their own bracket: no back-window to fall outside of.
+        text = _KVT.sub(lambda m: m.group(1) + "[REDACTED]", text)
+    low = _fold(text)
     hits: list[int] = []
     for hm in _HINT_RE.finditer(low):  # in order, C-speed; stop just past the pattern budget
         hits.append(hm.start())
@@ -233,9 +252,15 @@ def _scrub_keywords(text: str) -> str:
             if m:
                 span = (m.start(), m.end(), m.group(1) + "[REDACTED]")
                 break
+            m = _KVQE.match(text, i)
+            if m:
+                span = (m.start(), m.end(), m.group(1) + "[REDACTED]")
+                break
             m = _KV.match(text, i)
             if m:
-                span = (m.start(), m.end(), _kv(m))
+                rep = _kv(m)
+                if rep != m.group():  # kept prose doesn't consume: a key after it is still tried
+                    span = (m.start(), m.end(), rep)
                 break
         if span is not None:
             out.append(text[last:span[0]])
@@ -247,7 +272,8 @@ def _scrub_keywords(text: str) -> str:
 
 _FALLBACK = re.compile(
     r"((?:pass|pwd|secret|key|credential|signature|sig|token|authorization|cookie)"
-    r"[A-Za-z_\-]{0,24}+[\"'`]?+[ \t]*+[:=][ \t]*+[\"'`]?+)([^\s\"'`&]{1,4096}+)",
+    r"[A-Za-z_\-]{0,24}+[\"'`]?+[ \t]*+[:=,][ \t]*+b?)"
+    r"(\"[^\"\n]{0,4096}+\"|'[^'\n]{0,4096}+'|[^\s\"'`&]{1,4096}+)",
     re.IGNORECASE)
 
 
