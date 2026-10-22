@@ -140,12 +140,9 @@ def build_app(settings: Settings | None = None):
             # Liveness never reads the body (unauthenticated: must not buffer anything).
             return reply(JSONResponse({"status": "ok", "version": __version__}))
         client = client_key(request.client.host if request.client else None)
-        # A client address that has spent its failed-auth budget is refused WITHOUT evaluating
-        # the credential, so guessing cannot continue. (Behind a proxy, AUDEL_FORWARDED_ALLOW_IPS
-        # gives every real client its own budget.)
-        if auth.required and fail_limiter.blocked(client):
-            return reply(JSONResponse({"detail": "Too many failed attempts."}, status_code=429,
-                                      headers={"Retry-After": "60"}))
+        # Credentials are generated 256-bit secrets or signed JWTs, so guessing is infeasible: a
+        # VALID credential always passes, and only failures are throttled (to cap noise), so an
+        # unauthenticated client cannot lock out users sharing its address.
         # Authenticate BEFORE the body is read: an unauthenticated caller must not be able to
         # make the server read up to max_request_bytes (DoS amplification).
         principal = auth.authenticate(request.headers.get("authorization"))
@@ -678,6 +675,10 @@ def serve(host: str = "127.0.0.1", port: int = 8000) -> None:
     fwd: dict = {"proxy_headers": bool(s.forwarded_allow_ips)}
     if s.forwarded_allow_ips:
         fwd["forwarded_allow_ips"] = ",".join(s.forwarded_allow_ips)
+    from ..logging import scrub_logger
+
+    for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+        scrub_logger(name)
     uvicorn.run(build_app(), host=host, port=port, **tls, **fwd)
 
 

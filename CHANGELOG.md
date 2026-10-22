@@ -95,6 +95,18 @@ All notable changes to Audel are recorded here. The format follows
   - **Deploy.** Helm ingress defaults to the same namespace, DNS egress goes to kube-dns only,
     token, JWKS and TLS mounts are supported, and the default is one replica. The Dockerfile base
     is pinned by digest, and GitHub Actions are pinned to commit SHAs.
+- Red-team round 3 fixes (auth surface), each pinned by a regression test:
+  - **Medium.** Round 2's pre-authentication lockout let one unauthenticated client lock out valid
+    users sharing its address. Credentials must now be generated: a shared token must match
+    `openssl rand -hex 32` or `audel token new` output, and patterned strings are refused. Valid
+    credentials always pass, and only failures are throttled. The Helm chart gains a
+    `forwardedAllowIps` value.
+  - **Low.** The OG-image workflow is now split. Third-party code renders with a read-only token,
+    and a separate job commits with hooks disabled.
+  - **Low.** The scrubber redacts overlapping secrets longest-first, catches base64 bearer tokens,
+    and covers uvicorn's loggers. Settings `repr` hides secrets.
+  - **Info.** `canonical_host` normalizes short and hex IPv4 forms, IDNA names and IPv6 zone ids.
+  - **Info.** Helm booleans passed as strings can't dodge the TLS rules.
 - Red-team round 2 fixes (auth surface), each pinned by a regression test:
   - **Medium.** A throttled address still had every guess evaluated, so the right token got 200.
     A throttled address is now refused (429) before its credential is evaluated. Shared tokens

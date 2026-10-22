@@ -4,10 +4,10 @@
 {{- if and .Values.auth.jwt.jwksConfigMap (not (and .Values.auth.jwt.issuer .Values.auth.jwt.audience)) }}
 {{- fail "auth.jwt.issuer and auth.jwt.audience are required with a JWKS" }}
 {{- end }}
-{{- if and .Values.tls.mutual (not .Values.tls.secretName) }}
+{{- if and (eq (toString .Values.tls.mutual) "true") (not .Values.tls.secretName) }}
 {{- fail "tls.mutual needs tls.secretName (a server certificate); refusing to render a plaintext deployment" }}
 {{- end }}
-{{- if and (has .Values.service.type (list "LoadBalancer" "NodePort")) (not .Values.tls.secretName) (not .Values.service.allowPlaintext) }}
+{{- if and (has .Values.service.type (list "LoadBalancer" "NodePort")) (not .Values.tls.secretName) (ne (toString .Values.service.allowPlaintext) "true") }}
 {{- fail "service.type exposes Audel outside the cluster without TLS: set tls.secretName (or service.allowPlaintext=true behind your own TLS)" }}
 {{- end }}
 {{- $scheme := ternary "HTTPS" "HTTP" (ne .Values.tls.secretName "") }}
@@ -55,13 +55,16 @@ spec:
             - {name: AUDEL_JWT_ISSUER, value: {{ .Values.auth.jwt.issuer | quote }}}
             - {name: AUDEL_JWT_AUDIENCE, value: {{ .Values.auth.jwt.audience | quote }}}
             {{- end }}
+            {{- with .Values.forwardedAllowIps }}
+            - {name: AUDEL_FORWARDED_ALLOW_IPS, value: {{ toJson . | quote }}}
+            {{- end }}
             {{- with .Values.auth.adminTenants }}
             - {name: AUDEL_ADMIN_TENANTS, value: {{ toJson . | quote }}}
             {{- end }}
             {{- if .Values.tls.secretName }}
             - {name: AUDEL_TLS_CERTFILE, value: /etc/audel/tls/tls.crt}
             - {name: AUDEL_TLS_KEYFILE, value: /etc/audel/tls/tls.key}
-            {{- if .Values.tls.mutual }}
+            {{- if eq (toString .Values.tls.mutual) "true" }}
             - {name: AUDEL_TLS_CLIENT_CA, value: /etc/audel/tls/ca.crt}
             {{- end }}
             {{- end }}
@@ -69,7 +72,7 @@ spec:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities: {drop: ["ALL"]}
-          {{- if .Values.tls.mutual }}
+          {{- if eq (toString .Values.tls.mutual) "true" }}
           # mTLS rejects probes without a client certificate: check the port instead.
           readinessProbe:
             tcpSocket: {port: http}

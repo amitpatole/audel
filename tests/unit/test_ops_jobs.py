@@ -20,7 +20,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from audel.adapters.rest import build_app  # noqa: E402
 
-TOKEN = "t0ken-for-tests-123456-padded-to-32-chars"
+TOKEN = "4ff70d20d90b8a5d20f68be638b41178509c5aa2d11dff85dc8bff1771a037fb"
 AUTH = {"authorization": f"Bearer {TOKEN}"}
 
 

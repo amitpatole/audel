@@ -135,15 +135,14 @@ def token_new(tenant: str = typer.Option(..., help="Tenant name ([A-Za-z0-9._-],
               rate_per_min: int = typer.Option(None, help="Optional per-tenant rate limit.")) -> None:
     """Mint a token. Prints the token ONCE plus the hash entry for AUDEL_API_TOKENS_FILE."""
     import json as _json
-    import secrets
 
-    from ..auth import token_hash, valid_tenant
+    from ..auth import new_token, token_hash, valid_tenant
 
     if not valid_tenant(tenant) or tenant.lower() in ("default", "anonymous", "admin"):
         raise typer.BadParameter("tenant must be 1-64 chars of [A-Za-z0-9._-] and not reserved")
     if rate_per_min is not None and rate_per_min < 1:
         raise typer.BadParameter("--rate-per-min must be at least 1")
-    tok = secrets.token_urlsafe(32)
+    tok = new_token()
     entry: dict = {"sha256": token_hash(tok)}
     if rate_per_min is not None:
         entry["rate_per_min"] = rate_per_min

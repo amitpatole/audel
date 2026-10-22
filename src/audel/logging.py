@@ -13,7 +13,7 @@ import re
 
 _SECRET_RE = re.compile(
     r"(sk-[A-Za-z0-9_\-]{8,}|AIza[A-Za-z0-9_\-]{8,}"
-    r"|[Bb]earer\s+[A-Za-z0-9._\-]{8,}"
+    r"|[Bb]earer\s+[A-Za-z0-9._~+/=\-]{8,}"
     r"|(?:api[_-]?key|token|secret|password)[\"'`:=\s]+[A-Za-z0-9._\-]{6,})",
     re.IGNORECASE,
 )
@@ -38,7 +38,8 @@ def scrub_text(text: str) -> str:
     Value-based redaction is sound (config registers every key it resolves); the regex is a
     backstop. Used by the workspace so a credential can never reach disk via persisted session
     state, and by the log filter below."""
-    for secret in _KNOWN_SECRETS:
+    # Longest first: a secret containing a shorter registered secret must be redacted whole.
+    for secret in sorted(_KNOWN_SECRETS, key=len, reverse=True):
         if secret in text:
             text = text.replace(secret, "[REDACTED]")
     if _SECRET_RE.search(text):
@@ -79,3 +80,14 @@ def get_logger(name: str | None = None) -> logging.Logger:
     if name:
         return base.getChild(name)
     return base
+
+
+def scrub_logger(name: str) -> None:
+    """Attach the secret scrubber to another library's logger (e.g. uvicorn's), whose handlers
+    would otherwise print exception text unfiltered."""
+    lg = logging.getLogger(name)
+    if not any(isinstance(f, _SecretScrubber) for f in lg.filters):
+        lg.addFilter(_SecretScrubber())
+    for h in lg.handlers:
+        if not any(isinstance(f, _SecretScrubber) for f in h.filters):
+            h.addFilter(_SecretScrubber())

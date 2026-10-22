@@ -22,9 +22,10 @@ Credential sources, tried in this order:
 
 Rate limits are token buckets per tenant (``AUDEL_RATE_LIMIT_PER_MIN``, per-tenant override in
 the tokens file) and, for failed authentication, per client address
-(``AUDEL_AUTH_FAIL_PER_MIN``). Once an address spends its failure budget its requests are
-refused with 429 WITHOUT evaluating the credential, so guessing cannot continue at line rate.
-Behind a reverse proxy set ``AUDEL_FORWARDED_ALLOW_IPS`` so each real client has its own budget.
+(``AUDEL_AUTH_FAIL_PER_MIN``). Every credential is a generated secret of 256 bits (tokens) or a
+signature (JWT), so online guessing is infeasible; the failure throttle exists to cap noise and
+cost from invalid attempts, and a VALID credential always passes it (so one unauthenticated client
+cannot lock out users who share its address).
 """
 
 from __future__ import annotations
@@ -70,17 +71,47 @@ def valid_tenant(name: str) -> bool:
     return bool(_TENANT_RE.match(name or ""))
 
 
-def strong_token(token: str) -> bool:
-    """Length AND estimated entropy (Shannon bits/char x length >= 128): rejects "a"*32 and
-    dictionary passphrases padded to length."""
-    import math
-    from collections import Counter
+_ROWS = ("qwertyuiop", "asdfghjkl", "zxcvbnm", "1234567890", "0123456789abcdef")
 
-    if len(token) < _MIN_SHARED_TOKEN:
+
+def _walks(t: str, n: int = 5) -> bool:
+    """True if ``t`` contains an ASCII-sequential or keyboard-row run of ``n`` characters."""
+    low = t.lower()
+    for i in range(len(low) - n + 1):
+        chunk = low[i:i + n]
+        steps = {ord(chunk[k + 1]) - ord(chunk[k]) for k in range(n - 1)}
+        if steps in ({1}, {-1}):
+            return True
+        if any(chunk in row or chunk in row[::-1] for row in _ROWS):
+            return True
+    return False
+
+
+def strong_token(token: str) -> bool:
+    """A shared token must look like GENERATOR output, not something a person typed:
+    64+ hex characters (``openssl rand -hex 32``) or 43+ URL-safe characters
+    (``audel token new`` / ``secrets.token_urlsafe(32)``), not compressible like a repeat, and
+    with no 5-character sequential or keyboard-row walk. Online guessing is then infeasible,
+    which is what lets valid credentials always pass the failure throttle."""
+    import re
+    import zlib
+
+    if not (re.fullmatch(r"[0-9a-fA-F]{64,512}", token)
+            or re.fullmatch(r"[A-Za-z0-9_-]{43,512}", token)):
         return False
-    counts = Counter(token)
-    bits_per_char = -sum(c / len(token) * math.log2(c / len(token)) for c in counts.values())
-    return bits_per_char * len(token) >= 128 and len(counts) >= 12
+    if len(zlib.compress(token.encode(), 9)) / len(token) < 0.8:
+        return False
+    return not _walks(token)
+
+
+def new_token() -> str:
+    """A fresh 256-bit URL-safe token that passes :func:`strong_token`."""
+    import secrets
+
+    while True:
+        t = secrets.token_urlsafe(32)
+        if strong_token(t):
+            return t
 
 
 def token_hash(token: str) -> str:
@@ -191,8 +222,8 @@ class Authenticator:
     def __init__(self, settings: Settings) -> None:
         self._s = settings
         if settings.api_token is not None and not strong_token(settings.api_token):
-            raise ConfigError(f"AUDEL_API_TOKEN must be at least {_MIN_SHARED_TOKEN} characters of "
-                              "random data (about 128 bits); generate one with: openssl rand -hex 32")
+            raise ConfigError("AUDEL_API_TOKEN must be generated, not chosen: use "
+                              "`openssl rand -hex 32` or `audel token new`")
         self._tenants = load_tenants(settings.api_tokens_file) if settings.api_tokens_file else {}
         self._jwt = _JWTVerifier(settings) if settings.jwt_jwks_file else None
 

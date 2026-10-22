@@ -81,9 +81,9 @@ class Settings(BaseSettings):
     gemini_audio_model: str = DEFAULT_MODELS["gemini_audio"]
 
     # Provider credentials (conventional names; never logged/persisted)
-    ollama_api_key: str | None = Field(default=None, validation_alias="OLLAMA_API_KEY")
-    anthropic_api_key: str | None = Field(default=None, validation_alias="ANTHROPIC_API_KEY")
-    google_api_key: str | None = Field(default=None, validation_alias="GOOGLE_API_KEY")
+    ollama_api_key: str | None = Field(default=None, validation_alias="OLLAMA_API_KEY", repr=False)
+    anthropic_api_key: str | None = Field(default=None, validation_alias="ANTHROPIC_API_KEY", repr=False)
+    google_api_key: str | None = Field(default=None, validation_alias="GOOGLE_API_KEY", repr=False)
 
     # Admin-only diagnostics (/doctor, /metrics) when auth is on: these tenants (plus the shared
     # AUDEL_API_TOKEN principal) may read them; everyone else gets 404.
@@ -165,7 +165,7 @@ class Settings(BaseSettings):
     proxy_idle_timeout_s: float = 30.0
 
     # HTTP service (REST): bind + auth + DoS bounds (Phase 6, extended Phase 12)
-    api_token: str | None = Field(default=None, validation_alias="AUDEL_API_TOKEN")
+    api_token: str | None = Field(default=None, validation_alias="AUDEL_API_TOKEN", repr=False)
     api_tokens_file: Path | None = None   # per-tenant SHA-256 token hashes (audel token new)
     jwt_jwks_file: Path | None = None     # local JWKS; no IdP fetch at request time
     jwt_issuer: str | None = None

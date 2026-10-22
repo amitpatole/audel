@@ -38,14 +38,15 @@ export AUDEL_API_TOKENS_FILE=/etc/audel/tokens.json
 export AUDEL_ADMIN_TENANTS='["ops"]'         # who may read /doctor and /metrics
 ```
 
-A shared `AUDEL_API_TOKEN` must be at least 32 characters. For OIDC, set `AUDEL_JWT_JWKS_FILE`,
+A shared `AUDEL_API_TOKEN` must be generated (`openssl rand -hex 32` or `audel token new`).
+Patterned or hand-typed strings are refused at startup. For OIDC, set `AUDEL_JWT_JWKS_FILE`,
 `AUDEL_JWT_ISSUER` and `AUDEL_JWT_AUDIENCE`, and keep the JWKS file synced from your identity
 provider. JWT tenants appear as `jwt:<claim>`.
 
-!!! warning "Behind a reverse proxy or load balancer"
-    List the proxy in `AUDEL_FORWARDED_ALLOW_IPS`. Failed authentication is throttled per client
-    address, and once an address is throttled even valid tokens from it get 429 until it cools
-    down. Without the setting, every client shares the proxy's address and its budget.
+!!! note "Behind a reverse proxy or load balancer"
+    List the proxy in `AUDEL_FORWARDED_ALLOW_IPS`, or in the Helm value `forwardedAllowIps`.
+    Failed authentication is throttled per client address. Without the setting, every client
+    shares the proxy's address and one failure budget. Valid credentials always pass either way.
 
 ## Async jobs
 

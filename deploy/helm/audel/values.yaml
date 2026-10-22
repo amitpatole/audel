@@ -17,6 +17,10 @@ auth:
     audience: ""
   adminTenants: []          # tenants allowed to read /doctor and /metrics
 
+# Addresses of the ingress / load balancer in front of Audel (pod CIDR or IPs). Set it so
+# per-client failed-auth throttling sees real client addresses instead of the proxy's.
+forwardedAllowIps: []
+
 tls:
   secretName: ""            # kubernetes.io/tls Secret (tls.crt, tls.key); add ca.crt for mTLS
   mutual: false

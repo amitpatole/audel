@@ -154,21 +154,26 @@ def _always_blocked(addr: str) -> bool:
 
 
 def canonical_host(host: str | None) -> str:
-    """One spelling per host: lower-case, no trailing dot, IPs normalized (IPv4-mapped IPv6,
-    decimal / octal / hex IPv4 forms) so allow/deny lists can't be dodged by re-spelling."""
+    """One spelling per host: lower-case, no trailing dot, no IPv6 zone id, IDNA (punycode)
+    names, and IPs normalized (IPv4-mapped IPv6; decimal / octal / hex / short IPv4 forms) so
+    allow/deny lists can't be dodged by re-spelling."""
+    import re
+
     h = (host or "").strip().lower().rstrip(".").strip("[]")
+    h = h.split("%", 1)[0]  # drop an IPv6 zone id
     try:
-        ip = _normalize(ipaddress.ip_address(h))
-        return str(ip)
+        return str(_normalize(ipaddress.ip_address(h)))
     except ValueError:
         pass
+    if h and re.fullmatch(r"[0-9a-fx.]+", h):
+        try:
+            return str(ipaddress.IPv4Address(socket.inet_aton(h)))
+        except OSError:
+            pass
     try:
-        packed = socket.inet_aton(h)  # accepts 134744072, 0x08080808, 010.010.010.010 ...
-        if h and not any(c.isalpha() for c in h.replace("0x", "")):
-            return str(ipaddress.IPv4Address(packed))
-    except OSError:
-        pass
-    return h
+        return h.encode("idna").decode("ascii") if h else h
+    except UnicodeError:
+        return h
 
 
 def assert_backend_url(url: str, trusted_hosts: list[str] | tuple[str, ...] = (),
