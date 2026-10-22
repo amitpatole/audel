@@ -121,6 +121,18 @@ All notable changes to Audel are recorded here. The format follows
     at most 2 fetches, in a pool of 8.
   - **Low-Medium.** Work abandoned while waiting on its tenant share still ran later. Abandonment now
     propagates through both waits.
+- Red-team round 17 fixes (auth surface), each pinned by a regression test. No auth bypass or
+  escalation was found.
+  - **Low-Medium.** Key/value pair redaction in logs tried every key name at every bracket, so
+    floods of crafted brackets in an unauthenticated request line cost several times more to log.
+    Pairs are now matched by one bounded pattern and the key name is tested once; keyword scans
+    try only word and sub-word starts. Worst-case flood cost is back near the benign level.
+  - **Low.** Pairs wrapped across lines (pprint output), pairs with a trailing comma or a third
+    item, argv-style flags (`--password value`), `('auth', ...)` / `('sig', ...)` pairs, and
+    double- or triple-encoded JSON values containing raw non-ASCII characters are now redacted.
+  - **Low.** Session ids, cookies and `auth` in prose are redacted only when the value looks like a
+    credential, so `session_id: 42`, `cookie: none`, `auth: required` and JSON `null`/`false`
+    values are kept and JSON structure is no longer broken.
 - Red-team round 16 fixes (multichannel mono mix), each pinned by a regression test. The 416-entry
   battery is unchanged apart from the fixes below.
   - **Medium.** The round-15 index mix was used everywhere a single channel is analysed, and a

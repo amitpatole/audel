@@ -4059,3 +4059,67 @@ def test_inverted_left_right_is_caught_in_any_channel_order(tmp_path, order):
     del n
     checks = {i.detail.get("check") for i in asyncio.run(check(str(f))).issues}
     assert "polarity_inversion" in checks, checks
+
+
+# ==== round 17, auth surface ==================================================================
+
+def test_pprint_wrapped_and_loose_pairs_are_redacted():
+    import pprint
+
+    from audel.logging import scrub_text
+
+    c = "CANARYq9Z"
+    for text in (pprint.pformat(sorted({"DB_PASSWORD": c + "x" * 70, "PATH": "/usr/bin"}.items())),
+                 f"('password', 'zQ7{c}',)", f"['password', 'zQ7{c}', ]",
+                 f"('password', 'zQ7{c}', 'x')", f"['psql', '--password', '{c}', '-h', 'db']",
+                 f"('auth', '{c}')", f"('sig', '{c}x1')"):
+        assert c not in scrub_text(text), text
+
+
+@pytest.mark.parametrize("value", ["é", "😀", "\n"])
+def test_double_encoded_with_raw_unicode_is_redacted(value):
+    import json as _json
+
+    from audel.logging import scrub_text
+
+    text = _json.dumps(_json.dumps({"password": value + "CANARYq9Z"}, ensure_ascii=False))
+    assert "CANARYq9Z" not in scrub_text(text)
+
+
+def test_triple_encoded_json_is_redacted():
+    import json as _json
+
+    from audel.logging import scrub_text
+
+    assert "CANARYq9Z" not in scrub_text(_json.dumps(_json.dumps(_json.dumps(
+        {"password": "CANARYq9Z"}))))
+
+
+@pytest.mark.parametrize("text", ["auth: required", "AUDEL auth: tenant t0 status=401",
+                                  "cookie: none", "session_id: 42", '{"session_id": 42}',
+                                  '{"auth": null, "x": 1}', "has_secret_key: false"])
+def test_ids_literals_and_auth_prose_are_kept(text):
+    from audel.logging import scrub_text
+
+    assert scrub_text(text) == text
+
+
+def test_sub_word_keys_are_found():
+    from audel.logging import scrub_text
+
+    for text in ("aws_secret_access_key=abcd1234", "myApiKey=abc123", "JWT_SECRET_KEY=abc"):
+        assert scrub_text(text).endswith("[REDACTED]"), text
+
+
+@pytest.mark.parametrize("unit", ["('apikey',  b", "('session_id', '", "secret[b'", "auth ",
+                                  "('a','b'), "])
+def test_pair_and_keyword_floods_stay_bounded(unit):
+    from audel.logging import scrub_text
+
+    text = unit * (7900 // len(unit))
+    best = 9.0
+    for _ in range(5):
+        t0 = time.process_time()
+        scrub_text(text)
+        best = min(best, time.process_time() - t0)
+    assert best < 0.015, best
