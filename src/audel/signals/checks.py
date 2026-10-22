@@ -52,6 +52,12 @@ def _full_span(dur_s: float) -> Span:
     return Span(start_ms=0, end_ms=_ms(dur_s))
 
 
+def _track_span(tm, dur_s: float) -> Span:
+    """The track's own extent on the programme timeline (never past the programme's end)."""
+    end = tm.end_s if tm.decoded_s > 0 else dur_s
+    return Span(start_ms=_ms(min(tm.stream.start_s, end)), end_ms=_ms(max(end, tm.stream.start_s)))
+
+
 def _span(start_s: float, end_s: float, dur_s: float) -> Span:
     if end_s < 0:
         end_s = dur_s
@@ -83,11 +89,17 @@ def _track_label(tm: TrackMeasurements, multi: bool) -> str:
 
 def _issue(kind, sev, msg, span, check, tm, *, conf=Confidence.HIGH, programme=False,
            **detail) -> Issue:
-    """``span`` is track-relative unless ``programme``: shift it onto the programme timeline by
-    the track's start, so every finding is reported at programme time."""
-    off = 0 if programme else _ms(tm.stream.start_s)
-    if off and span is not None:
-        span = Span(start_ms=span.start_ms + off, end_ms=span.end_ms + off)
+    """``span`` (and any ``spans_ms``) are in the track's DECODED time unless ``programme``: map
+    them onto the programme timeline (track start, plus every missing-packet gap before them),
+    so every finding is reported at programme time."""
+    if not programme:
+        def _p(ms: int) -> int:
+            return _ms(tm.to_programme(ms / 1000.0))
+
+        if span is not None:
+            span = Span(start_ms=_p(span.start_ms), end_ms=_p(span.end_ms))
+        if isinstance(detail.get("spans_ms"), list):
+            detail["spans_ms"] = [[_p(a), _p(b)] for a, b in detail["spans_ms"]]
     return Issue.make(kind, sev, msg, span=span, source=IssueSource.DSP, confidence=conf,
                       detail={"check": check, "stream": tm.stream.index, **detail})
 
@@ -301,20 +313,21 @@ def evaluate(m: Measurements, settings: Settings, spec: DeliverySpec | str | Non
             detail={"check": "duration_mismatch", "declared_s": round(m.declared_s, 3),
                     "decoded_s": round(dur, 3)}))
     live = [t for t in m.tracks if not t.failed]
-    longest = max((t.stream.start_s + t.decoded_s for t in live), default=0.0)
+    longest = max((t.end_s for t in live), default=0.0)
     for tm in m.tracks:
         label = _track_label(tm, multi)
         if tm.failed:
             issues.append(_issue(IssueKind.DECODE_ERROR, Severity.CRITICAL,
                                  f"{label}track could not be decoded: {tm.failed}",
-                                 _full_span(dur), "track_decode_error", tm))
+                                 _full_span(dur), "track_decode_error", tm, programme=True))
             continue
         if tm.decode_errors:
             issues.append(_issue(
                 IssueKind.DROPOUT, Severity.ERROR if tm.decode_errors >= 10 else Severity.WARNING,
                 f"{label}the decoder reported {tm.decode_errors} problem(s) with the data "
-                "(corrupt or missing packets); audio may be missing", _full_span(dur),
-                "decode_errors", tm, conf=Confidence.MEDIUM, errors=tm.decode_errors))
+                "(corrupt or missing packets); audio may be missing", _track_span(tm, dur),
+                "decode_errors", tm, conf=Confidence.MEDIUM, programme=True,
+                errors=tm.decode_errors))
         for a, b in tm.gaps[:_MAX_SPANS]:
             issues.append(_issue(
                 IssueKind.DROPOUT, Severity.WARNING,
@@ -325,9 +338,9 @@ def evaluate(m: Measurements, settings: Settings, spec: DeliverySpec | str | Non
             issues.append(_issue(
                 IssueKind.OTHER, Severity.WARNING,
                 f"{label}the packet timeline could not be checked in full (missing-packet "
-                "detection incomplete)", _full_span(dur), "gap_scan_incomplete", tm,
+                "detection incomplete)", _track_span(tm, dur), "gap_scan_incomplete", tm,
                 conf=Confidence.LOW, programme=True))
-        start, end = tm.stream.start_s, tm.stream.start_s + tm.decoded_s
+        start, end = tm.stream.start_s, tm.end_s
         tol = max(1.0, 0.02 * longest)
         if multi and longest > 0 and tm.decoded_s > 0 and (start > tol or end < longest - tol):
             missing = [(0.0, start)] if start > tol else []
@@ -344,8 +357,8 @@ def evaluate(m: Measurements, settings: Settings, spec: DeliverySpec | str | Non
             # No samples were measured at all: report it once instead of trusting the meters'
             # placeholder values (an empty stream otherwise reads as 0 dBTP "clipping").
             issues.append(_issue(IssueKind.SILENCE, Severity.CRITICAL,
-                                 f"{label}the audio stream contains no samples", _full_span(dur),
-                                 "empty_stream", tm))
+                                 f"{label}the audio stream contains no samples",
+                                 _track_span(tm, dur), "empty_stream", tm, programme=True))
             continue
         tdur = tm.decoded_s if tm.decoded_s > 0 else dur  # each track on its own decoded length
         found, dead = _silence(tm, tdur, settings, label)

@@ -121,6 +121,23 @@ All notable changes to Audel are recorded here. The format follows
     at most 2 fetches, in a pool of 8.
   - **Low-Medium.** Work abandoned while waiting on its tenant share still ran later. Abandonment now
     propagates through both waits.
+- Red-team round 7 fixes (decode and timeline accuracy), each pinned by a regression test. The 69
+  legitimate and edge-case files still grade with no false integrity findings.
+  - **Medium.** Streamed WAVs from GStreamer and arecord use other "unknown length" placeholders
+    and got a false truncation FAIL. Any placeholder size is now treated as unknown.
+  - **Medium.** Audio starting more than about 5 s into an MKV or TS file got the wrong start
+    time, which shifted every finding and hid or invented truncations. Each track now starts at its
+    first packet.
+  - **Low-Medium.** Truncated BW64, AIFF and CAF files are now caught (`container_truncated`).
+  - **Low-Medium.** The missing-packet scan streams the packet list, so long files are read in full
+    with flat memory. It handles packets without a duration (TrueHD in MKV) and timestamps that
+    jump backwards, and it runs alongside the decode passes inside the per-file budget.
+  - **Low-Medium.** Findings after a missing-packet gap were reported early by the gap's length.
+    They are now mapped onto the programme timeline past the gap.
+  - **Low.** Short clips with two packets no longer get a false gap. Lists of spans move with
+    their track. Video running longer than the audio is no longer a duration mismatch, and for
+    MPEG-TS the packets are the declaration. Whole-track spans stay inside the programme. The header
+    walk is bounded by chunk count and the reported shortfall is clamped.
 - Red-team round 7 fixes (network surface), each pinned by a regression test. A leak stress and
   a 20,000-task cancellation fuzz returned every counter to baseline.
   - **Low.** `/render` audited refused or failed requests as `ok` and left out the input digest.

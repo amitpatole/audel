@@ -1762,7 +1762,7 @@ def test_one_undecodable_track_does_not_discard_the_others(tmp_path, monkeypatch
     _ff("-i", a, "-i", a, "-map", "0:a", "-map", "1:a", "-c:a", "pcm_s16le", mkv)
     real = ms.measure_track
 
-    def flaky(path, st, settings, dur_s=0.0, deadline=None, **kw):
+    def flaky(path, st, settings, dur_s=0.0, deadline=None, **kw):  # noqa: D401
         if st.index == 1:
             raise DecodeError("no decoder found")
         return real(path, st, settings, dur_s, deadline, **kw)
@@ -2003,17 +2003,17 @@ def test_incomplete_gap_scan_is_reported_not_assumed_clean(media, monkeypatch):
 
     seen = {}
 
-    def gaps(path, settings, idx, *, origin=0.0, timeout_s=None, **kw):
+    def gaps(path, settings, idx, *, timeout_s=None, **kw):
         seen["timeout"] = timeout_s
-        return None
+        return mg.PacketScan(first_pts=0.0, complete=False)
 
     import audel.mediaguard as mg
 
-    monkeypatch.setattr(mg, "packet_gaps", gaps)
+    monkeypatch.setattr(mg, "scan_packets", gaps)
     del ms
     r = asyncio.run(check(str(media["good"])))
     assert _checks(r, "gap_scan_incomplete")
-    assert seen["timeout"] is not None and seen["timeout"] <= 120.0   # inside the file budget
+    assert seen["timeout"] is not None and seen["timeout"] <= 1000.0  # inside the file budget
 
 
 # ==== round 7, auth surface ===================================================================
@@ -2159,3 +2159,164 @@ def test_service_start_reaps_stale_temp_files(tmp_path):
     os.utime(stale, (old, old))
     build_app(settings=Settings(cache_dir=ws))
     assert not stale.exists() and fresh.exists()
+
+
+# ==== round 7, decode surface =================================================================
+
+def _wav_with_size(tmp_path, name, size_field):
+    import struct
+
+    f = tmp_path / name
+    _ff("-f", "lavfi", "-i", "sine=d=4", f)
+    b = bytearray(f.read_bytes())
+    i = b.index(b"data")
+    b[i + 4:i + 8] = struct.pack("<I", size_field)
+    f.write_bytes(bytes(b))
+    return f
+
+
+@requires_ffmpeg
+@pytest.mark.parametrize("placeholder", [0x7FFF0000, 0x80000000, 0xFFFFFFFF, 0])
+def test_streaming_writer_placeholders_are_not_called_truncated(tmp_path, placeholder):
+    from audel import check
+
+    f = _wav_with_size(tmp_path, "s.wav", placeholder)
+    assert not _checks(asyncio.run(check(str(f))), "container_truncated")
+
+
+@requires_ffmpeg
+@pytest.mark.parametrize("ext", ["mkv", "ts"])
+def test_late_audio_is_timed_from_its_first_packet(tmp_path, ext):
+    from audel import check
+
+    a = tmp_path / "a.wav"
+    _ff("-f", "lavfi", "-i", "sine=f=440:d=10", "-af",
+        "volume=enable='between(t,3,6)':volume=0,afade=t=out:st=9:d=1", a)
+    f = tmp_path / f"late.{ext}"
+    vcodec = ["-c:v", "ffv1"] if ext == "mkv" else ["-c:v", "mpeg2video"]
+    acodec = ["-c:a", "flac"] if ext == "mkv" else ["-c:a", "mp2"]
+    _ff("-f", "lavfi", "-i", "color=c=black:s=64x64:d=18", "-itsoffset", "8", "-i", a,
+        "-map", "0:v", "-map", "1:a", *vcodec, *acodec, f)
+    r = asyncio.run(check(str(f)))
+    assert not _checks(r, "duration_mismatch"), [i.message for i in r.issues]
+    gap = [i for i in _checks(r, "silence_gap") if i.span.end_ms - i.span.start_ms < 5000]
+    assert gap and 10_500 <= gap[0].span.start_ms <= 11_500, [i.span for i in r.issues]
+
+
+@requires_ffmpeg
+@pytest.mark.parametrize("ext", ["aiff", "caf"])
+def test_cut_short_aiff_and_caf_are_caught(tmp_path, ext):
+    from audel import check
+
+    full = tmp_path / f"full.{ext}"
+    _ff("-f", "lavfi", "-i", "sine=d=30", "-af", "volume=0.3", "-ac", "2", "-c:a",
+        "pcm_s16be" if ext == "aiff" else "pcm_s16le", full)
+    cut = tmp_path / f"cut.{ext}"
+    data = full.read_bytes()
+    cut.write_bytes(data[: (len(data) * 2 // 3) // 4 * 4])
+    assert not _checks(asyncio.run(check(str(full))), "container_truncated")
+    bad = _checks(asyncio.run(check(str(cut))), "container_truncated")
+    assert bad and 8 <= bad[0].detail["missing_s"] <= 12
+
+
+def test_bw64_and_many_chunk_wavs_are_walked(tmp_path):
+    import struct
+
+    from audel.mediaguard import container_shortfall_s
+
+    pcm = b"\0" * 48000 * 4 * 10                   # 10 s stereo 16-bit at 48 kHz
+    fmt = struct.pack("<HHIIHH", 1, 2, 48000, 192000, 4, 16)
+    junk = b"".join(b"JUNK" + struct.pack("<I", 8) + b"\0" * 8 for _ in range(200))
+    for magic in (b"RIFF", b"BW64"):
+        body = b"WAVE" + junk + b"fmt " + struct.pack("<I", 16) + fmt + b"data" + \
+            struct.pack("<I", len(pcm)) + pcm[: len(pcm) // 2]
+        f = tmp_path / f"{magic.decode()}.wav"
+        f.write_bytes(magic + struct.pack("<I", len(body)) + body)
+        assert 4.9 <= container_shortfall_s(f, 3600) <= 5.1, magic
+
+
+def test_crafted_declared_length_is_clamped(tmp_path):
+    import struct
+
+    from audel.mediaguard import container_shortfall_s
+
+    ds64 = struct.pack("<QQQI", 0, 1 << 61, 0, 0)
+    fmt = struct.pack("<HHIIHH", 1, 1, 8000, 1, 1, 8)
+    body = b"WAVE" + b"ds64" + struct.pack("<I", len(ds64)) + ds64 + b"fmt " + \
+        struct.pack("<I", 16) + fmt + b"data" + struct.pack("<I", 0xFFFFFFFF) + b"\0" * 100
+    f = tmp_path / "huge.wav"
+    f.write_bytes(b"RF64" + struct.pack("<I", 0xFFFFFFFF) + body)
+    assert container_shortfall_s(f, 3600) <= 3600
+
+
+def _scan(packets):
+    from audel.mediaguard import _GapScanner
+
+    sc = _GapScanner(0.1, 50)
+    for pts, dur in packets:
+        sc.add(pts, dur)
+    return sc.finish()
+
+
+def test_gap_scan_survives_missing_durations_and_backward_jumps():
+    na = [(i / 1200, None) for i in range(1200 * 5) if not (2.0 <= i / 1200 < 2.8)]
+    assert [(round(a, 2), round(b, 2)) for a, b in _scan(na).gaps] == [(2.0, 2.8)]
+    seg = [(1000 + i * 0.024, 0.024) for i in range(400)]
+    back = seg + [(i * 0.024, 0.024) for i in range(400) if not (4 <= i * 0.024 < 5)]
+    gaps = _scan(back).gaps
+    assert len(gaps) == 1 and 0.9 <= gaps[0][1] - gaps[0][0] <= 1.1
+
+
+def test_two_packet_clips_have_no_false_long_packet_gap():
+    assert _scan([(0.0, 1.045), (1.045, 0.455)]).gaps == []
+    assert _scan([(0.0, 0.512), (0.512, 0.188)]).gaps == []
+
+
+@requires_ffmpeg
+def test_findings_after_a_gap_are_on_programme_time(tmp_path):
+    from audel import check
+
+    raw = tmp_path / "r.m4a"
+    _ff("-f", "lavfi", "-i", "sine=f=440:d=12", "-af",
+        "volume=0.3,volume=enable='between(t,8,8.1)':volume=40", "-c:a", "aac", raw)
+    f = tmp_path / "gap.m4a"
+    _ff("-i", raw, "-c", "copy", "-bsf:a", "noise=drop='between(pts*tb,3,5)'", f)
+    r = asyncio.run(check(str(f)))
+    gap, clip = _checks(r, "packet_gap"), _checks(r, "clipping")
+    assert gap and 2_800 <= gap[0].span.start_ms <= 3_200
+    assert clip and 7_700 <= clip[0].span.start_ms <= 8_300, [c.span for c in clip]
+
+
+@requires_ffmpeg
+def test_spans_lists_are_shifted_with_the_track(tmp_path):
+    from audel import check
+
+    a = tmp_path / "a.wav"
+    _ff("-f", "lavfi", "-i", "sine=f=440:d=8", "-af",
+        "volume=enable='between(t,2,2.4)+between(t,4,4.4)':volume=40", a)
+    f = tmp_path / "d.mov"
+    _ff("-f", "lavfi", "-i", "color=c=black:s=64x64:d=11", "-itsoffset", "3", "-i", a,
+        "-map", "0:v", "-map", "1:a", "-c:v", "mpeg4", "-c:a", "pcm_s16le", f)
+    clip = _checks(asyncio.run(check(str(f))), "clipping")
+    assert clip and all(s[0] >= 4_500 for s in clip[0].detail["spans_ms"]), clip[0].detail
+
+
+@requires_ffmpeg
+def test_video_longer_than_audio_is_not_a_duration_mismatch(tmp_path):
+    from audel import check
+
+    f = tmp_path / "v.mp4"
+    _ff("-f", "lavfi", "-i", "color=c=black:s=64x64:d=12", "-f", "lavfi", "-i", "sine=d=10",
+        "-map", "0:v", "-map", "1:a", "-c:v", "mpeg4", "-c:a", "aac", f)
+    assert not _checks(asyncio.run(check(str(f))), "duration_mismatch")
+
+
+def test_whole_track_spans_stay_inside_the_programme():
+    from audel.mediaguard import StreamInfo
+    from audel.signals.checks import _track_span
+    from audel.signals.measure import TrackMeasurements
+
+    tm = TrackMeasurements(stream=StreamInfo(index=0, codec="pcm", sample_rate=48000,
+                                             channels=2, start_s=3.0), decoded_s=7.0)
+    sp = _track_span(tm, 10.0)
+    assert (sp.start_ms, sp.end_ms) == (3000, 10000)

@@ -179,3 +179,13 @@ These figures come from one 4-core laptop grading eight 2-minute stereo programm
 Each grade is single-threaded, so set `AUDEL_MAX_CONCURRENT_JOBS` to the number of cores you give
 the pod. `listen` adds transcription time, which depends on the whisper model and on whether a
 GPU is present.
+
+### Time budget per file
+
+Every file gets one deadline for all of its passes: `AUDEL_DECODE_TIMEOUT_S` plus
+`AUDEL_DECODE_TIMEOUT_PER_CHANNEL_S` for each channel-second the file declares. With the defaults,
+a 70-minute stereo programme gets 540 s. A file that needs longer is refused rather than graded
+partially. Most codecs finish far inside that. Slow lossless formats such as Dolby TrueHD can
+reach it on long programmes, especially on a busy host. If you grade long lossless masters, raise
+`AUDEL_DECODE_TIMEOUT_PER_CHANNEL_S`, for example to `0.1`, and keep
+`AUDEL_MAX_CONCURRENT_JOBS` at your core count.

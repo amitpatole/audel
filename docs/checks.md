@@ -25,7 +25,7 @@ consumers of the contract key on. It also has a precise rule name in `detail.che
 | `empty_stream` | `silence` | an audio stream contains no samples | critical |
 | `packet_gap` | `dropout` | audio packets are missing from the stream's timeline, including a hole stored as one long sample | warning |
 | `gap_scan_incomplete` | `other` | the packet timeline couldn't be read in full, so missing-packet detection is incomplete | warning (low confidence) |
-| `container_truncated` | `truncation` | the file header declares more audio than the file contains (WAV, RF64, W64) | error |
+| `container_truncated` | `truncation` | the file header declares more audio than the file contains (WAV, RF64, BW64, W64, AIFF, CAF) | error |
 | `track_decode_error` | `decode_error` | one audio track can't be decoded (the others are still graded) | critical |
 | `dead_channel` | `channel_issue` | one channel is silent while the track is live (LFE excluded) | error |
 | `polarity_inversion` | `channel_issue` | left and right cancel to silence in a mono fold-down | error |

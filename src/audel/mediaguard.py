@@ -16,7 +16,7 @@ import resource
 import shutil
 import subprocess
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .config import Settings
@@ -134,6 +134,7 @@ class StreamInfo:
     title: str | None = None
     abs_index: int = -1      # the container's stream index (ffmpeg's #0:K)
     start_s: float = 0.0     # where this track starts on the programme timeline
+    declared_end_s: float | None = None  # container time the stream DECLARES it ends (start+duration)
 
     def channel_labels(self) -> list[str]:
         layout = self.layout or _DEFAULT_LAYOUT.get(self.channels, "")
@@ -179,7 +180,8 @@ class MediaInfo:
     has_audio: bool
     streams: tuple[StreamInfo, ...] = ()
     format_start: float | None = None  # container start time (the programme timeline origin)
-    container_shortfall_s: float = 0.0  # header-declared audio missing from the file (WAV/W64)
+    container_shortfall_s: float = 0.0  # header-declared audio missing (WAV/W64/AIFF/CAF)
+    estimated_durations: bool = False   # MPEG-TS/PS: stream durations are bitrate estimates
 
 
 def _tool(name: str, override: str | None = None) -> str:
@@ -384,57 +386,166 @@ def _stream_decode_errors(text: str, abs_index: int) -> int:
 _MAX_PACKET_GAP_S = 60.0
 
 
-def packet_gaps(path: Path, settings: Settings, abs_index: int, *, min_gap_s: float = 0.1,
-                limit: int = 50, origin: float = 0.0, timeout_s: float | None = None
-                ) -> list[tuple[float, float]] | None:
-    """Gaps in a stream's packet timeline (missing packets), on the programme timeline (relative
-    to ``origin``, the container start). Restamping by sample count would otherwise close them.
+@dataclass
+class PacketScan:
+    """A stream's packet timeline. Times are on a CONTINUOUS packet clock (timestamp jumps such
+    as a broadcast splice or a wrap are folded out), in the container's time base."""
 
-    Two shapes: a hole BETWEEN packets, and a single packet far longer than the stream's normal
-    packet (MP4/MOV store a hole as one long sample duration). ``None`` when the timeline could
-    not be read completely (the caller reports that rather than assuming no gaps)."""
-    import statistics
+    first_pts: float | None = None
+    last_end: float | None = None      # where the last packet ends, on the same clock
+    gaps: list[tuple[float, float]] = field(default_factory=list)
+    complete: bool = True
+
+
+class _GapScanner:
+    """Streaming missing-packet detector with bounded memory.
+
+    * a hole BETWEEN packets (the next packet starts after the previous one ended), and
+    * one packet far longer than the stream's normal packet (MP4/MOV store a hole as one long
+      sample duration). The final packet is exempt: it is legitimately short or long.
+    Packets without a duration are taken at the stream's typical length (TrueHD in MKV), and a
+    backward or huge forward timestamp jump re-anchors the clock instead of blinding the scan."""
+
+    _CALIBRATE = 4096
+
+    def __init__(self, min_gap_s: float, limit: int) -> None:
+        self.min_gap, self.limit = min_gap_s, limit
+        self.scan = PacketScan()
+        self.typical: float | None = None
+        self._head: list[tuple[float, float | None]] = []
+        self._offset = 0.0
+        self._prev_end: float | None = None
+        self._pending: tuple[float, float | None] | None = None
+
+    @property
+    def full(self) -> bool:
+        return len(self.scan.gaps) >= self.limit
+
+    def add(self, pts: float, dur: float | None) -> None:
+        if self.scan.first_pts is None:
+            self.scan.first_pts = pts
+        if self.typical is None:
+            self._head.append((pts, dur))
+            if len(self._head) >= self._CALIBRATE:
+                self._calibrate(exclude_last=False)
+            return
+        self._feed(pts, dur)
+
+    def finish(self) -> PacketScan:
+        if self.typical is None:
+            self._calibrate(exclude_last=True)
+        self.scan.gaps.sort()
+        self.scan.last_end = self._prev_end
+        return self.scan
+
+    def _calibrate(self, *, exclude_last: bool) -> None:
+        import statistics
+
+        head = self._head[:-1] if exclude_last and len(self._head) >= 2 else self._head
+        known = [d for _, d in head if d is not None and d > 0]
+        if known and len(known) * 2 >= len(head):
+            self.typical = statistics.median(known)
+        else:
+            deltas = [b[0] - a[0] for a, b in zip(head, head[1:], strict=False) if b[0] > a[0]]
+            self.typical = statistics.median(deltas) if deltas else 0.0
+        pending, self._head = self._head, []
+        for pts, dur in pending:
+            self._feed(pts, dur)
+
+    def _feed(self, pts: float, dur: float | None) -> None:
+        typical = self.typical or 0.0
+        d = dur if dur is not None and dur >= 0 else typical
+        c = pts - self._offset
+        jumped = False
+        if self._prev_end is not None:
+            delta = c - self._prev_end
+            if delta < -max(0.05, 2 * typical) or delta > _MAX_PACKET_GAP_S:
+                # A timestamp discontinuity, not missing audio: continue the clock from here.
+                self._offset += delta
+                c, jumped = self._prev_end, True
+            elif delta > self.min_gap:
+                self._gap(self._prev_end, c)
+        if self._pending is not None:  # long-packet rule, for every packet but the final one
+            pc, pd = self._pending
+            if pd is not None and typical > 0 and pd - typical > self.min_gap and pd <= _MAX_PACKET_GAP_S:
+                self._gap(pc + typical, pc + pd)
+        self._pending = (c, dur)
+        end = c + d
+        self._prev_end = end if (self._prev_end is None or jumped) else max(self._prev_end, end)
+
+    def _gap(self, a: float, b: float) -> None:
+        if len(self.scan.gaps) < self.limit:
+            self.scan.gaps.append((a, b))
+
+
+def _parse_packet(line: bytes) -> tuple[float, float | None] | None:
+    parts = line.strip().split(b",")
+    try:
+        pts = float(parts[0])
+    except (ValueError, IndexError):
+        return None
+    if pts != pts or pts in (float("inf"), float("-inf")):
+        return None
+    dur: float | None
+    try:
+        dur = float(parts[1]) if len(parts) > 1 else None
+    except ValueError:
+        dur = None
+    if dur is not None and (dur != dur or dur < 0 or dur == float("inf")):
+        dur = None
+    return pts, dur
+
+
+def scan_packets(path: Path, settings: Settings, abs_index: int, *, min_gap_s: float = 0.1,
+                 limit: int = 50, timeout_s: float | None = None,
+                 stop=None) -> PacketScan | None:
+    """Read a stream's packet timeline (``None`` when the stream has no container index).
+
+    Streamed line by line, so memory stays flat however many packets a file has; the wall
+    timeout and RLIMITs bound the cost. ``complete`` is False when the scan was cut short."""
+    import threading
 
     if abs_index < 0:
         return None
     ffprobe = _tool("ffprobe", settings.ffmpeg_path and str(Path(settings.ffmpeg_path).with_name("ffprobe")))
     argv = [ffprobe, "-v", "error", "-select_streams", str(abs_index),
             "-show_entries", "packet=pts_time,duration_time", "-of", "csv=p=0", *safe_input(path)]
-    cap = 64 * 1024 * 1024
+    timeout = timeout_s or min(120.0, settings.decode_timeout_s)
+    pre = _rlimit_setter(int(timeout) + _RLIMIT_CPU_PAD_S) if os.name == "posix" else None
+    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, preexec_fn=pre)
+    assert proc.stdout is not None
+    expired = threading.Event()
+
+    def _expire() -> None:
+        expired.set()
+        proc.kill()
+
+    timer = threading.Timer(timeout, _expire)
+    timer.daemon = True
+    timer.start()
+    sc = _GapScanner(min_gap_s, limit)
+    stopped_early = False
     try:
-        proc = run(argv, timeout_s=timeout_s or min(120.0, settings.decode_timeout_s),
-                   max_stdout_bytes=cap)
-    except UnsafeSourceError:
-        return None
-    if proc.returncode != 0 or len(proc.stdout) >= cap:
-        return None
-    packets: list[tuple[float, float]] = []
-    for line in proc.stdout.decode("ascii", "replace").split("\n"):
-        parts = line.strip().split(",")
-        if len(parts) < 2:
-            continue
-        try:
-            pts, dur = float(parts[0]), float(parts[1])
-        except ValueError:
-            continue
-        if pts == pts and dur == dur and dur >= 0:
-            packets.append((pts, dur))
-    if not packets:
-        return []
-    typical = statistics.median(d for _, d in packets)
-    gaps: list[tuple[float, float]] = []
-    prev_end: float | None = None
-    for pts, dur in packets:
-        if prev_end is not None and min_gap_s < pts - prev_end <= _MAX_PACKET_GAP_S:
-            # Small holes are missing packets. Huge jumps are timestamp discontinuities (e.g. a
-            # broadcast splice); the decoded-vs-declared duration check covers those.
-            gaps.append((prev_end - origin, pts - origin))
-        elif dur - typical > min_gap_s and dur <= _MAX_PACKET_GAP_S:
-            gaps.append((pts + typical - origin, pts + dur - origin))
-        if len(gaps) >= limit:
-            break
-        prev_end = max(prev_end or 0.0, pts + dur)
-    return gaps
+        for line in iter(lambda: proc.stdout.readline(256), b""):  # type: ignore[union-attr]
+            if stop is not None and stop.is_set():
+                expired.set()  # the caller gave up on this file: end the scan now
+                break
+            pkt = _parse_packet(line)
+            if pkt is not None:
+                sc.add(*pkt)
+                if sc.full:
+                    stopped_early = True
+                    break
+        result = sc.finish()
+    finally:
+        timer.cancel()
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+        proc.stdout.close()
+    result.complete = not expired.is_set() and (stopped_early or proc.returncode == 0)
+    return result
 
 
 def channel_layout_arg(layout: str, channels: int) -> str:
@@ -503,7 +614,7 @@ def probe(path: Path, settings: Settings) -> MediaInfo:
         ffprobe, "-v", "error", "-print_format", "json",
         "-show_entries",
         "format=duration,format_name,start_time:stream=index,codec_type,codec_name,sample_rate,channels,"
-        "channel_layout,start_time:stream_tags=language,title",
+        "channel_layout,start_time,duration:stream_tags=language,title",
         *safe_input(path),
     ]
     proc = run(argv, timeout_s=min(30.0, settings.decode_timeout_s))
@@ -577,85 +688,207 @@ def probe(path: Path, settings: Settings) -> MediaInfo:
             start = max(0.0, float(st.get("start_time") or 0.0))
         except (TypeError, ValueError):
             start = 0.0
+        try:
+            sdur: float | None = float(st.get("duration"))
+        except (TypeError, ValueError):
+            sdur = None
+        if sdur is not None and not (0 < sdur < float("inf")):
+            sdur = None
         streams.append(StreamInfo(
+            declared_end_s=(start + sdur) if sdur is not None and start == start else None,
             index=i, codec=_tag(st.get("codec_name")), sample_rate=sr, channels=ch,
             layout=_tag(st.get("channel_layout")), language=_tag(tags.get("language")) or None,
             title=_tag(tags.get("title")) or None, abs_index=_int(st.get("index", -1)),
             start_s=start if start == start else 0.0))
     if channels > settings.max_channels:
         raise UnsafeSourceError(f"channel count {channels} exceeds the {settings.max_channels} cap")
-    shortfall = riff_shortfall_s(path) if fmt in ("wav", "w64") else 0.0
+    shortfall = (container_shortfall_s(path, settings.max_duration_s)
+                 if fmt.split(",")[0] in ("wav", "w64", "aiff", "caf") else 0.0)
     return MediaInfo(duration_s=duration_s, sample_rate=sample_rate, channels=channels,
                      codec=codec, has_audio=has_audio, streams=tuple(streams),
-                     format_start=format_start, container_shortfall_s=shortfall)
+                     format_start=format_start, container_shortfall_s=shortfall,
+                     estimated_durations=fmt.split(",")[0] in ("mpegts", "mpeg", "mpegvideo"))
 
 
+_W64_RIFF = bytes.fromhex("726966662e91cf11a5d628db04c10000")
 _W64_DATA = bytes.fromhex("64617461f3acd3118cd100c04f8edb8a")
 _W64_FMT = bytes.fromhex("666d7420f3acd3118cd100c04f8edb8a")
+_MAX_CHUNKS = 4096          # header walk bound (chunk headers only, never the audio)
+_UNKNOWN_32 = 0x7F000000    # streaming writers' placeholders (0x7FFF0000, 0x80000000, 0xFFFFFFFF)
 
 
-def riff_shortfall_s(path: Path) -> float:
+def container_shortfall_s(path: Path, max_s: float) -> float:
     """Seconds of audio the header DECLARES but the file does not contain (a transfer cut short).
 
-    ffprobe sizes a WAV from the bytes present, so a truncated file otherwise looks complete.
-    Streamed WAVs that declare 0 / 0xFFFFFFFF ("unknown") are not judged. Bounded: reads chunk
-    headers only (at most 64 chunks), never the audio."""
+    ffprobe sizes these formats from the bytes present, so a truncated file otherwise looks
+    complete. Covers RIFF/RF64/BW64 WAV, Sony W64, AIFF/AIFC and CAF. A streamed file that
+    declares an unknown length (0, or a placeholder) is not judged. Bounded: chunk headers only,
+    at most ``_MAX_CHUNKS``, and the result is clamped to ``max_s``."""
     import struct
 
     try:
         size = path.stat().st_size
         with open(path, "rb") as fh:
             head = fh.read(16)
-            if head[:4] in (b"RIFF", b"RF64") and head[8:12] == b"WAVE":
-                ds64 = None
-                byte_rate = 0
-                pos = 12
-                for _ in range(64):
-                    fh.seek(pos)
-                    hdr = fh.read(8)
-                    if len(hdr) < 8:
-                        return 0.0
-                    cid, csz = hdr[:4], struct.unpack("<I", hdr[4:])[0]
-                    if cid == b"ds64":
-                        body = fh.read(min(csz, 28))
-                        if len(body) >= 16:
-                            ds64 = struct.unpack("<Q", body[8:16])[0]
-                    elif cid == b"fmt ":
-                        body = fh.read(min(csz, 16))
-                        if len(body) >= 12:
-                            byte_rate = struct.unpack("<I", body[8:12])[0]
-                    elif cid == b"data":
-                        declared = ds64 if (head[:4] == b"RF64" and ds64) else csz
-                        if declared in (0, 0xFFFFFFFF) or byte_rate <= 0:
-                            return 0.0
-                        present = max(0, size - (pos + 8))
-                        return max(0.0, (declared - present) / byte_rate)
-                    pos += 8 + csz + (csz & 1)
+            if head[:4] in (b"RIFF", b"RF64", b"BW64") and head[8:12] == b"WAVE":
+                got = _riff(fh, head[:4] != b"RIFF", size)
+            elif head[:16] == _W64_RIFF:
+                got = _w64(fh, size)
+            elif head[:4] == b"FORM" and head[8:12] in (b"AIFF", b"AIFC"):
+                got = _aiff(fh, size)
+            elif head[:4] == b"caff":
+                got = _caf(fh, size)
+            else:
                 return 0.0
-            if head[:16] == bytes.fromhex("726966662e91cf11a5d628db04c10000"):  # W64 "riff" GUID
-                byte_rate = 0
-                pos = 40  # riff GUID(16) + size(8) + wave GUID(16)
-                for _ in range(64):
-                    fh.seek(pos)
-                    hdr = fh.read(24)
-                    if len(hdr) < 24:
-                        return 0.0
-                    guid, csz = hdr[:16], struct.unpack("<Q", hdr[16:])[0]
-                    if guid == _W64_FMT:
-                        body = fh.read(16)
-                        if len(body) >= 12:
-                            byte_rate = struct.unpack("<I", body[8:12])[0]
-                    elif guid == _W64_DATA:
-                        declared = csz - 24
-                        if declared <= 0 or byte_rate <= 0:
-                            return 0.0
-                        present = max(0, size - (pos + 24))
-                        return max(0.0, (declared - present) / byte_rate)
-                    pos += max(24, csz + ((8 - csz % 8) % 8))
-                return 0.0
-    except (OSError, struct.error):
+    except (OSError, struct.error, ValueError, OverflowError):
         return 0.0
-    return 0.0
+    if got is None:
+        return 0.0
+    declared, present, byte_rate = got
+    if declared <= 0 or byte_rate <= 0 or present >= declared:
+        return 0.0
+    return min(max_s, (declared - present) / byte_rate)
+
+
+def _riff(fh, sixty_four: bool, size: int):
+    import struct
+
+    ds64 = None
+    byte_rate = 0
+    pos = 12
+    for _ in range(_MAX_CHUNKS):
+        fh.seek(pos)
+        hdr = fh.read(8)
+        if len(hdr) < 8:
+            return None
+        cid, csz = hdr[:4], struct.unpack("<I", hdr[4:])[0]
+        if cid == b"ds64":
+            body = fh.read(min(csz, 28))
+            if len(body) >= 16:
+                ds64 = struct.unpack("<Q", body[8:16])[0]
+        elif cid == b"fmt ":
+            body = fh.read(min(csz, 16))
+            if len(body) >= 12:
+                byte_rate = struct.unpack("<I", body[8:12])[0]
+        elif cid == b"data":
+            if sixty_four and csz == 0xFFFFFFFF:
+                declared = ds64 or 0
+                if declared >= 1 << 62:
+                    return None
+            else:
+                declared = csz
+                if declared >= _UNKNOWN_32:
+                    return None
+            return declared, max(0, size - (pos + 8)), byte_rate
+        pos += 8 + csz + (csz & 1)
+        if pos >= size:
+            return None
+    return None
+
+
+def _w64(fh, size: int):
+    import struct
+
+    byte_rate = 0
+    pos = 40  # riff GUID(16) + size(8) + wave GUID(16)
+    for _ in range(_MAX_CHUNKS):
+        fh.seek(pos)
+        hdr = fh.read(24)
+        if len(hdr) < 24:
+            return None
+        guid, csz = hdr[:16], struct.unpack("<Q", hdr[16:])[0]
+        if guid == _W64_FMT:
+            body = fh.read(16)
+            if len(body) >= 12:
+                byte_rate = struct.unpack("<I", body[8:12])[0]
+        elif guid == _W64_DATA:
+            if csz <= 24 or csz >= 1 << 62:
+                return None
+            return csz - 24, max(0, size - (pos + 24)), byte_rate
+        if csz < 24:
+            return None
+        pos += csz + ((8 - csz % 8) % 8)
+        if pos >= size:
+            return None
+    return None
+
+
+def _ext80(b: bytes) -> float:
+    """IEEE 754 80-bit extended (AIFF sample rate)."""
+    import struct
+
+    exp, mant = struct.unpack(">HQ", b[:10])
+    sign = -1 if exp & 0x8000 else 1
+    exp &= 0x7FFF
+    if exp == 0 or exp == 0x7FFF:
+        return 0.0
+    return sign * mant * 2.0 ** (exp - 16383 - 63)
+
+
+_AIFC_PCM = {b"NONE", b"sowt", b"twos", b"fl32", b"FL32", b"fl64", b"FL64", b"in24", b"in32",
+             b"raw "}
+
+
+def _aiff(fh, size: int):
+    import struct
+
+    frames = ch = bits = 0
+    rate = 0.0
+    pcm = True
+    ssnd_data = None
+    pos = 12
+    for _ in range(_MAX_CHUNKS):
+        fh.seek(pos)
+        hdr = fh.read(8)
+        if len(hdr) < 8:
+            break
+        cid, csz = hdr[:4], struct.unpack(">I", hdr[4:])[0]
+        if cid == b"COMM":
+            body = fh.read(min(csz, 22))
+            if len(body) >= 18:
+                ch, frames, bits = struct.unpack(">hIh", body[:8])
+                rate = _ext80(body[8:18])
+                if len(body) >= 22:
+                    pcm = body[18:22] in _AIFC_PCM
+        elif cid == b"SSND":
+            off = fh.read(4)
+            ssnd_data = pos + 16 + (struct.unpack(">I", off)[0] if len(off) == 4 else 0)
+        pos += 8 + csz + (csz & 1)
+        if pos >= size:
+            break
+    if not pcm or ssnd_data is None or frames <= 0 or ch <= 0 or bits <= 0 or rate <= 0:
+        return None
+    bpf = ch * ((bits + 7) // 8)
+    return frames * bpf, max(0, size - ssnd_data), int(bpf * rate)
+
+
+def _caf(fh, size: int):
+    import struct
+
+    rate = 0.0
+    bpp = fpp = 0
+    pos = 8
+    for _ in range(_MAX_CHUNKS):
+        fh.seek(pos)
+        hdr = fh.read(12)
+        if len(hdr) < 12:
+            return None
+        cid, csz = hdr[:4], struct.unpack(">q", hdr[4:])[0]
+        if cid == b"desc":
+            body = fh.read(32)
+            if len(body) >= 24:
+                rate = struct.unpack(">d", body[:8])[0]
+                bpp, fpp = struct.unpack(">II", body[16:24])
+        elif cid == b"data":
+            if csz < 4 or bpp <= 0 or fpp <= 0 or not (rate > 0):
+                return None  # -1 = streamed / unknown length; VBR codecs are not judged
+            return csz - 4, max(0, size - (pos + 16)), int(bpp / fpp * rate)
+        if csz < 0:
+            return None
+        pos += 12 + csz
+        if pos >= size:
+            return None
+    return None
 
 
 def _int(v) -> int:

@@ -72,6 +72,23 @@ class TrackMeasurements:
     gap_scan_incomplete: bool = False        # the packet timeline couldn't be read in full
     dialogue_lufs: float | None = None       # speech-gated integrated loudness, when computed
     dialogue_coverage: float | None = None   # fraction of the programme that is speech
+    seek_base_s: float = 0.0                 # programme time -> ffmpeg input -ss offset
+
+    @property
+    def end_s(self) -> float:
+        """Where this track ends on the programme timeline (missing packets included)."""
+        return self.stream.start_s + self.decoded_s + sum(b - a for a, b in self.gaps)
+
+    def to_programme(self, t_s: float) -> float:
+        """Map a time in the DECODED audio (restamped by sample count, so missing packets are
+        closed up) onto the programme timeline: add the track start and every gap before it."""
+        p = self.stream.start_s + t_s
+        for a, b in self.gaps:  # sorted, programme time
+            if p >= a:
+                p += b - a
+            else:
+                break
+        return p
 
 
 @dataclass
@@ -202,7 +219,7 @@ def _tail_pass(ffmpeg: str, path, idx: int, tm: TrackMeasurements, settings: Set
     # Truncation cue: RMS of the final 250 ms of the DECODED audio (not the container's claimed
     # end, which a file can misstate). A clip that ends loud is a likely mid-word cut.
     # Container-time seek to this track's real end (its start on the timeline + decoded length).
-    seek = (["-ss", f"{max(0.0, tm.stream.start_s + tm.decoded_s - 0.25):.3f}"]
+    seek = (["-ss", f"{max(0.0, tm.seek_base_s + tm.end_s - 0.25):.3f}"]
             if tm.decoded_s > 0 else ["-sseof", "-0.25"])
     try:
         err = _pipe(path, tm.stream, settings,
@@ -216,24 +233,31 @@ def _tail_pass(ffmpeg: str, path, idx: int, tm: TrackMeasurements, settings: Set
 
 
 def measure_track(path, st: StreamInfo, settings: Settings, dur_s: float = 0.0,
-                  deadline: float | None = None, origin: float = 0.0) -> TrackMeasurements:
+                  deadline: float | None = None, *, timeline=None) -> TrackMeasurements:
+    """Every analysis pass over one track. ``timeline(st)`` (from :func:`measure`) returns the
+    track placed on the programme timeline: ``(stream, gaps, gap_scan_incomplete, seek_base)``.
+    It is awaited only before the tail pass, so the packet scan overlaps the decode passes."""
     ffmpeg = _tool("ffmpeg", settings.ffmpeg_path)
     tm = _main_pass(ffmpeg, path, st.index, st, settings, dur_s, deadline)
-    import time as _t
-
-    from ..mediaguard import packet_gaps
-
-    left = (deadline - _t.monotonic()) if deadline is not None else None
-    if left is not None and left <= 1:
-        raise UnsafeSourceError("analysis exceeded the per-file time budget")
-    gaps = packet_gaps(path, settings, st.abs_index, origin=origin,
-                       timeout_s=min(120.0, left) if left is not None else None)
-    tm.gaps = gaps or []
-    tm.gap_scan_incomplete = gaps is None and st.abs_index >= 0
     if settings.hum_detection or st.channels >= 2:
         _spectral_pass(ffmpeg, path, st.index, tm, settings, max(dur_s, tm.decoded_s), deadline)
+    if timeline is not None:
+        tm.stream, gaps, tm.gap_scan_incomplete, tm.seek_base_s = timeline(st)
+        tm.gaps = sorted(gaps)
     _tail_pass(ffmpeg, path, st.index, tm, settings, deadline)
     return tm
+
+
+def _scan(path, st: StreamInfo, settings: Settings, deadline: float, stop=None):
+    """The packet scan, inside the per-file budget (it may not outlive the file's deadline)."""
+    import time
+
+    from ..mediaguard import scan_packets
+
+    left = deadline - time.monotonic()
+    if left <= 1:
+        raise UnsafeSourceError("analysis exceeded the per-file time budget")
+    return scan_packets(path, settings, st.abs_index, timeout_s=left, stop=stop)
 
 
 def measure(path, info: MediaInfo, settings: Settings) -> Measurements:
@@ -255,16 +279,48 @@ def measure(path, info: MediaInfo, settings: Settings) -> Measurements:
     channel_s = sum(max(1, s.channels) for s in streams) * dur
     deadline = time.monotonic() + settings.decode_timeout_s + \
         channel_s * settings.decode_timeout_per_channel_s
-    # The programme timeline starts at the CONTAINER start (video may begin before the audio).
-    first_audio = min((st.start_s for st in streams), default=0.0)
-    origin = (info.format_start if info.format_start is not None
-              and info.format_start <= first_audio else first_audio)
+    # Each track's start is its FIRST PACKET (ffprobe's start_time is an estimate that goes wrong
+    # when the audio begins late in the file). The programme timeline starts at the CONTAINER
+    # start, which video may set before the audio.
+    import concurrent.futures as cf
+    import threading
+
+    pool = cf.ThreadPoolExecutor(max_workers=2, thread_name_prefix="audel-scan")
+    stop = threading.Event()
+    futures = [pool.submit(_scan, path, st, settings, deadline, stop) for st in streams]
+    placed: dict = {}
+
+    def timeline(st: StreamInfo):
+        if not placed:
+            scans = []
+            for f in futures:
+                try:
+                    scans.append(f.result(timeout=max(0.0, deadline - time.monotonic()) + 5))
+                except cf.TimeoutError:
+                    raise UnsafeSourceError("analysis exceeded the per-file time budget") from None
+            starts = [sc.first_pts if sc is not None and sc.first_pts is not None else s.start_s
+                      for s, sc in zip(streams, scans, strict=True)]
+            first_audio = min(starts, default=0.0)
+            origin = (info.format_start if info.format_start is not None
+                      and info.format_start <= first_audio else first_audio)
+            seek_base = origin - (info.format_start or 0.0)  # -ss counts from the format start
+            placed[-1] = (origin,)
+            for s, sc, start in zip(streams, scans, starts, strict=True):
+                # Packet times are on the scan's continuous clock, anchored at the first packet.
+                gaps = [(a - origin, b - origin) for a, b in sc.gaps] if sc is not None else []
+                placed[s.index] = (dataclasses.replace(s, start_s=max(0.0, start - origin)), gaps,
+                                   sc is not None and not sc.complete, seek_base)
+                if info.estimated_durations and sc is not None and sc.last_end is not None \
+                        and sc.complete:
+                    # TS durations are bitrate estimates: the packets are the declaration.
+                    placed[("end", s.index)] = sc.last_end - origin
+        return placed[st.index]
+
     m.tracks = []
     for st in streams:
-        st_rel = dataclasses.replace(st, start_s=max(0.0, st.start_s - origin))
         try:
-            m.tracks.append(measure_track(path, st_rel, settings, info.duration_s, deadline,
-                                          origin=origin))
+            m.tracks.append(measure_track(path, st, settings, info.duration_s, deadline,
+                                          timeline=timeline))
         except UnsafeSourceError:
             raise  # caps / budgets / deadline: the whole file is refused (fail closed)
         except AudelError as e:
@@ -272,13 +328,37 @@ def measure(path, info: MediaInfo, settings: Settings) -> Measurements:
             # and report this track by name.
             from ..errors import sanitize_message
 
-            m.tracks.append(TrackMeasurements(stream=st_rel, failed=sanitize_message(str(e), limit=160)))
+            m.tracks.append(TrackMeasurements(stream=st, failed=sanitize_message(str(e), limit=160)))
+        except BaseException:
+            stop.set()
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
+    try:
+        timeline(streams[0])  # place every track (also those that failed to decode)
+    except BaseException:
+        stop.set()
+        raise
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    origin = placed[-1][0]
+    for t in m.tracks:
+        if t.failed:
+            t.stream = placed[t.stream.index][0]
     if all(t.failed for t in m.tracks):
         from ..errors import DecodeError
 
         raise DecodeError(m.tracks[0].failed or "no audio track could be decoded")
-    decoded = max((t.stream.start_s + t.decoded_s for t in m.tracks if not t.failed), default=0.0)
-    declared = info.duration_s
+    decoded = max((t.end_s for t in m.tracks if not t.failed), default=0.0)
+    # Compare against what the container declares for its AUDIO: where the streams themselves
+    # say they end (ffprobe's start + duration, one consistent estimate; video may run longer),
+    # when every graded track declares one, else the container's duration.
+    live = [t for t in m.tracks if not t.failed]
+    if live and info.estimated_durations and all(("end", t.stream.index) in placed for t in live):
+        declared = max(placed[("end", t.stream.index)] for t in live)
+    elif live and all(t.stream.declared_end_s is not None for t in live):
+        declared = max((t.stream.declared_end_s or 0.0) - origin for t in live)
+    else:
+        declared = info.duration_s
     if decoded > 0 and (declared <= 0 or abs(decoded - declared) > max(1.0, 0.02 * declared)):
         # Grade the audio that is actually there. A container that DECLARED a wrong length is
         # reported; one that declared none is not.
