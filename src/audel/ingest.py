@@ -111,6 +111,15 @@ def _pool():
 
 def _download(url: str, dest: Path, proxy_url: str, settings: Settings,
               stop: threading.Event | None = None) -> int:
+    try:
+        return _download_inner(url, dest, proxy_url, settings, stop)
+    except BaseException:
+        dest.unlink(missing_ok=True)  # the thread removes what IT created, however it ends
+        raise
+
+
+def _download_inner(url: str, dest: Path, proxy_url: str, settings: Settings,
+                    stop: threading.Event | None = None) -> int:
     opener = urllib.request.build_opener(
         urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url}),
         _SafeRedirect(settings))
@@ -189,5 +198,11 @@ async def fetch_to_file(url: str, tmp_dir: Path, settings: Settings) -> Path:
         raise
     finally:
         stop.set()  # any exit (success, error, timeout, cancel): the worker thread stops
-        await proxy.stop()
+        try:
+            await proxy.stop()
+        except BaseException:
+            # Cancelled while shutting the proxy down AFTER a successful download: the caller
+            # never receives the path, so the file must not be left behind.
+            dest.unlink(missing_ok=True)
+            raise
     return dest

@@ -121,6 +121,15 @@ All notable changes to Audel are recorded here. The format follows
     at most 2 fetches, in a pool of 8.
   - **Low-Medium.** Work abandoned while waiting on its tenant share still ran later. Abandonment now
     propagates through both waits.
+- Red-team round 6 fixes (network surface), each pinned by a regression test:
+  - **Medium.** Synchronous routes given a URL fetched it while holding a grading slot, and waited
+    for the per-tenant fetch share without limit. All grading routes now acquire their input first
+    and only then take a slot, and the fetch-share wait is bounded (429).
+  - **Low-Medium.** Work abandoned before it started stayed queued with its whole request payload.
+    It is now cancelled immediately.
+  - **Low.** A download cancelled during proxy shutdown, or before its worker thread created the
+    file, could leave a file behind. Both paths now clean up.
+  - **Info.** Abandoned-task failures no longer print unscrubbed asyncio tracebacks.
 - Red-team round 5 and 6 fixes (auth surface): obviously constructed token bodies (low character
   variety, short repeating periods, alphabet runs) are refused even when wrapped in a valid
   checksum. The format check can't detect a hash of a word, so tokens must be minted with

@@ -213,6 +213,7 @@ def build_app(settings: Settings | None = None):
             return await run_shielded(_work_sem, coro_factory, timeout)
         sem = _tenant_work.get(tenant)
         abandoned = asyncio.Event()
+        started = {"v": False}
 
         async def guarded():
             async with sem:
@@ -221,14 +222,18 @@ def build_app(settings: Settings | None = None):
                 async with _work_sem:
                     if abandoned.is_set():
                         return None
+                    started["v"] = True
                     return await coro_factory()
 
         task = asyncio.ensure_future(guarded())
         task.add_done_callback(lambda _t: _tenant_work.done(tenant))  # cleanup when work ENDS
+        task.add_done_callback(_retrieve)
         try:
             return await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
         except (TimeoutError, asyncio.CancelledError):
             abandoned.set()
+            if not started["v"]:
+                task.cancel()  # not started: drop it now (and the request payload it holds)
             raise
 
     _tenant_fetch = TenantSemaphores(2)  # concurrent URL fetches per tenant
@@ -240,8 +245,15 @@ def build_app(settings: Settings | None = None):
 
         sem = _tenant_fetch.get(tenant)
         try:
-            async with sem:
+            try:
+                await asyncio.wait_for(sem.acquire(), timeout=settings.queue_wait_s)
+            except TimeoutError:
+                raise HTTPException(status_code=429, detail="Too many downloads in progress.",
+                                    headers={"Retry-After": "30"}) from None
+            try:
                 return await fetch_to_file(url, Workspace(settings).tmp, settings)
+            finally:
+                sem.release()
         finally:
             _tenant_fetch.done(tenant)
 
@@ -256,11 +268,11 @@ def build_app(settings: Settings | None = None):
 
     jobs._owner_gate = _tenant_job_gate  # async jobs: tenant share before the global slot
 
-    async def _job_slot(request: Request):
+    @contextlib.asynccontextmanager
+    async def _slot_for(tenant: str):
         """A grading slot: the tenant's share FIRST, then a global slot, each with a bounded wait
-        (429). Taking the global slot first would let one tenant's surplus requests hold global
-        slots while queued on their own share."""
-        tenant = _principal(request).tenant
+        (429). Taken only AFTER the input is spooled or fetched, so a slow upload or URL never
+        holds a slot other tenants need."""
         tsem = _tenant_jobs.get(tenant)
         try:
             try:
@@ -284,6 +296,10 @@ def build_app(settings: Settings | None = None):
                 tsem.release()
         finally:
             _tenant_jobs.done(tenant)
+
+    async def _job_slot(request: Request):
+        async with _slot_for(_principal(request).tenant):
+            yield
 
     def _http_error(e: Exception) -> HTTPException:
         if isinstance(e, (ConfigError, UnsafeSourceError)):
@@ -467,8 +483,9 @@ def build_app(settings: Settings | None = None):
         path = None
         try:
             path, src, host = await _acquire(file, url, _principal(request).tenant)
-            return await _run_and_audit(kind, path, src, host, p, gs, _principal(request),
-                                        request.state.request_id)
+            async with _slot_for(_principal(request).tenant):
+                return await _run_and_audit(kind, path, src, host, p, gs, _principal(request),
+                                            request.state.request_id)
         except AudelError as e:
             raise _http_error(e) from e
         finally:
@@ -479,7 +496,7 @@ def build_app(settings: Settings | None = None):
     async def check_ep(request: Request, file: UploadFile | None = File(None),
                        url: str | None = Form(None), brief: str | None = Form(None),
                        expect: list[str] | None = Form(None), spec: str | None = Form(None),
-                       content: str | None = Form(None), _slot=Depends(_job_slot)):
+                       content: str | None = Form(None)):
         """Deterministic grade (no LLM, no egress except an opted-in URL fetch)."""
         return await _sync(request, "check", file, url, {"brief": brief, "expect": expect,
                                                          "spec": spec, "content": content})
@@ -488,8 +505,7 @@ def build_app(settings: Settings | None = None):
     async def analyze_ep(request: Request, file: UploadFile | None = File(None),
                          url: str | None = Form(None), brief: str | None = Form(None),
                          expect: list[str] | None = Form(None), backend: str | None = Form(None),
-                         spec: str | None = Form(None), content: str | None = Form(None),
-                         _slot=Depends(_job_slot)):
+                         spec: str | None = Form(None), content: str | None = Form(None)):
         """Full grade (signals + ASR + backend critique). Egress only to the server's backend."""
         return await _sync(request, "analyze", file, url, {
             "brief": brief, "expect": expect, "backend": backend, "spec": spec,
@@ -504,8 +520,7 @@ def build_app(settings: Settings | None = None):
                         key_message: list[str] | None = Form(None), tone: str | None = Form(None),
                         understand: bool = Form(False), backend: str | None = Form(None),
                         spec: str | None = Form(None), content: str | None = Form(None),
-                        brief: str | None = Form(None), expect: list[str] | None = Form(None),
-                        _slot=Depends(_job_slot)):
+                        brief: str | None = Form(None), expect: list[str] | None = Form(None)):
         """Hear and listen: signal QC plus script / wording / pace / captions (offline). With
         ``understand`` (operator opt-in), key messages and delivery via the server's backend."""
         return await _sync(request, "listen", file, url, {
@@ -516,7 +531,7 @@ def build_app(settings: Settings | None = None):
 
     @app.post("/render")
     async def render_ep(request: Request, file: UploadFile | None = File(None),
-                        url: str | None = Form(None), _slot=Depends(_job_slot)):
+                        url: str | None = Form(None)):
         """Decode to trustworthy signals (loudness / true peak / RMS / silent spans, per track)."""
         from ..core import render
 
@@ -526,8 +541,9 @@ def build_app(settings: Settings | None = None):
         try:
             path, src, host = await _acquire(file, url, _principal(request).tenant)
             digest, size = await asyncio.to_thread(_sha256, path)
-            rr = await _shielded(lambda: render(str(path), settings=grade_settings),
-                                 settings.request_timeout_s, _principal(request).tenant)
+            async with _slot_for(_principal(request).tenant):
+                rr = await _shielded(lambda: render(str(path), settings=grade_settings),
+                                     settings.request_timeout_s, _principal(request).tenant)
             return {"duration_ms": rr.duration_ms, "channels": rr.channels,
                     "sample_rate": rr.sample_rate, "codec": rr.codec, "has_audio": rr.has_audio,
                     "integrated_lufs": rr.integrated_lufs, "true_peak_dbtp": rr.true_peak_dbtp,
@@ -549,15 +565,15 @@ def build_app(settings: Settings | None = None):
     @app.post("/handoff")
     async def handoff_ep(request: Request, file: UploadFile | None = File(None),
                          url: str | None = Form(None), brief: str | None = Form(None),
-                         expect: list[str] | None = Form(None), backend: str | None = Form(None),
-                         _slot=Depends(_job_slot)):
+                         expect: list[str] | None = Form(None), backend: str | None = Form(None)):
         """Grade + return the distilled ears→brain handoff (verdict + next action + todo)."""
         p, gs = _validate("analyze", {"brief": brief, "expect": expect, "backend": backend})
         path = None
         try:
             path, src, host = await _acquire(file, url, _principal(request).tenant)
-            return await _run_and_audit("analyze", path, src, host, p, gs, _principal(request),
-                                        request.state.request_id, as_handoff=True)
+            async with _slot_for(_principal(request).tenant):
+                return await _run_and_audit("analyze", path, src, host, p, gs, _principal(request),
+                                            request.state.request_id, as_handoff=True)
         except AudelError as e:
             raise _http_error(e) from e
         finally:
@@ -695,6 +711,12 @@ class TenantSemaphores:
         return len(self._sems)
 
 
+def _retrieve(t: asyncio.Future) -> None:
+    """Consume an abandoned task's outcome so asyncio never prints an unscrubbed traceback."""
+    if not t.cancelled() and t.exception() is not None:
+        log.info("abandoned grading ended with %s", type(t.exception()).__name__)
+
+
 async def run_shielded(sem: asyncio.Semaphore, coro_factory, timeout: float | None):
     """Run grading so its concurrency slot is held until the work REALLY ends.
 
@@ -702,18 +724,23 @@ async def run_shielded(sem: asyncio.Semaphore, coro_factory, timeout: float | No
     running (that would let a caller pile up unbounded background work). Work abandoned before it
     acquired a slot is skipped entirely."""
     abandoned = asyncio.Event()
+    started = {"v": False}
 
     async def guarded():
         async with sem:
             if abandoned.is_set():
                 return None
+            started["v"] = True
             return await coro_factory()
 
     task = asyncio.create_task(guarded())
+    task.add_done_callback(_retrieve)
     try:
         return await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
     except (TimeoutError, asyncio.CancelledError):
         abandoned.set()
+        if not started["v"]:
+            task.cancel()
         raise
 
 

@@ -1803,3 +1803,127 @@ def test_constructed_bodies_fail_even_with_a_valid_checksum():
     for body in ("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ", ("abcdefghijklmnopqr" * 3)[:43]):
         assert not strong_token(f"audel_{body}_{_checksum(body)}")
     assert all(strong_token(new_token()) for _ in range(5000))
+
+
+# ==== round 6, network surface ================================================================
+
+@requires_ffmpeg
+def test_sync_url_requests_do_not_hold_grading_slots_while_fetching(tmp_path, media, monkeypatch):
+    import threading
+
+    import audel.ingest as ing
+
+    async def slow_fetch(url, tmp, settings):
+        await asyncio.sleep(3.0)
+        raise UnsafeSourceError("stub upstream")
+
+    monkeypatch.setattr(ing, "fetch_to_file", slow_fetch)
+    monkeypatch.setattr(ing, "validate_ingest_url", lambda u, s: None)
+    f = tmp_path / "t.json"
+    f.write_text(json.dumps({"tenants": {"alpha": {"sha256": token_hash(A_TOK)}}}))
+    s = Settings(cache_dir=tmp_path / "ws", allow_url_ingest=True, allow_local_files=False,
+                 api_token=SHARED, api_tokens_file=f, max_concurrent_jobs=2, queue_wait_s=2)
+    body = media["good"].read_bytes()
+    with TestClient(build_app(settings=s)) as c:
+        th = [threading.Thread(target=lambda: c.post(
+            "/check", headers={"authorization": f"Bearer {A_TOK}"},
+            data={"url": "https://media.example/a.wav"})) for _ in range(2)]
+        for t in th:
+            t.start()
+        time.sleep(0.3)
+        t0 = time.monotonic()
+        r = c.post("/check", headers={"authorization": f"Bearer {SHARED}"},
+                   files={"file": ("a.wav", body, "audio/wav")})
+        took = time.monotonic() - t0
+        for t in th:
+            t.join()
+    assert r.status_code == 200 and took < 2.0, (r.status_code, took)
+
+
+def test_waiting_for_a_fetch_share_is_bounded(tmp_path, monkeypatch):
+    import threading
+
+    import audel.ingest as ing
+
+    async def slow_fetch(url, tmp, settings):
+        await asyncio.sleep(6.0)
+        raise UnsafeSourceError("stub upstream")
+
+    monkeypatch.setattr(ing, "fetch_to_file", slow_fetch)
+    monkeypatch.setattr(ing, "validate_ingest_url", lambda u, s: None)
+    s = Settings(cache_dir=tmp_path / "ws", allow_url_ingest=True, queue_wait_s=1.5)
+    with TestClient(build_app(settings=s)) as c:
+        for _ in range(2):
+            assert c.post("/jobs", data={"url": "https://media.example/a.wav"}).status_code == 202
+        time.sleep(0.3)
+        t0 = time.monotonic()
+        r = c.post("/check", data={"url": "https://media.example/b.wav"})
+        took = time.monotonic() - t0
+    assert r.status_code == 429 and took < 4.0, (r.status_code, took)
+    del threading
+
+
+def test_abandoned_unstarted_work_is_dropped_immediately():
+    from audel.adapters.rest import run_shielded
+
+    async def scenario():
+        sem = asyncio.Semaphore(1)
+        await sem.acquire()   # slot busy: the next work waits
+        payload = bytearray(10_000_000)
+
+        async def work():
+            return len(payload)
+
+        with pytest.raises(TimeoutError):
+            await run_shielded(sem, work, timeout=0.05)
+        await asyncio.sleep(0.01)
+        waiting = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+        sem.release()
+        return waiting
+
+    assert asyncio.run(scenario()) == []   # the waiter (and its payload) is gone
+
+
+def test_download_cancelled_during_proxy_shutdown_leaves_no_file(tmp_path, monkeypatch):
+    import audel.ingest as ing
+    import audel.proxy as pm
+
+    def fake_download(url, dest, proxy_url, settings, stop=None):
+        dest.write_bytes(b"x" * 1000)
+        return 1000
+
+    real_stop = pm.VettingProxy.stop
+
+    async def slow_stop(self):
+        await asyncio.sleep(1.0)
+        await real_stop(self)
+
+    monkeypatch.setattr(ing, "_download", fake_download)
+    monkeypatch.setattr(ing, "validate_ingest_url", lambda u, s: None)
+    monkeypatch.setattr(pm.VettingProxy, "stop", slow_stop)
+
+    async def scenario():
+        t = asyncio.create_task(ing.fetch_to_file("https://media.example/a.wav", tmp_path,
+                                                  Settings(allow_url_ingest=True)))
+        await asyncio.sleep(0.4)   # download done, proxy shutting down
+        t.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await t
+
+    asyncio.run(scenario())
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_download_thread_removes_its_own_file_on_failure(tmp_path, monkeypatch):
+    import audel.ingest as ing
+
+    dest = tmp_path / "ingest_x.wav"
+
+    def inner(url, d, proxy_url, settings, stop=None):
+        d.write_bytes(b"partial")
+        raise UnsafeSourceError("download cancelled")
+
+    monkeypatch.setattr(ing, "_download_inner", inner)
+    with pytest.raises(UnsafeSourceError):
+        ing._download("https://x/a.wav", dest, "http://127.0.0.1:1", Settings())
+    assert not dest.exists()
