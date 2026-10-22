@@ -121,10 +121,12 @@ All notable changes to Audel are recorded here. The format follows
     at most 2 fetches, in a pool of 8.
   - **Low-Medium.** Work abandoned while waiting on its tenant share still ran later. Abandonment now
     propagates through both waits.
-- Red-team round 5 fixes (auth surface): a character-variety floor on token bodies, so patterned
-  bodies are refused even when wrapped in a valid checksum, and an honest description of what the
-  format check proves. Minted tokens are redacted from logs wherever they appear, including when
-  misplaced in a URL. `forwarded_allow_ips` refuses `*` in config and in Helm.
+- Red-team round 5 and 6 fixes (auth surface): obviously constructed token bodies (low character
+  variety, short repeating periods, alphabet runs) are refused even when wrapped in a valid
+  checksum. The format check can't detect a hash of a word, so tokens must be minted with
+  `audel token new`. Minted tokens are redacted from logs wherever they appear, including when
+  misplaced in a URL. `forwarded_allow_ips` refuses `*`, unparseable entries and networks broader
+  than /8 (IPv4) or /32 (IPv6), in config and in Helm.
 - Red-team round 4 fixes (decode and measurement surface), each pinned by a regression test:
   - **High.** A forward timestamp jump larger than the duration cap ended decoding early, because
     `-t` counts timestamps, so the audio after it was never measured and a clipping file could PASS.

@@ -1771,3 +1771,35 @@ def test_one_undecodable_track_does_not_discard_the_others(tmp_path, monkeypatch
     r = asyncio.run(check(str(mkv)))
     bad = [i for i in r.issues if i.detail.get("check") == "track_decode_error"]
     assert bad and bad[0].detail.get("stream") == 1 and len(r.tracks) == 2
+
+
+# ==== round 6, auth surface ===================================================================
+
+@pytest.mark.parametrize("entries", [["0.0.0.0/0"], ["::/0"], ["0.0.0.0/1", "128.0.0.0/1"],
+                                     ["10.0.0.0/7"], ["not-an-ip"], [" * "]])
+def test_broad_or_wildcard_proxy_networks_are_refused(entries):
+    with pytest.raises(ValueError):
+        Settings(forwarded_allow_ips=entries)
+
+
+def test_specific_proxy_networks_are_accepted():
+    assert Settings(forwarded_allow_ips=["10.0.0.0/8", "10.1.2.3", "fd00::/48"]).forwarded_allow_ips
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="helm not installed")
+@pytest.mark.parametrize("entry", ["0.0.0.0/0", "::/0", "128.0.0.0/1"])
+def test_helm_refuses_broad_proxy_networks(entry):
+    from pathlib import Path
+
+    chart = Path(__file__).resolve().parents[2] / "deploy" / "helm" / "audel"
+    r = subprocess.run(["helm", "template", "t", str(chart), "--set", "auth.existingSecret=s",
+                        "--set", f"forwardedAllowIps={{{entry}}}"], capture_output=True, text=True)
+    assert r.returncode != 0
+
+
+def test_constructed_bodies_fail_even_with_a_valid_checksum():
+    from audel.auth import _checksum, new_token, strong_token
+
+    for body in ("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ", ("abcdefghijklmnopqr" * 3)[:43]):
+        assert not strong_token(f"audel_{body}_{_checksum(body)}")
+    assert all(strong_token(new_token()) for _ in range(5000))

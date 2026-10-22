@@ -220,8 +220,22 @@ class Settings(BaseSettings):
     @field_validator("forwarded_allow_ips")
     @classmethod
     def _no_wildcard_proxies(cls, v: list[str]) -> list[str]:
-        if any(x.strip() == "*" for x in v):
-            raise ValueError("forwarded_allow_ips may not be '*': list your proxies' addresses")
+        """Trusted proxies must be specific: no '*', nothing that doesn't parse as an address or
+        network, and no network broader than /8 (IPv4) or /32 (IPv6) -- 0.0.0.0/0 is a wildcard."""
+        import ipaddress
+
+        for x in v:
+            entry = x.strip()
+            if entry == "*":
+                raise ValueError("forwarded_allow_ips may not be '*': list your proxies' addresses")
+            try:
+                net = ipaddress.ip_network(entry, strict=False)
+            except ValueError as e:
+                raise ValueError(f"forwarded_allow_ips entry {entry!r} is not an address or network") from e
+            floor = 8 if net.version == 4 else 32
+            if net.prefixlen < floor:
+                raise ValueError(f"forwarded_allow_ips entry {entry!r} is too broad (/{net.prefixlen}); "
+                                 f"use /{floor} or narrower")
         return v
 
     def model_for(self, backend: str) -> str:

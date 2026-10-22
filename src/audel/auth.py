@@ -108,9 +108,25 @@ def strong_token(token: str) -> bool:
     if _TOKEN_RE is None:
         _TOKEN_RE = re.compile(r"\Aaudel_([A-Za-z0-9_-]{43})_([a-z2-7]{8})\Z")
     m = _TOKEN_RE.match(token or "")
-    if m is None or len(set(m.group(1))) < _MIN_DISTINCT:
+    if m is None or len(set(m.group(1))) < _MIN_DISTINCT or _structured(m.group(1)):
         return False
     return hmac.compare_digest(_checksum(m.group(1)), m.group(2))
+
+
+def _structured(body: str) -> bool:
+    """Obvious construction: a short repeating period or a long ascending/descending run (the
+    alphabet). Random 256-bit bodies essentially never match; a hash of a word cannot be detected,
+    which is why tokens must be minted."""
+    n = len(body)
+    for p in range(1, 22):
+        if all(body[i] == body[i + p] for i in range(n - p)):
+            return True
+    run = 1
+    for a, b in zip(body, body[1:], strict=False):
+        run = run + 1 if abs(ord(b) - ord(a)) == 1 else 1
+        if run >= 6:
+            return True
+    return False
 
 
 def token_hash(token: str) -> str:

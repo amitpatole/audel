@@ -18,8 +18,11 @@
 {{- if and (has .Values.service.type (list "LoadBalancer" "NodePort")) (not .Values.tls.secretName) (ne $plain "true") }}
 {{- fail "service.type exposes Audel outside the cluster without TLS: set tls.secretName (or service.allowPlaintext=true behind your own TLS)" }}
 {{- end }}
-{{- if has "*" .Values.forwardedAllowIps }}
-{{- fail "forwardedAllowIps may not contain '*': list your ingress / load balancer addresses" }}
+{{- range .Values.forwardedAllowIps }}
+{{- $e := trim (toString .) }}
+{{- if or (eq $e "*") (regexMatch "^[0-9.]+/[0-7]$" $e) (regexMatch "^[0-9a-fA-F:]+/([0-9]|[12][0-9]|3[01])$" $e) }}
+{{- fail (printf "forwardedAllowIps entry %q is a wildcard or too broad: list your ingress / load balancer addresses" $e) }}
+{{- end }}
 {{- end }}
 {{- $scheme := ternary "HTTPS" "HTTP" (ne .Values.tls.secretName "") }}
 apiVersion: apps/v1
