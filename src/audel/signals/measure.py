@@ -73,11 +73,14 @@ class TrackMeasurements:
     dialogue_lufs: float | None = None       # speech-gated integrated loudness, when computed
     dialogue_coverage: float | None = None   # fraction of the programme that is speech
     seek_base_s: float = 0.0                 # programme time -> ffmpeg input -ss offset
+    gap_total_s: float = 0.0                 # ALL missing-packet time (gaps lists the first ones)
+    extent_s: float = 0.0                    # how long the packet timeline says the track runs
 
     @property
     def end_s(self) -> float:
         """Where this track ends on the programme timeline (missing packets included)."""
-        return self.stream.start_s + self.decoded_s + sum(b - a for a, b in self.gaps)
+        return self.stream.start_s + self.decoded_s + max(self.gap_total_s,
+                                                          sum(b - a for a, b in self.gaps))
 
     def to_programme(self, t_s: float) -> float:
         """Map a time in the DECODED audio (restamped by sample count, so missing packets are
@@ -242,13 +245,15 @@ def measure_track(path, st: StreamInfo, settings: Settings, dur_s: float = 0.0,
     if settings.hum_detection or st.channels >= 2:
         _spectral_pass(ffmpeg, path, st.index, tm, settings, max(dur_s, tm.decoded_s), deadline)
     if timeline is not None:
-        tm.stream, gaps, tm.gap_scan_incomplete, tm.seek_base_s = timeline(st)
+        (tm.stream, gaps, tm.gap_scan_incomplete, tm.seek_base_s, tm.gap_total_s,
+         tm.extent_s) = timeline(st)
         tm.gaps = sorted(gaps)
     _tail_pass(ffmpeg, path, st.index, tm, settings, deadline)
     return tm
 
 
-def _scan(path, st: StreamInfo, settings: Settings, deadline: float, stop=None):
+def _scan(path, st: StreamInfo, settings: Settings, deadline: float, stop=None,
+          fold: bool = True):
     """The packet scan, inside the per-file budget (it may not outlive the file's deadline)."""
     import time
 
@@ -257,7 +262,29 @@ def _scan(path, st: StreamInfo, settings: Settings, deadline: float, stop=None):
     left = deadline - time.monotonic()
     if left <= 1:
         raise UnsafeSourceError("analysis exceeded the per-file time budget")
-    return scan_packets(path, settings, st.abs_index, timeout_s=left, stop=stop)
+    return scan_packets(path, settings, st.abs_index, timeout_s=left, stop=stop, fold=fold)
+
+
+def _shared_clock(scans) -> None:
+    """MPEG-TS: every PID shares one clock, but each scan folded only its OWN jumps. A track
+    that starts after a splice must be placed on the reference track's folded clock (the
+    earliest-starting track), or it lands a whole splice away."""
+    live = [sc for sc in scans if sc is not None and sc.first_pts is not None]
+    if len(live) < 2:
+        return
+    ref = min(live, key=lambda sc: sc.first_pts)
+    for sc in live:
+        if sc is ref:
+            continue
+        shift = 0.0
+        for raw, off in ref.segments:
+            if raw <= sc.first_pts + 1e-6:
+                shift = off
+        if shift:
+            sc.first_pts -= shift
+            if sc.last_end is not None:
+                sc.last_end -= shift
+            sc.gaps = [(a - shift, b - shift) for a, b in sc.gaps]
 
 
 def measure(path, info: MediaInfo, settings: Settings) -> Measurements:
@@ -287,7 +314,10 @@ def measure(path, info: MediaInfo, settings: Settings) -> Measurements:
 
     pool = cf.ThreadPoolExecutor(max_workers=2, thread_name_prefix="audel-scan")
     stop = threading.Event()
-    futures = [pool.submit(_scan, path, st, settings, deadline, stop) for st in streams]
+    # Timestamp jumps are folded out only where splices are routine (MPEG-TS/PS); elsewhere a
+    # jump is missing audio.
+    futures = [pool.submit(_scan, path, st, settings, deadline, stop, info.estimated_durations)
+               for st in streams]
     placed: dict = {}
 
     def timeline(st: StreamInfo):
@@ -298,21 +328,27 @@ def measure(path, info: MediaInfo, settings: Settings) -> Measurements:
                     scans.append(f.result(timeout=max(0.0, deadline - time.monotonic()) + 5))
                 except cf.TimeoutError:
                     raise UnsafeSourceError("analysis exceeded the per-file time budget") from None
+            if info.estimated_durations:
+                _shared_clock(scans)
             starts = [sc.first_pts if sc is not None and sc.first_pts is not None else s.start_s
                       for s, sc in zip(streams, scans, strict=True)]
             first_audio = min(starts, default=0.0)
             origin = (info.format_start if info.format_start is not None
                       and info.format_start <= first_audio else first_audio)
-            seek_base = origin - (info.format_start or 0.0)  # -ss counts from the format start
+            # ffmpeg's -ss counts from the container's (signed) start time.
+            seek_base = origin - (info.format_start_raw or 0.0)
             placed[-1] = (origin,)
             for s, sc, start in zip(streams, scans, starts, strict=True):
                 # Packet times are on the scan's continuous clock, anchored at the first packet.
                 gaps = [(a - origin, b - origin) for a, b in sc.gaps] if sc is not None else []
                 placed[s.index] = (dataclasses.replace(s, start_s=max(0.0, start - origin)), gaps,
-                                   sc is not None and not sc.complete, seek_base)
-                if info.estimated_durations and sc is not None and sc.last_end is not None \
+                                   sc is not None and not sc.complete, seek_base,
+                                   sc.gap_total_s if sc is not None else 0.0,
+                                   sc.extent_s if sc is not None and sc.complete else 0.0)
+                if info.packets_declare_end and sc is not None and sc.last_end is not None \
                         and sc.complete:
-                    # TS durations are bitrate estimates: the packets are the declaration.
+                    # TS durations are bitrate estimates, ASF copies the file's onto every
+                    # stream: the packets are the declaration.
                     placed[("end", s.index)] = sc.last_end - origin
         return placed[st.index]
 
@@ -352,10 +388,12 @@ def measure(path, info: MediaInfo, settings: Settings) -> Measurements:
     # say they end (ffprobe's start + duration, one consistent estimate; video may run longer),
     # when every graded track declares one, else the container's duration.
     live = [t for t in m.tracks if not t.failed]
-    if live and info.estimated_durations and all(("end", t.stream.index) in placed for t in live):
+    if live and info.packets_declare_end and all(("end", t.stream.index) in placed for t in live):
         declared = max(placed[("end", t.stream.index)] for t in live)
     elif live and all(t.stream.declared_end_s is not None for t in live):
         declared = max((t.stream.declared_end_s or 0.0) - origin for t in live)
+    elif info.has_video:
+        declared = 0.0  # the container's duration includes the picture: not the audio's claim
     else:
         declared = info.duration_s
     if decoded > 0 and (declared <= 0 or abs(decoded - declared) > max(1.0, 0.02 * declared)):

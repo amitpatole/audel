@@ -121,6 +121,27 @@ All notable changes to Audel are recorded here. The format follows
     at most 2 fetches, in a pool of 8.
   - **Low-Medium.** Work abandoned while waiting on its tenant share still ran later. Abandonment now
     propagates through both waits.
+- Red-team round 8 fixes (decode and timeline accuracy), each pinned by a regression test. 110
+  legitimate and edge-case files grade with no new integrity findings.
+  - **Medium.** A dropout of 60 s or more in MP4, MOV or MKV was treated as a timestamp splice and,
+    with the header durations edited, graded PASS. Only MPEG-TS/PS splices are folded out now;
+    elsewhere a jump is missing audio and is reported as a gap.
+  - **Medium.** Missing audio spread through a track (many holes below the gap threshold, or
+    packets whose durations are stretched) could grade PASS. A new header-independent check
+    compares how long the packet timeline runs with the audio that decodes
+    (`timeline_shortfall`).
+  - **Low-Medium.** In MPEG-TS, one stray packet far ahead could hide a real gap. A jump that
+    returns to the old clock within a few packets is treated as a stray, and the gap is measured
+    against the old clock.
+  - **Low-Medium.** A second TS audio track starting after a splice was placed a whole splice away
+    (a false FAIL). All tracks now share the reference track's clock.
+  - **Low.** A TS whose timestamps wrap (negative start time) got a false truncation warning; the
+    tail is read from the right place again.
+  - **Low.** Video running longer than the audio no longer counts as a duration mismatch in MKV,
+    WebM, FLV or ASF, which don't declare per-stream durations (ASF copies the file's).
+  - **Low.** Gaps past the first 50 still count toward a track's length (`packet_gap_total`).
+  - **Low.** Truncation of compressed WAV (ADPCM, MP3) is no longer sized from a nominal byte
+    rate, and A-law/mu-law AIFC truncation is caught.
 - Red-team round 8 fixes (auth and network surfaces), each pinned by a regression test:
   - **High.** The JWT redaction pattern added in round 7 backtracked quadratically, so one
     unauthenticated request with a long URL could block the server for seconds while its access

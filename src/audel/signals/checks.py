@@ -328,12 +328,32 @@ def evaluate(m: Measurements, settings: Settings, spec: DeliverySpec | str | Non
                 "(corrupt or missing packets); audio may be missing", _track_span(tm, dur),
                 "decode_errors", tm, conf=Confidence.MEDIUM, programme=True,
                 errors=tm.decode_errors))
+        if tm.gap_total_s > sum(b - a for a, b in tm.gaps) + 0.05:
+            issues.append(_issue(
+                IssueKind.DROPOUT, Severity.WARNING,
+                f"{label}{tm.gap_total_s:.2f}s of audio packets missing in total (more gaps than "
+                "are listed)", _track_span(tm, dur), "packet_gap_total", tm,
+                conf=Confidence.MEDIUM, programme=True, gap_s=round(tm.gap_total_s, 3)))
         for a, b in tm.gaps[:_MAX_SPANS]:
             issues.append(_issue(
                 IssueKind.DROPOUT, Severity.WARNING,
                 f"{label}{b - a:.2f}s of audio packets missing (timeline gap)",
                 Span(start_ms=_ms(a), end_ms=_ms(b)), "packet_gap", tm, conf=Confidence.MEDIUM,
                 programme=True, gap_s=round(b - a, 3)))
+        if tm.extent_s > 0 and tm.decoded_s > 0:
+            # Header-independent: the packets say how long the track runs; the decoded audio
+            # plus the reported gaps must account for it. Catches missing audio spread through
+            # the track (many tiny holes, stretched packet durations) that no single gap shows.
+            short = tm.extent_s - tm.decoded_s - tm.gap_total_s
+            if short > max(0.5, 0.01 * tm.extent_s):
+                issues.append(_issue(
+                    IssueKind.DROPOUT,
+                    Severity.ERROR if short > 0.1 * tm.extent_s else Severity.WARNING,
+                    f"{label}the packet timeline runs {tm.extent_s:.1f}s but only "
+                    f"{tm.decoded_s:.1f}s of audio decodes ({short:.1f}s missing, spread through "
+                    "the track)", _track_span(tm, dur), "timeline_shortfall", tm,
+                    conf=Confidence.MEDIUM, programme=True, missing_s=round(short, 3),
+                    extent_s=round(tm.extent_s, 3)))
         if tm.gap_scan_incomplete:
             issues.append(_issue(
                 IssueKind.OTHER, Severity.WARNING,

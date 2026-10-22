@@ -2453,3 +2453,132 @@ def test_deleted_running_job_is_audited_as_cancelled(tmp_path, media, monkeypatc
         time.sleep(0.3)
     rows = [json.loads(x) for x in log.read_text().splitlines() if jid in x]
     assert rows and rows[-1]["status"] == "cancelled", rows
+
+
+# ==== round 8, decode surface =================================================================
+
+def _setts(src, dst, expr):
+    _ff("-i", src, "-c", "copy", "-bsf:a", f"setts=pts={expr}:dts={expr.replace('PTS', 'DTS')}",
+        dst)
+
+
+@pytest.fixture
+def base_mka(tmp_path):
+    f = tmp_path / "base.mka"
+    _ff("-f", "lavfi", "-i", "sine=d=20", "-af", "volume=0.3,afade=t=out:st=18:d=2", "-c:a",
+        "flac", f)
+    return f
+
+
+@requires_ffmpeg
+def test_a_long_dropout_outside_ts_is_a_gap_not_a_splice(tmp_path, base_mka):
+    from audel import check
+
+    f = tmp_path / "jump.mka"
+    _setts(base_mka, f, r"if(gte(PTS*TB\,10)\,PTS+70/TB\,PTS)")
+    gaps = _checks(asyncio.run(check(str(f))), "packet_gap")
+    assert gaps and gaps[0].detail["gap_s"] >= 69, [g.detail for g in gaps]
+
+
+@requires_ffmpeg
+def test_missing_audio_spread_through_a_track_is_caught(tmp_path, base_mka):
+    from audel import check
+
+    f = tmp_path / "choppy.mka"
+    _setts(base_mka, f, "PTS+floor(PTS/100)*50")     # many holes below the gap threshold
+    r = asyncio.run(check(str(f)))
+    short = _checks(r, "timeline_shortfall") + _checks(r, "packet_gap_total")
+    assert short or _checks(r, "packet_gap"), [i.detail.get("check") for i in r.issues]
+    assert r.verdict.value != "pass"
+
+
+def test_scanner_shortfall_from_stretched_durations():
+    sc = _scan([(i * 0.175, 0.175) for i in range(120)])
+    assert sc.gaps == [] and 20.5 <= sc.extent_s <= 21.5   # extent checked against decoded
+
+
+def test_a_ts_decoy_packet_cannot_hide_a_gap():
+    from audel.mediaguard import _GapScanner
+
+    sc = _GapScanner(0.1, 50, fold=True)
+    pk = [(1 + i * 0.024, 0.024) for i in range(int(10 / 0.024))]
+    pk += [(100.0, 0.05)]                                  # one stray packet far ahead
+    pk += [(16 + i * 0.024, 0.024) for i in range(200)]    # audio resumes after a 5 s hole
+    for p in pk:
+        sc.add(*p)
+    gaps = sc.finish().gaps
+    assert len(gaps) == 1 and 4.5 <= gaps[0][1] - gaps[0][0] <= 5.5, gaps
+
+
+def test_ts_splices_are_still_folded():
+    from audel.mediaguard import _GapScanner
+
+    sc = _GapScanner(0.1, 50, fold=True)
+    for p in [(1 + i * 0.024, 0.024) for i in range(400)] + \
+             [(1000 + i * 0.024, 0.024) for i in range(400)]:
+        sc.add(*p)
+    res = sc.finish()
+    assert res.gaps == [] and res.segments and 19 <= res.extent_s <= 20
+
+
+def test_gaps_past_the_list_limit_still_count():
+    from audel.mediaguard import _GapScanner
+
+    sc = _GapScanner(0.1, 5, fold=False)
+    t = 0.0
+    for i in range(2000):
+        sc.add(t, 0.02)
+        t += 0.02 + (0.3 if i % 20 == 19 else 0.0)        # 99 gaps of 0.3 s
+    res = sc.finish()
+    assert len(res.gaps) == 5 and res.gap_count == 99 and 29 <= res.gap_total_s <= 30
+
+
+@requires_ffmpeg
+def test_ts_pts_wrap_keeps_the_tail_seek_right(tmp_path):
+    from audel import check
+
+    a = tmp_path / "a.wav"
+    _ff("-f", "lavfi", "-i", "sine=d=30", "-af", "volume=0.3,afade=t=out:st=27:d=3", a)
+    f = tmp_path / "wrap.ts"
+    _ff("-i", a, "-c:a", "mp2", "-output_ts_offset", "95430", f)   # wraps 2^33 mid-file
+    r = asyncio.run(check(str(f)))
+    assert not [i for i in r.issues if i.detail.get("check") == "truncation"]
+
+
+@requires_ffmpeg
+@pytest.mark.parametrize("ext", ["mkv", "webm"])
+def test_video_outlasting_audio_without_stream_durations(tmp_path, ext):
+    from audel import check
+
+    f = tmp_path / f"v.{ext}"
+    v = ["-c:v", "ffv1"] if ext == "mkv" else ["-c:v", "libvpx", "-b:v", "50k"]
+    ac = ["-c:a", "flac"] if ext == "mkv" else ["-c:a", "libopus"]
+    _ff("-f", "lavfi", "-i", "color=c=black:s=64x64:d=12", "-f", "lavfi", "-i", "sine=d=9",
+        "-map", "0:v", "-map", "1:a", *v, *ac, f)
+    assert not _checks(asyncio.run(check(str(f))), "duration_mismatch")
+
+
+def test_compressed_wav_is_not_sized_from_its_nominal_byte_rate(tmp_path):
+    import struct
+
+    from audel.mediaguard import container_shortfall_s
+
+    fmt = struct.pack("<HHIIHH", 2, 1, 8000, 4096, 256, 4)   # MS ADPCM: nominal byte rate
+    body = b"WAVE" + b"fmt " + struct.pack("<I", 16) + fmt + b"data" + \
+        struct.pack("<I", 40000) + b"\0" * 20000
+    f = tmp_path / "adpcm.wav"
+    f.write_bytes(b"RIFF" + struct.pack("<I", len(body)) + body)
+    assert container_shortfall_s(f, 3600) == 0.0
+
+
+@requires_ffmpeg
+def test_cut_alaw_aifc_is_caught(tmp_path):
+    from audel import check
+
+    full = tmp_path / "a.aifc"
+    _ff("-f", "lavfi", "-i", "sine=d=6", "-c:a", "pcm_alaw", full)
+    cut = tmp_path / "cut.aifc"
+    data = full.read_bytes()
+    cut.write_bytes(data[: len(data) * 6 // 10])
+    assert not _checks(asyncio.run(check(str(full))), "container_truncated")
+    assert _checks(asyncio.run(check(str(cut))), "container_truncated")
