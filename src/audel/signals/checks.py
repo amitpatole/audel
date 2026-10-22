@@ -286,21 +286,40 @@ def evaluate(m: Measurements, settings: Settings, spec: DeliverySpec | str | Non
             "graded on the decoded audio", span=_full_span(dur), source=IssueSource.DSP,
             detail={"check": "duration_mismatch", "declared_s": round(m.declared_s, 3),
                     "decoded_s": round(dur, 3)}))
-    longest = max((t.decoded_s for t in m.tracks), default=0.0)
+    live = [t for t in m.tracks if not t.failed]
+    longest = max((t.stream.start_s + t.decoded_s for t in live), default=0.0)
     for tm in m.tracks:
         label = _track_label(tm, multi)
+        if tm.failed:
+            issues.append(_issue(IssueKind.DECODE_ERROR, Severity.CRITICAL,
+                                 f"{label}track could not be decoded: {tm.failed}",
+                                 _full_span(dur), "track_decode_error", tm))
+            continue
         if tm.decode_errors:
             issues.append(_issue(
                 IssueKind.DROPOUT, Severity.ERROR if tm.decode_errors >= 10 else Severity.WARNING,
                 f"{label}the decoder reported {tm.decode_errors} problem(s) with the data "
                 "(corrupt or missing packets); audio may be missing", _full_span(dur),
                 "decode_errors", tm, conf=Confidence.MEDIUM, errors=tm.decode_errors))
-        if multi and longest > 0 and tm.decoded_s > 0 and tm.decoded_s < longest - max(1.0, 0.02 * longest):
+        for a, b in tm.gaps[:_MAX_SPANS]:
             issues.append(_issue(
-                IssueKind.TRUNCATION, Severity.ERROR,
-                f"{label}track is {tm.decoded_s:.1f}s long but the programme runs {longest:.1f}s",
-                Span(start_ms=_ms(tm.decoded_s), end_ms=_ms(longest)), "short_track", tm,
-                decoded_s=round(tm.decoded_s, 3), programme_s=round(longest, 3)))
+                IssueKind.DROPOUT, Severity.WARNING,
+                f"{label}{b - a:.2f}s of audio packets missing (timeline gap)",
+                Span(start_ms=_ms(a), end_ms=_ms(b)), "packet_gap", tm, conf=Confidence.MEDIUM,
+                gap_s=round(b - a, 3)))
+        start, end = tm.stream.start_s, tm.stream.start_s + tm.decoded_s
+        tol = max(1.0, 0.02 * longest)
+        if multi and longest > 0 and tm.decoded_s > 0 and (start > tol or end < longest - tol):
+            missing = [(0.0, start)] if start > tol else []
+            if end < longest - tol:
+                missing.append((end, longest))
+            for a, b in missing:
+                issues.append(_issue(
+                    IssueKind.TRUNCATION, Severity.ERROR,
+                    f"{label}track has no audio from {a:.1f}s to {b:.1f}s of a "
+                    f"{longest:.1f}s programme", Span(start_ms=_ms(a), end_ms=_ms(b)),
+                    "short_track", tm, track_start_s=round(start, 3),
+                    track_end_s=round(end, 3), programme_s=round(longest, 3)))
         if not tm.frames and (tm.rms_dbfs is None or not math.isfinite(tm.rms_dbfs)):
             # No samples were measured at all: report it once instead of trusting the meters'
             # placeholder values (an empty stream otherwise reads as 0 dBTP "clipping").

@@ -98,8 +98,17 @@ def _ffmpeg_layout_table() -> dict[str, list[str]]:
 _LAYOUT_CACHE: dict[str, list[str]] | None = None
 
 
+def _mask_inner(layout: str) -> str:
+    """ffprobe prints a non-standard channel mask as ``N channels (A+B+...)``: return ``A+B+...``."""
+    import re
+
+    m = re.fullmatch(r"\d+ channels \(([A-Za-z0-9+]+)\)", layout or "")
+    return m.group(1) if m else layout
+
+
 def layout_channels(layout: str) -> list[str] | None:
     """Channel names of a layout: FFmpeg's table, or a ``FL+FR+LFE+...`` custom layout."""
+    layout = _mask_inner(layout)
     if not layout:
         return None
     if "+" in layout:
@@ -123,6 +132,8 @@ class StreamInfo:
     layout: str = ""
     language: str | None = None
     title: str | None = None
+    abs_index: int = -1      # the container's stream index (ffmpeg's #0:K)
+    start_s: float = 0.0     # where this track starts on the programme timeline
 
     def channel_labels(self) -> list[str]:
         layout = self.layout or _DEFAULT_LAYOUT.get(self.channels, "")
@@ -266,7 +277,7 @@ def pcm_pipeline(path: Path, settings: Settings, *, stream: int, channels: int,
                  sample_rate: int, analysis: list[str], timeout_s: float,
                  pre_input: list[str] | None = None, layout: str = "",
                  verbose: bool = False, max_stderr: int = 128 * 1024 * 1024,
-                 stats: dict | None = None) -> str:
+                 stats: dict | None = None, abs_index: int = -1) -> str:
     """Decode the untrusted file to raw float PCM in one process and ANALYSE it in another.
 
     The analysing ffmpeg only ever sees a raw PCM stream (no container, no metadata, no tags), so
@@ -286,8 +297,12 @@ def pcm_pipeline(path: Path, settings: Settings, *, stream: int, channels: int,
     # -reinit_filter 0: a stream that changes sample rate / channel count mid-file is REFUSED
     # rather than silently resampled to its first frame's format (which hid most of the audio).
     # -ch_layout keeps the stream's own channel order (an -ac N remix would relabel channels).
-    decode = [ffmpeg, "-nostdin", "-hide_banner", "-v", "error", "-threads", "1",
-              "-reinit_filter", "0", *(pre_input or []), *safe_input(path),
+    # The decoder runs at -v verbose so it prints its own per-stream summary ("N decode errors")
+    # for the mapped stream only; error lines from OTHER streams (probing decodes them all) are
+    # never counted. -err_detect crccheck makes CRC-protected codecs report corruption.
+    decode = [ffmpeg, "-nostdin", "-hide_banner", "-v", "verbose", "-threads", "1",
+              "-reinit_filter", "0", "-err_detect", "crccheck+explode",
+              *(pre_input or []), *safe_input(path),
               "-map", f"0:a:{int(stream)}",
               # Restamp by SAMPLE COUNT before the -t cap: a forward timestamp jump must not end
               # decoding early (and leave the audio after it unmeasured).
@@ -334,9 +349,7 @@ def pcm_pipeline(path: Path, settings: Settings, *, stream: int, channels: int,
     tail1 = err1.join(5).decode("utf-8", "replace")
     out2 = err2.join(5).decode("utf-8", "replace")
     if stats is not None:
-        # The decoder runs at -v error: every line it printed is a decoding problem (corrupt or
-        # missing data), even when it still exits 0.
-        stats["decode_errors"] = err1.lines
+        stats["decode_errors"] = _stream_decode_errors(tail1, abs_index)
     for pipe in (p1.stderr, p2.stderr):
         try:
             pipe.close()
@@ -353,6 +366,57 @@ def pcm_pipeline(path: Path, settings: Settings, *, stream: int, channels: int,
 ANALYSIS_MAX_RATE = 48000
 
 
+def _stream_decode_errors(text: str, abs_index: int) -> int:
+    """ffmpeg's own count for ONE stream, from its anchored end-of-run summary line
+    (``[in#0/...]   Input stream #0:K (audio): ... N decode errors``). Metadata dump lines are
+    indented and can't start a line with ``[in#0/``, so tag text can't forge this."""
+    import re
+
+    k = abs_index if abs_index >= 0 else r"\d+"
+    rx = re.compile(r"^\[in#0/[^\]\n]+\]\s+Input stream #0:" + str(k)
+                    + r" \(audio\):[^\n]*?(\d+) decode errors", re.MULTILINE)
+    found = rx.findall(text)
+    return int(found[-1]) if found else 0
+
+
+_MAX_PACKET_GAP_S = 60.0
+
+
+def packet_gaps(path: Path, settings: Settings, abs_index: int, *, min_gap_s: float = 0.1,
+                limit: int = 50) -> list[tuple[float, float]] | None:
+    """Gaps in a stream's packet timeline (missing packets). Restamping by sample count would
+    otherwise close them up silently. ``None`` if the timeline couldn't be read."""
+    if abs_index < 0:
+        return None
+    ffprobe = _tool("ffprobe", settings.ffmpeg_path and str(Path(settings.ffmpeg_path).with_name("ffprobe")))
+    argv = [ffprobe, "-v", "error", "-select_streams", str(abs_index),
+            "-show_entries", "packet=pts_time,duration_time", "-of", "csv=p=0", *safe_input(path)]
+    proc = run(argv, timeout_s=min(120.0, settings.decode_timeout_s),
+               max_stdout_bytes=64 * 1024 * 1024)
+    if proc.returncode != 0:
+        return None
+    gaps: list[tuple[float, float]] = []
+    prev_end: float | None = None
+    for line in proc.stdout.decode("ascii", "replace").split("\n"):
+        parts = line.strip().split(",")
+        if len(parts) < 2:
+            continue
+        try:
+            pts, dur = float(parts[0]), float(parts[1])
+        except ValueError:
+            continue
+        if not (pts == pts and dur == dur) or dur < 0:  # NaN / garbage
+            continue
+        if prev_end is not None and min_gap_s < pts - prev_end <= _MAX_PACKET_GAP_S:
+            # Small holes are missing packets. Huge jumps are timestamp discontinuities (e.g. a
+            # broadcast splice); the decoded-vs-declared duration check covers those.
+            gaps.append((prev_end, pts))
+            if len(gaps) >= limit:
+                break
+        prev_end = max(prev_end or 0.0, pts + dur)
+    return gaps
+
+
 def channel_layout_arg(layout: str, channels: int) -> str:
     """The -ch_layout to decode and analyse with: the stream's own layout name when ffmpeg knows
     it (probe output, charset-filtered), else a custom layout of N named channels (ffmpeg's
@@ -360,6 +424,7 @@ def channel_layout_arg(layout: str, channels: int) -> str:
     import re
 
     n = max(1, int(channels))
+    layout = _mask_inner(layout)
     if layout and layout != "unknown" and re.fullmatch(r"[A-Za-z0-9.()+_-]{1,200}", layout):
         known = layout_channels(layout)
         if known is None or len(known) == n:
@@ -417,8 +482,8 @@ def probe(path: Path, settings: Settings) -> MediaInfo:
     argv = [
         ffprobe, "-v", "error", "-print_format", "json",
         "-show_entries",
-        "format=duration:stream=codec_type,codec_name,sample_rate,channels,channel_layout"
-        ":stream_tags=language,title",
+        "format=duration,format_name:stream=index,codec_type,codec_name,sample_rate,channels,"
+        "channel_layout,start_time:stream_tags=language,title",
         *safe_input(path),
     ]
     proc = run(argv, timeout_s=min(30.0, settings.decode_timeout_s))
@@ -435,6 +500,11 @@ def probe(path: Path, settings: Settings) -> MediaInfo:
     try:
         duration_s = float(meta.get("format", {}).get("duration") or 0.0)
     except (TypeError, ValueError):
+        duration_s = 0.0
+    fmt = str(meta.get("format", {}).get("format_name") or "")
+    if "mpegts" in fmt and duration_s > settings.max_duration_s:
+        # MPEG-TS duration is a PTS estimate: a timestamp splice can inflate it. Treat it as
+        # unknown (budgets then assume the maximum) and let the decode cap fail closed instead.
         duration_s = 0.0
     try:
         sample_rate = int(a.get("sample_rate") or 0)
@@ -474,10 +544,15 @@ def probe(path: Path, settings: Settings) -> MediaInfo:
         if ch > settings.max_channels:
             raise UnsafeSourceError(f"stream {i} channel count {ch} exceeds the {settings.max_channels} cap")
         tags = st.get("tags") if isinstance(st.get("tags"), dict) else {}
+        try:
+            start = max(0.0, float(st.get("start_time") or 0.0))
+        except (TypeError, ValueError):
+            start = 0.0
         streams.append(StreamInfo(
             index=i, codec=_tag(st.get("codec_name")), sample_rate=sr, channels=ch,
             layout=_tag(st.get("channel_layout")), language=_tag(tags.get("language")) or None,
-            title=_tag(tags.get("title")) or None))
+            title=_tag(tags.get("title")) or None, abs_index=_int(st.get("index", -1)),
+            start_s=start if start == start else 0.0))
     if channels > settings.max_channels:
         raise UnsafeSourceError(f"channel count {channels} exceeds the {settings.max_channels} cap")
     return MediaInfo(duration_s=duration_s, sample_rate=sample_rate, channels=channels,

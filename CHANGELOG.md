@@ -95,6 +95,24 @@ All notable changes to Audel are recorded here. The format follows
   - **Deploy.** Helm ingress defaults to the same namespace, DNS egress goes to kube-dns only,
     token, JWKS and TLS mounts are supported, and the default is one replica. The Dockerfile base
     is pinned by digest, and GitHub Actions are pinned to commit SHAs.
+- Red-team round 5 fixes (decode and accuracy on real-world files), each pinned by a regression
+  test. 21 legitimate professional formats (BWF, RF64, MXF OP1a, MOV pcm24 with timecode, TS, ALAC,
+  E-AC-3, files with ID3 and odd chunks, and more) grade with no false integrity findings.
+  - **Medium.** Decoder errors were counted from every stream ffmpeg probes, video included, and
+    each was counted twice. A cut broadcast capture got a false FAIL, and a clean track was blamed
+    for a damaged neighbour. The count now comes from ffmpeg's own per-stream summary for the graded
+    stream only.
+  - **Medium.** Custom channel masks (`N channels (A+B+...)`, such as surround or LFE stems) aborted
+    the grade or were silently remixed. They are now decoded in place and labelled.
+  - **Low-Medium.** Missing-packet gaps were closed up by the sample restamp. Packet-timeline gaps
+    are now reported at their position (`packet_gap`).
+  - **Low-Medium.** CRC-protected codecs (FLAC, AC-3, E-AC-3) hid corruption. CRCs are now checked.
+  - **Low.** A delayed-start track was blamed at the wrong time and got a false truncation. Tracks
+    are now placed on the programme timeline.
+  - **Low.** An MPEG-TS timestamp splice was refused as a duration bomb. TS durations are treated
+    as estimates, and the decode cap still fails closed.
+  - **Low.** One undecodable track discarded the whole grade. It is now reported by name
+    (`track_decode_error`) and the other tracks are graded.
 - Red-team round 5 fixes (network surface), each pinned by a regression test:
   - **Medium.** Async jobs took the global grading slot before the tenant's share, and fetched URL
     inputs while holding it. Jobs now fetch first, before any slot, then take the tenant share,

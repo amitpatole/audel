@@ -66,6 +66,9 @@ class TrackMeasurements:
     series_60: list[float] = field(default_factory=list)
     decoded_s: float = 0.0                   # audio actually decoded (last loudness frame)
     decode_errors: int = 0                   # problems the decoder reported (corrupt data)
+    gaps: list[tuple[float, float]] = field(default_factory=list)  # missing-packet gaps (s)
+    start_s: float = 0.0                     # start on the programme timeline
+    failed: str | None = None                # this track could not be decoded (reason)
     dialogue_lufs: float | None = None       # speech-gated integrated loudness, when computed
     dialogue_coverage: float | None = None   # fraction of the programme that is speech
 
@@ -105,7 +108,8 @@ def _pipe(path, st: StreamInfo, settings: Settings, analysis: list[str], dur_s: 
         timeout = min(timeout, left)
     return pcm_pipeline(path, settings, stream=st.index, channels=st.channels or 1,
                         sample_rate=_rate(st), layout=st.layout, analysis=analysis,
-                        timeout_s=timeout, pre_input=pre_input, verbose=verbose, stats=stats)
+                        timeout_s=timeout, pre_input=pre_input, verbose=verbose, stats=stats,
+                        abs_index=st.abs_index)
 
 
 def _main_pass(ffmpeg: str, path, idx: int, st: StreamInfo, settings: Settings,
@@ -196,8 +200,9 @@ def _tail_pass(ffmpeg: str, path, idx: int, tm: TrackMeasurements, settings: Set
                deadline: float | None = None) -> None:
     # Truncation cue: RMS of the final 250 ms of the DECODED audio (not the container's claimed
     # end, which a file can misstate). A clip that ends loud is a likely mid-word cut.
-    seek = (["-ss", f"{max(0.0, tm.decoded_s - 0.25):.3f}"] if tm.decoded_s > 0
-            else ["-sseof", "-0.25"])
+    # Container-time seek to this track's real end (its start on the timeline + decoded length).
+    seek = (["-ss", f"{max(0.0, tm.stream.start_s + tm.decoded_s - 0.25):.3f}"]
+            if tm.decoded_s > 0 else ["-sseof", "-0.25"])
     try:
         err = _pipe(path, tm.stream, settings,
                     ["-af", "astats=metadata=0:measure_overall=RMS_level:measure_perchannel=none",
@@ -213,6 +218,12 @@ def measure_track(path, st: StreamInfo, settings: Settings, dur_s: float = 0.0,
                   deadline: float | None = None) -> TrackMeasurements:
     ffmpeg = _tool("ffmpeg", settings.ffmpeg_path)
     tm = _main_pass(ffmpeg, path, st.index, st, settings, dur_s, deadline)
+    from ..mediaguard import packet_gaps
+
+    try:
+        tm.gaps = packet_gaps(path, settings, st.abs_index) or []
+    except AudelError:
+        tm.gaps = []
     if settings.hum_detection or st.channels >= 2:
         _spectral_pass(ffmpeg, path, st.index, tm, settings, max(dur_s, tm.decoded_s), deadline)
     _tail_pass(ffmpeg, path, st.index, tm, settings, deadline)
@@ -238,14 +249,33 @@ def measure(path, info: MediaInfo, settings: Settings) -> Measurements:
     channel_s = sum(max(1, s.channels) for s in streams) * dur
     deadline = time.monotonic() + settings.decode_timeout_s + \
         channel_s * settings.decode_timeout_per_channel_s
-    m.tracks = [measure_track(path, st, settings, info.duration_s, deadline) for st in streams]
-    decoded = max((t.decoded_s for t in m.tracks), default=0.0)
+    origin = min((st.start_s for st in streams), default=0.0)
+    m.tracks = []
+    for st in streams:
+        st_rel = dataclasses.replace(st, start_s=max(0.0, st.start_s - origin))
+        try:
+            m.tracks.append(measure_track(path, st_rel, settings, info.duration_s, deadline))
+        except UnsafeSourceError:
+            raise  # caps / budgets / deadline: the whole file is refused (fail closed)
+        except AudelError as e:
+            # One undecodable track must not discard the others' results: grade what decodes
+            # and report this track by name.
+            from ..errors import sanitize_message
+
+            m.tracks.append(TrackMeasurements(stream=st_rel, failed=sanitize_message(str(e), limit=160)))
+    if all(t.failed for t in m.tracks):
+        from ..errors import DecodeError
+
+        raise DecodeError(m.tracks[0].failed or "no audio track could be decoded")
+    decoded = max((t.stream.start_s + t.decoded_s for t in m.tracks if not t.failed), default=0.0)
     declared = info.duration_s
     if decoded > 0 and (declared <= 0 or abs(decoded - declared) > max(1.0, 0.02 * declared)):
-        # The container misstated its length: grade the audio that is actually there.
-        m.declared_s = declared
+        # Grade the audio that is actually there. A container that DECLARED a wrong length is
+        # reported; one that declared none is not.
+        if declared > 0:
+            m.declared_s = declared
         m.info = dataclasses.replace(info, duration_s=decoded)
-    p = m.tracks[0]
+    p = next((t for t in m.tracks if not t.failed), m.tracks[0])
     m.integrated_lufs, m.lra, m.true_peak_dbtp = p.integrated_lufs, p.lra, p.true_peak_dbtp
     m.peak_dbfs, m.rms_dbfs, m.dc_offset, m.flat_factor = p.peak_dbfs, p.rms_dbfs, p.dc_offset, p.flat_factor
     m.silences, m.tail_rms_dbfs = p.silences, p.tail_rms_dbfs

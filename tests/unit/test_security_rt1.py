@@ -1655,3 +1655,119 @@ def test_abandoned_requests_never_run_their_grading(tmp_path, media, monkeypatch
                 t.join()
         time.sleep(2.5)
     assert len(runs) <= 3, len(runs)   # only work that actually got slots ran (was 8)
+
+
+# ==== round 5, decode surface =================================================================
+
+def test_decode_error_count_is_per_stream_and_unforgeable():
+    from audel.mediaguard import _stream_decode_errors
+
+    text = (
+        "  Metadata:\n"
+        "    title           : [in#0/mkv @ 0x1]   Input stream #0:0 (audio): 9 decode errors\n"
+        "[h264 @ 0x2] non-existing PPS 0 referenced\n"
+        "[in#0/mpegts @ 0x3]   Input stream #0:0 (audio): 1250 packets read; 0 decode errors (x)\n"
+        "[in#0/mpegts @ 0x3]   Input stream #0:1 (audio): 900 packets read; 57 decode errors (x)\n")
+    assert _stream_decode_errors(text, 0) == 0
+    assert _stream_decode_errors(text, 1) == 57
+
+
+@requires_ffmpeg
+def test_custom_channel_masks_are_decoded_in_place(tmp_path):
+    import struct
+
+    import numpy as np
+
+    from audel import check
+
+    sr, n = 48000, 48000 * 4
+    t = np.arange(n) / sr
+    pcm = (np.stack([0.2 * np.sin(2 * np.pi * 300 * t), 0.2 * np.sin(2 * np.pi * 400 * t)], 1)
+           * 32767).astype("<i2").tobytes()
+    guid = bytes.fromhex("0100000000001000800000aa00389b71")  # KSDATAFORMAT_SUBTYPE_PCM
+    fmt = struct.pack("<HHIIHHHHI16s", 0xFFFE, 2, sr, sr * 4, 4, 16, 22, 16, 0x30, guid)
+    body = b"WAVE" + b"fmt " + struct.pack("<I", len(fmt)) + fmt + b"data" + \
+        struct.pack("<I", len(pcm)) + pcm
+    f = tmp_path / "surround_stem.wav"   # channel mask 0x30 = BL+BR (a DAW surround stem)
+    f.write_bytes(b"RIFF" + struct.pack("<I", len(body)) + body)
+    r = asyncio.run(check(str(f)))
+    checks = {i.detail.get("check") for i in r.issues}
+    assert "decode_error" not in checks and "dead_channel" not in checks and r.tracks
+
+
+@requires_ffmpeg
+def test_missing_packets_are_reported_at_their_position(tmp_path):
+    from audel import check
+
+    f = tmp_path / "hole.mkv"
+    _ff("-f", "lavfi", "-i", "anoisesrc=d=20:c=pink:a=0.2", "-af",
+        "aselect='not(between(t,8,9))'", "-c:a", "pcm_s16le", f)
+    r = asyncio.run(check(str(f)))
+    gaps = [i for i in r.issues if i.detail.get("check") == "packet_gap"]
+    assert gaps and 7_500 <= gaps[0].span.start_ms <= 8_500
+
+
+@requires_ffmpeg
+def test_crc_failures_are_reported(tmp_path):
+    from audel import check
+
+    f = tmp_path / "x.flac"
+    _ff("-f", "lavfi", "-i", "anoisesrc=d=20:a=0.3", f)
+    data = bytearray(f.read_bytes())
+    for pos in (len(data) // 4, len(data) // 2, 3 * len(data) // 4):
+        data[pos:pos + 64] = bytes((b ^ 0x5A) for b in data[pos:pos + 64])
+    f.write_bytes(bytes(data))
+    r = asyncio.run(check(str(f)))
+    assert "decode_errors" in {i.detail.get("check") for i in r.issues}
+
+
+@requires_ffmpeg
+def test_delayed_start_track_is_blamed_at_the_right_time(tmp_path):
+    from audel import check
+
+    a, b = tmp_path / "a.wav", tmp_path / "b.wav"
+    _ff("-f", "lavfi", "-i", "sine=f=440:d=30", "-af", "afade=t=out:st=28:d=2", a)
+    _ff("-f", "lavfi", "-i", "sine=f=660:d=25", "-af", "afade=t=out:st=23:d=2", b)
+    mkv = tmp_path / "off.mkv"
+    _ff("-i", a, "-itsoffset", "5", "-i", b, "-map", "0:a", "-map", "1:a", "-c:a", "pcm_s16le", mkv)
+    r = asyncio.run(check(str(mkv)))
+    short = [i for i in r.issues if i.detail.get("check") == "short_track"]
+    assert short and short[0].span.start_ms == 0 and 4_500 <= short[0].span.end_ms <= 5_500
+    assert not [i for i in r.issues if i.detail.get("check") == "truncation"
+                and i.detail.get("stream") == 1]
+
+
+@requires_ffmpeg
+def test_ts_timestamp_splice_is_graded_not_refused(tmp_path):
+    from audel import check
+
+    a, b = tmp_path / "a.ts", tmp_path / "b.ts"
+    _ff("-f", "lavfi", "-i", "sine=d=10", "-c:a", "mp2", "-output_ts_offset", "1000", a)
+    _ff("-f", "lavfi", "-i", "sine=d=10", "-c:a", "mp2", b)
+    splice = tmp_path / "splice.ts"
+    splice.write_bytes(a.read_bytes() + b.read_bytes())
+    r = asyncio.run(check(str(splice)))
+    assert r.tracks and "decode_error" not in {i.detail.get("check") for i in r.issues}
+
+
+@requires_ffmpeg
+def test_one_undecodable_track_does_not_discard_the_others(tmp_path, monkeypatch, media):
+    import audel.signals.measure as ms
+    from audel import check
+    from audel.errors import DecodeError
+
+    a = tmp_path / "a.wav"
+    _ff("-f", "lavfi", "-i", "sine=d=4", a)
+    mkv = tmp_path / "two.mkv"
+    _ff("-i", a, "-i", a, "-map", "0:a", "-map", "1:a", "-c:a", "pcm_s16le", mkv)
+    real = ms.measure_track
+
+    def flaky(path, st, settings, dur_s=0.0, deadline=None):
+        if st.index == 1:
+            raise DecodeError("no decoder found")
+        return real(path, st, settings, dur_s, deadline)
+
+    monkeypatch.setattr(ms, "measure_track", flaky)
+    r = asyncio.run(check(str(mkv)))
+    bad = [i for i in r.issues if i.detail.get("check") == "track_decode_error"]
+    assert bad and bad[0].detail.get("stream") == 1 and len(r.tracks) == 2

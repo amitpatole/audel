@@ -19,10 +19,12 @@ consumers of the contract key on. It also has a precise rule name in `detail.che
 | `true_peak_ceiling` | `clipping` | true peak is above the spec ceiling but below full scale | error |
 | `clipping` | `clipping` | true peak is at or above 0 dBTP | error |
 | `truncation` | `truncation` | the track ends at programme level with no decay | warning (low confidence) |
-| `short_track` | `truncation` | one audio track ends well before the programme | error |
-| `decode_errors` | `dropout` | the decoder reported corrupt or missing data | warning, error at 10 or more |
+| `short_track` | `truncation` | one audio track starts late or ends early on the programme timeline | error |
+| `decode_errors` | `dropout` | the decoder reported corrupt data or CRC failures in this stream | warning, error at 10 or more |
 | `duration_mismatch` | `duration` | the container's declared length differs from the decoded audio | warning |
 | `empty_stream` | `silence` | an audio stream contains no samples | critical |
+| `packet_gap` | `dropout` | audio packets are missing from the stream's timeline | warning |
+| `track_decode_error` | `decode_error` | one audio track can't be decoded (the others are still graded) | critical |
 | `dead_channel` | `channel_issue` | one channel is silent while the track is live (LFE excluded) | error |
 | `polarity_inversion` | `channel_issue` | left and right cancel to silence in a mono fold-down | error |
 | `phase` | `channel_issue` | left and right are largely anti-correlated | warning |
