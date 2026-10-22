@@ -19,7 +19,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from audel.adapters.rest import build_app  # noqa: E402
 
-A_TOK, B_TOK = "tenant-a-token-xxxxxxxxxxxxxxxx", "tenant-b-token-yyyyyyyyyyyyyyyy"
+A_TOK, B_TOK = "audel_nI2zB7O_Uh68j1nSJ3HC0HZvRcc8YRArfug1RWWMl8I_2jqr43az", "audel_3fQaanmbW-3GFx1p3c4mj32cO4yjzLdEmLr_Jkuxr_g_bcvmuvmx"
 
 
 @pytest.fixture
@@ -289,7 +289,7 @@ def test_mutual_tls_requires_a_client_certificate(tmp_path, monkeypatch):
     sock.bind(("127.0.0.1", 0))
     port = sock.getsockname()[1]
     sock.close()
-    for k, v in {"AUDEL_API_TOKEN": "4ff70d20d90b8a5d20f68be638b41178509c5aa2d11dff85dc8bff1771a037fb", "AUDEL_CACHE_DIR": str(tmp_path),
+    for k, v in {"AUDEL_API_TOKEN": "audel_s2GS5zbClAPZW_BX-zl1O7VUqv193uD1ZB0otjT2Tag_a2oxej7i", "AUDEL_CACHE_DIR": str(tmp_path),
                  "AUDEL_TLS_CERTFILE": str(d / "srv.crt"), "AUDEL_TLS_KEYFILE": str(d / "srv.key"),
                  "AUDEL_TLS_CLIENT_CA": str(d / "ca.crt")}.items():
         monkeypatch.setenv(k, v)
@@ -321,7 +321,7 @@ def test_mutual_tls_requires_a_client_certificate(tmp_path, monkeypatch):
 def test_serve_refuses_half_configured_tls(monkeypatch, tmp_path):
     from audel.adapters.rest import serve
 
-    monkeypatch.setenv("AUDEL_API_TOKEN", "4ff70d20d90b8a5d20f68be638b41178509c5aa2d11dff85dc8bff1771a037fb")
+    monkeypatch.setenv("AUDEL_API_TOKEN", "audel_s2GS5zbClAPZW_BX-zl1O7VUqv193uD1ZB0otjT2Tag_a2oxej7i")
     monkeypatch.setenv("AUDEL_TLS_CERTFILE", str(tmp_path / "a.crt"))
     with pytest.raises(SystemExit):
         serve("127.0.0.1", 0)

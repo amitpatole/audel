@@ -5,7 +5,7 @@ zero-config for local development. A routable bind refuses to start without auth
 
 ```bash
 pip install "audel[serve,asr]"
-export AUDEL_API_TOKEN="$(openssl rand -hex 32)"
+export AUDEL_API_TOKEN="$(audel token new)"
 audel serve --host 0.0.0.0 --port 8000
 ```
 
@@ -38,8 +38,9 @@ export AUDEL_API_TOKENS_FILE=/etc/audel/tokens.json
 export AUDEL_ADMIN_TENANTS='["ops"]'         # who may read /doctor and /metrics
 ```
 
-A shared `AUDEL_API_TOKEN` must be generated (`openssl rand -hex 32` or `audel token new`).
-Patterned or hand-typed strings are refused at startup. For OIDC, set `AUDEL_JWT_JWKS_FILE`,
+Every token, shared or per-tenant, must be minted by `audel token new`. A minted token has the
+form `audel_<256 random bits>_<checksum>`. Anything else is refused before it is compared, so a
+hand-chosen secret can't be used, even if its hash is put in the tokens file. For OIDC, set `AUDEL_JWT_JWKS_FILE`,
 `AUDEL_JWT_ISSUER` and `AUDEL_JWT_AUDIENCE`, and keep the JWKS file synced from your identity
 provider. JWT tenants appear as `jwt:<claim>`.
 

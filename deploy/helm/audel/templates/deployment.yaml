@@ -4,10 +4,18 @@
 {{- if and .Values.auth.jwt.jwksConfigMap (not (and .Values.auth.jwt.issuer .Values.auth.jwt.audience)) }}
 {{- fail "auth.jwt.issuer and auth.jwt.audience are required with a JWKS" }}
 {{- end }}
-{{- if and (eq (toString .Values.tls.mutual) "true") (not .Values.tls.secretName) }}
+{{- $mutual := lower (toString .Values.tls.mutual) }}
+{{- $plain := lower (toString .Values.service.allowPlaintext) }}
+{{- if not (has $mutual (list "true" "false")) }}
+{{- fail "tls.mutual must be true or false" }}
+{{- end }}
+{{- if not (has $plain (list "true" "false")) }}
+{{- fail "service.allowPlaintext must be true or false" }}
+{{- end }}
+{{- if and (eq $mutual "true") (not .Values.tls.secretName) }}
 {{- fail "tls.mutual needs tls.secretName (a server certificate); refusing to render a plaintext deployment" }}
 {{- end }}
-{{- if and (has .Values.service.type (list "LoadBalancer" "NodePort")) (not .Values.tls.secretName) (ne (toString .Values.service.allowPlaintext) "true") }}
+{{- if and (has .Values.service.type (list "LoadBalancer" "NodePort")) (not .Values.tls.secretName) (ne $plain "true") }}
 {{- fail "service.type exposes Audel outside the cluster without TLS: set tls.secretName (or service.allowPlaintext=true behind your own TLS)" }}
 {{- end }}
 {{- $scheme := ternary "HTTPS" "HTTP" (ne .Values.tls.secretName "") }}
@@ -64,7 +72,7 @@ spec:
             {{- if .Values.tls.secretName }}
             - {name: AUDEL_TLS_CERTFILE, value: /etc/audel/tls/tls.crt}
             - {name: AUDEL_TLS_KEYFILE, value: /etc/audel/tls/tls.key}
-            {{- if eq (toString .Values.tls.mutual) "true" }}
+            {{- if eq $mutual "true" }}
             - {name: AUDEL_TLS_CLIENT_CA, value: /etc/audel/tls/ca.crt}
             {{- end }}
             {{- end }}
@@ -72,7 +80,7 @@ spec:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities: {drop: ["ALL"]}
-          {{- if eq (toString .Values.tls.mutual) "true" }}
+          {{- if eq $mutual "true" }}
           # mTLS rejects probes without a client certificate: check the port instead.
           readinessProbe:
             tcpSocket: {port: http}

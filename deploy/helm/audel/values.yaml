@@ -9,7 +9,7 @@ replicaCount: 1
 
 # At least one auth source is required; the chart never generates or embeds a credential.
 auth:
-  existingSecret: ""        # Secret with key AUDEL_API_TOKEN (shared token, >= 32 chars)
+  existingSecret: ""        # Secret with key AUDEL_API_TOKEN (minted by `audel token new`)
   tokensSecret: ""          # Secret with key tokens.json (per-tenant SHA-256 hashes)
   jwt:
     jwksConfigMap: ""       # ConfigMap with key jwks.json

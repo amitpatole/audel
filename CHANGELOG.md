@@ -95,6 +95,18 @@ All notable changes to Audel are recorded here. The format follows
   - **Deploy.** Helm ingress defaults to the same namespace, DNS egress goes to kube-dns only,
     token, JWKS and TLS mounts are supported, and the default is one replica. The Dockerfile base
     is pinned by digest, and GitHub Actions are pinned to commit SHAs.
+- Red-team round 4 fixes (auth surface), each pinned by a regression test:
+  - **Medium.** The shape-based token check accepted chosen secrets, such as sentences or a hash of
+    "password", and tenant-file hashes could not be checked at all, so guessing was bounded only by
+    throughput. Tokens are now minted only by `audel token new`, in the form
+    `audel_<256 random bits>_<checksum>`. Anything else is refused before comparison, including a
+    chosen secret whose hash is placed in the tokens file. **Breaking:** regenerate tokens with
+    `audel token new`. Running it without `--tenant` prints a shared `AUDEL_API_TOKEN`.
+  - **Low-Medium.** In Helm, a `tls.mutual` of `"True"` or `"yes"` silently disabled mTLS. Values are
+    now normalised, and anything other than true or false fails.
+  - **Low.** Log scrubbing collapsed record args and broke uvicorn's access-log lines. Arguments are
+    now scrubbed in place, and the scrubber is installed through uvicorn's own log config so it
+    survives startup.
 - Red-team round 3 fixes (decode and measurement surface), each pinned by a regression test:
   - **High.** A stream that changed sample rate or channel count mid-file was silently resampled
     and downmixed to its first frame's format, which hid most of the audio, so a defective file

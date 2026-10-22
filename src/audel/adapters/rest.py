@@ -722,8 +722,8 @@ def serve(host: str = "127.0.0.1", port: int = 8000) -> None:
     s = load_settings()
     if not _is_loopback(host) and not Authenticator(s).required:
         raise SystemExit(
-            f"Refusing to bind non-loopback host {host!r} without auth. Set AUDEL_API_TOKEN, "
-            "AUDEL_API_TOKENS_FILE or AUDEL_JWT_JWKS_FILE to expose the service, or bind 127.0.0.1."
+            f"Refusing to bind non-loopback host {host!r} without auth. Set AUDEL_API_TOKEN (from "
+            "`audel token new`), AUDEL_API_TOKENS_FILE or AUDEL_JWT_JWKS_FILE, or bind 127.0.0.1."
         )
     if bool(s.tls_certfile) != bool(s.tls_keyfile):
         raise SystemExit("TLS needs both AUDEL_TLS_CERTFILE and AUDEL_TLS_KEYFILE.")
@@ -742,11 +742,9 @@ def serve(host: str = "127.0.0.1", port: int = 8000) -> None:
     fwd: dict = {"proxy_headers": bool(s.forwarded_allow_ips)}
     if s.forwarded_allow_ips:
         fwd["forwarded_allow_ips"] = ",".join(s.forwarded_allow_ips)
-    from ..logging import scrub_logger
+    from ..logging import uvicorn_log_config
 
-    for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
-        scrub_logger(name)
-    uvicorn.run(build_app(), host=host, port=port, **tls, **fwd)
+    uvicorn.run(build_app(), host=host, port=port, log_config=uvicorn_log_config(), **tls, **fwd)
 
 
 def main() -> None:

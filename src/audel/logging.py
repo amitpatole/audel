@@ -49,14 +49,21 @@ def scrub_text(text: str) -> str:
 
 class _SecretScrubber(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003
+        # Scrub the template and each argument IN PLACE, keeping the args' shape: formatters such
+        # as uvicorn's access formatter unpack a fixed number of args.
         try:
-            msg = record.getMessage()
+            if isinstance(record.msg, str):
+                record.msg = scrub_text(record.msg)
+            if isinstance(record.args, tuple):
+                record.args = tuple(scrub_text(a) if isinstance(a, str) else a for a in record.args)
+            elif isinstance(record.args, dict):
+                record.args = {k: scrub_text(v) if isinstance(v, str) else v
+                               for k, v in record.args.items()}
+            full = record.getMessage()
         except Exception:
             return True
-        scrubbed = scrub_text(msg)
-        if scrubbed != msg:
-            record.msg = scrubbed
-            record.args = ()
+        if scrub_text(full) != full:  # a secret spanning template + argument: flatten
+            record.msg, record.args = scrub_text(full), ()
         if record.exc_info:
             # Tracebacks can carry secrets too (exception text, locals in messages).
             import traceback
@@ -91,3 +98,17 @@ def scrub_logger(name: str) -> None:
     for h in lg.handlers:
         if not any(isinstance(f, _SecretScrubber) for f in h.filters):
             h.addFilter(_SecretScrubber())
+
+
+def uvicorn_log_config() -> dict:
+    """uvicorn's own logging config with the scrubber attached to EVERY handler (uvicorn rebuilds
+    its handlers at startup, so filters added beforehand would be lost)."""
+    import copy
+
+    from uvicorn.config import LOGGING_CONFIG
+
+    cfg = copy.deepcopy(LOGGING_CONFIG)
+    cfg.setdefault("filters", {})["audel_scrub"] = {"()": "audel.logging._SecretScrubber"}
+    for h in cfg.get("handlers", {}).values():
+        h.setdefault("filters", []).append("audel_scrub")
+    return cfg

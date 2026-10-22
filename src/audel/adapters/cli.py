@@ -131,13 +131,17 @@ app.add_typer(token_app, name="token")
 
 
 @token_app.command("new")
-def token_new(tenant: str = typer.Option(..., help="Tenant name ([A-Za-z0-9._-], 1-64 chars)."),
+def token_new(tenant: str = typer.Option(None, help="Tenant name ([A-Za-z0-9._-], 1-64 chars). "
+                                         "Omit to mint a shared AUDEL_API_TOKEN."),
               rate_per_min: int = typer.Option(None, help="Optional per-tenant rate limit.")) -> None:
-    """Mint a token. Prints the token ONCE plus the hash entry for AUDEL_API_TOKENS_FILE."""
+    """Mint a token. Prints the token ONCE (plus the tokens-file hash entry for a tenant)."""
     import json as _json
 
     from ..auth import new_token, token_hash, valid_tenant
 
+    if tenant is None:
+        typer.echo(new_token())
+        return
     if not valid_tenant(tenant) or tenant.lower() in ("default", "anonymous", "admin"):
         raise typer.BadParameter("tenant must be 1-64 chars of [A-Za-z0-9._-] and not reserved")
     if rate_per_min is not None and rate_per_min < 1:

@@ -16,7 +16,7 @@ directly.
 | `audel diff BASELINE CANDIDATE` | What a fix changed: resolved, introduced and persisted issues. |
 | `audel stream SOURCE [--chunk-ms N]` | Grade a file fed as a live stream through the bounded monitor. |
 | `audel serve [--host H] [--port P]` | REST service. A routable bind requires auth. |
-| `audel token new --tenant NAME [--rate-per-min N]` | Mint a per-tenant token. Prints the token once, plus the hash entry. |
+| `audel token new [--tenant NAME] [--rate-per-min N]` | Mint a token, the only kind Audel accepts. With `--tenant` it also prints the tokens-file hash entry. |
 | `audel purge [--hours N]` | Remove stale temp files and expired sessions. |
 | `audel doctor` | Environment and backend diagnostics. |
 | `audel demo` | Broken clip to FAIL, fixed clip to PASS. No key needed. |

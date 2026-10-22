@@ -22,8 +22,9 @@ Credential sources, tried in this order:
 
 Rate limits are token buckets per tenant (``AUDEL_RATE_LIMIT_PER_MIN``, per-tenant override in
 the tokens file) and, for failed authentication, per client address
-(``AUDEL_AUTH_FAIL_PER_MIN``). Every credential is a generated secret of 256 bits (tokens) or a
-signature (JWT), so online guessing is infeasible; the failure throttle exists to cap noise and
+(``AUDEL_AUTH_FAIL_PER_MIN``). Every token must be MINTED (``audel token new``: 256 random bits
+plus a checksum); anything else is refused before comparison, and JWTs are signatures, so online
+guessing is infeasible; the failure throttle exists to cap noise and
 cost from invalid attempts, and a VALID credential always passes it (so one unauthenticated client
 cannot lock out users who share its address).
 """
@@ -71,47 +72,39 @@ def valid_tenant(name: str) -> bool:
     return bool(_TENANT_RE.match(name or ""))
 
 
-_ROWS = ("qwertyuiop", "asdfghjkl", "zxcvbnm", "1234567890", "0123456789abcdef")
+_TOKEN_RE = None
 
 
-def _walks(t: str, n: int = 5) -> bool:
-    """True if ``t`` contains an ASCII-sequential or keyboard-row run of ``n`` characters."""
-    low = t.lower()
-    for i in range(len(low) - n + 1):
-        chunk = low[i:i + n]
-        steps = {ord(chunk[k + 1]) - ord(chunk[k]) for k in range(n - 1)}
-        if steps in ({1}, {-1}):
-            return True
-        if any(chunk in row or chunk in row[::-1] for row in _ROWS):
-            return True
-    return False
+def _checksum(body: str) -> str:
+    import base64
 
-
-def strong_token(token: str) -> bool:
-    """A shared token must look like GENERATOR output, not something a person typed:
-    64+ hex characters (``openssl rand -hex 32``) or 43+ URL-safe characters
-    (``audel token new`` / ``secrets.token_urlsafe(32)``), not compressible like a repeat, and
-    with no 5-character sequential or keyboard-row walk. Online guessing is then infeasible,
-    which is what lets valid credentials always pass the failure throttle."""
-    import re
-    import zlib
-
-    if not (re.fullmatch(r"[0-9a-fA-F]{64,512}", token)
-            or re.fullmatch(r"[A-Za-z0-9_-]{43,512}", token)):
-        return False
-    if len(zlib.compress(token.encode(), 9)) / len(token) < 0.8:
-        return False
-    return not _walks(token)
+    digest = hashlib.sha256(b"audel-token:" + body.encode("ascii")).digest()
+    return base64.b32encode(digest).decode("ascii").lower().rstrip("=")[:8]
 
 
 def new_token() -> str:
-    """A fresh 256-bit URL-safe token that passes :func:`strong_token`."""
+    """Mint a token: ``audel_<43 chars = 256 random bits>_<8-char checksum>``.
+
+    The self-checking format is what makes "valid credentials always pass" safe: anything a person
+    chose (a sentence, a hash of a password, a word hashed into the tokens file) does not carry a
+    valid checksum and is refused before any comparison, so only minted 256-bit tokens work."""
     import secrets
 
-    while True:
-        t = secrets.token_urlsafe(32)
-        if strong_token(t):
-            return t
+    body = secrets.token_urlsafe(32)
+    return f"audel_{body}_{_checksum(body)}"
+
+
+def strong_token(token: str) -> bool:
+    """True only for a token minted by :func:`new_token` (format + checksum)."""
+    import re
+
+    global _TOKEN_RE
+    if _TOKEN_RE is None:
+        _TOKEN_RE = re.compile(r"\Aaudel_([A-Za-z0-9_-]{43})_([a-z2-7]{8})\Z")
+    m = _TOKEN_RE.match(token or "")
+    if m is None:
+        return False
+    return hmac.compare_digest(_checksum(m.group(1)), m.group(2))
 
 
 def token_hash(token: str) -> str:
@@ -222,8 +215,8 @@ class Authenticator:
     def __init__(self, settings: Settings) -> None:
         self._s = settings
         if settings.api_token is not None and not strong_token(settings.api_token):
-            raise ConfigError("AUDEL_API_TOKEN must be generated, not chosen: use "
-                              "`openssl rand -hex 32` or `audel token new`")
+            raise ConfigError("AUDEL_API_TOKEN must be a token minted by `audel token new` "
+                              "(audel_<random>_<checksum>); chosen strings are refused")
         self._tenants = load_tenants(settings.api_tokens_file) if settings.api_tokens_file else {}
         self._jwt = _JWTVerifier(settings) if settings.jwt_jwks_file else None
 
@@ -241,6 +234,10 @@ class Authenticator:
         presented = header[7:].strip()
         if not presented:
             return None
+        if presented.count(".") == 2 and self._jwt is not None:
+            return self._jwt.verify(presented)
+        if not strong_token(presented):
+            return None  # not a minted token: never compared (chosen secrets are unusable)
         if self._tenants:
             digest = hashlib.sha256(presented.encode("utf-8", "ignore")).digest()
             match: tuple[str, int | None] | None = None
@@ -254,8 +251,6 @@ class Authenticator:
         # a non-ASCII char raises TypeError (a crafted header would 500 instead of 401).
         if token and hmac.compare_digest(presented.encode("utf-8", "ignore"), token.encode()):
             return Principal(tenant="default", method="token")
-        if self._jwt is not None and presented.count(".") == 2:
-            return self._jwt.verify(presented)
         return None
 
 
