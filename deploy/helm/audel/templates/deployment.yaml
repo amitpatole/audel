@@ -20,7 +20,7 @@
 {{- end }}
 {{- range .Values.forwardedAllowIps }}
 {{- $e := trim (toString .) }}
-{{- if or (eq $e "*") (regexMatch "/[0-9]+\\.[0-9]" $e) (regexMatch "^[0-9.]+/0*[0-7]$" $e) (regexMatch "^[0-9a-fA-F:]+/0*([0-9]|[12][0-9]|3[01])$" $e) (regexMatch "(?i)^::(ffff:)?[0-9a-f:.]*/0*([0-9]|[1-9][0-9]|10[0-3])$" $e) }}
+{{- if or (eq $e "*") (regexMatch "/[0-9]+\\.[0-9]" $e) (regexMatch "^[0-9.]+/0*[0-7]$" $e) (regexMatch "^[0-9a-fA-F:]+/0*([0-9]|[12][0-9]|3[01])$" $e) (regexMatch "(?i)^(0*:)+(ffff:)?[0-9a-f:.]*/0*([0-9]|[1-9][0-9]|10[0-3])$" $e) (regexMatch "(?i)^64:ff9b[0-9a-f:.]*/0*([0-9]|[1-9][0-9]|10[0-3])$" $e) }}
 {{- fail (printf "forwardedAllowIps entry %q is a wildcard or too broad: list your ingress / load balancer addresses" $e) }}
 {{- end }}
 {{- end }}

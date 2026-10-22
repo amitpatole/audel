@@ -445,6 +445,9 @@ def build_app(settings: Settings | None = None):
         except TimeoutError:
             status, err = "timeout", "timeout"
             raise UnsafeSourceError(f"grading exceeded {settings.request_timeout_s:.0f}s") from None
+        except asyncio.CancelledError:
+            status, err = "cancelled", "cancelled"
+            raise
         except Exception as e:
             status, err = "error", type(e).__name__
             raise

@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .config import Settings
-from .errors import DecodeError, MissingDependencyError, UnsafeSourceError
+from .errors import BusyError, DecodeError, MissingDependencyError, UnsafeSourceError
 from .logging import get_logger
 
 _log = get_logger("mediaguard")
@@ -208,6 +208,15 @@ def _rlimit_setter(cpu_s: int):
     return _apply
 
 
+def _popen(argv: list[str], **kw) -> subprocess.Popen:
+    """Start a tool process. A host at its process / memory limit (EAGAIN, ENOMEM) is a capacity
+    problem, not a property of the media: raise BusyError (HTTP 429), never a bare 500."""
+    try:
+        return subprocess.Popen(argv, **kw)
+    except OSError:
+        raise BusyError("could not start the decoder: the host is at capacity; retry later") from None
+
+
 def run(argv: list[str], *, timeout_s: float, max_stdout_bytes: int | None = None) -> subprocess.CompletedProcess:
     """Run an ffmpeg/ffprobe argv with no shell, hard timeout, and child resource limits.
 
@@ -215,8 +224,8 @@ def run(argv: list[str], *, timeout_s: float, max_stdout_bytes: int | None = Non
     truncated to ``max_stdout_bytes`` when given (bounds raw-PCM decode buffers).
     """
     pre = _rlimit_setter(int(timeout_s) + _RLIMIT_CPU_PAD_S) if os.name == "posix" else None
-    p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                         stderr=subprocess.PIPE, preexec_fn=pre)
+    p = _popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+               stderr=subprocess.PIPE, preexec_fn=pre)
     assert p.stdout is not None and p.stderr is not None
     out = _BoundedReader(p.stdout, max_stdout_bytes or 16 * 1024 * 1024)
     err = _BoundedReader(p.stderr, 1024 * 1024, tail=True)  # bounded: a flood can't grow memory
@@ -319,11 +328,11 @@ def pcm_pipeline(path: Path, settings: Settings, *, stream: int, channels: int,
                "-threads", "1", "-f", "f32le", "-ar", str(sr), "-ch_layout", lay,
                "-i", "pipe:0", *analysis]
     pre = _rlimit_setter(int(timeout_s) + _RLIMIT_CPU_PAD_S) if os.name == "posix" else None
-    p1 = subprocess.Popen(decode, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                          stderr=subprocess.PIPE, preexec_fn=pre)
+    p1 = _popen(decode, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, preexec_fn=pre)
     try:
-        p2 = subprocess.Popen(analyse, stdin=p1.stdout, stdout=subprocess.DEVNULL,
-                              stderr=subprocess.PIPE, preexec_fn=pre)
+        p2 = _popen(analyse, stdin=p1.stdout, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE, preexec_fn=pre)
     except BaseException:
         p1.kill()
         p1.wait()
@@ -504,6 +513,7 @@ def scan_packets(path: Path, settings: Settings, abs_index: int, *, min_gap_s: f
     Streamed line by line, so memory stays flat however many packets a file has; the wall
     timeout and RLIMITs bound the cost. ``complete`` is False when the scan was cut short."""
     import threading
+    import time
 
     if abs_index < 0:
         return None
@@ -512,18 +522,26 @@ def scan_packets(path: Path, settings: Settings, abs_index: int, *, min_gap_s: f
             "-show_entries", "packet=pts_time,duration_time", "-of", "csv=p=0", *safe_input(path)]
     timeout = timeout_s or min(120.0, settings.decode_timeout_s)
     pre = _rlimit_setter(int(timeout) + _RLIMIT_CPU_PAD_S) if os.name == "posix" else None
-    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                            stderr=subprocess.DEVNULL, preexec_fn=pre)
+    try:
+        proc = _popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                      stderr=subprocess.DEVNULL, preexec_fn=pre)
+    except BusyError:
+        return PacketScan(complete=False)  # reported as an incomplete scan, the grade goes on
     assert proc.stdout is not None
     expired = threading.Event()
+    done = threading.Event()
+    limit_at = time.monotonic() + timeout
 
-    def _expire() -> None:
-        expired.set()
-        proc.kill()
+    def _watch() -> None:
+        # Kill on the deadline OR when the caller gives up, even while ffprobe prints nothing.
+        while not done.wait(0.2):
+            if time.monotonic() >= limit_at or (stop is not None and stop.is_set()):
+                expired.set()
+                proc.kill()
+                return
 
-    timer = threading.Timer(timeout, _expire)
-    timer.daemon = True
-    timer.start()
+    watcher = threading.Thread(target=_watch, daemon=True, name="audel-scan-watch")
+    watcher.start()
     sc = _GapScanner(min_gap_s, limit)
     stopped_early = False
     try:
@@ -539,7 +557,7 @@ def scan_packets(path: Path, settings: Settings, abs_index: int, *, min_gap_s: f
                     break
         result = sc.finish()
     finally:
-        timer.cancel()
+        done.set()
         if proc.poll() is None:
             proc.kill()
         proc.wait()

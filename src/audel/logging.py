@@ -11,14 +11,23 @@ import logging
 import os
 import re
 
+# Every pattern is LINEAR on hostile input (logged text includes unauthenticated request lines):
+# anchored at a token boundary (the lookbehind) and possessive (``++`` / ``{n,}+``), so a failed
+# match never backtracks and a run of look-alike prefixes can't make matching quadratic.
+_TOK = r"[A-Za-z0-9_\-]"
 _SECRET_RE = re.compile(
-    r"(audel(?:_|%5[Ff])[A-Za-z0-9_\-%]{43,60}(?:_|%5[Ff])[a-z2-7]{8}"   # minted tokens, anywhere
-    r"|eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"          # JWTs, anywhere
-    r"|sk-[A-Za-z0-9_\-]{8,}|AIza[A-Za-z0-9_\-]{8,}"
-    r"|[Bb]earer\s+[A-Za-z0-9._~+/=\-]{8,}"
-    r"|(?:api[_-]?key|token|secret|password)[\"'`:=\s]+[A-Za-z0-9._\-]{6,})",
+    r"(?<![A-Za-z0-9])(?:"
+    r"audel_[A-Za-z0-9_\-]{43}_[a-z2-7]{8}"                       # minted Audel tokens
+    rf"|ey[JA]{_TOK}{{8,}}+\.{_TOK}{{2,}}+\.{_TOK}{{2,}}+"        # JWTs ('{{"' / '{{ "')
+    rf"|sk-{_TOK}{{8,}}+|AIza{_TOK}{{8,}}+"                        # provider keys
+    r"|[Bb]earer[ \t]++[A-Za-z0-9._~+/=\-]{8,}+"
+    r"|(?:api[_-]?key|token|secret|password)[\"'`]?+[ \t]*+[:=][ \t]*+[\"'`]?+"
+    r"[A-Za-z0-9._\-]{6,}+"                                        # key=value / key: value
+    r")",
     re.IGNORECASE,
 )
+_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
+_MAX_UNQUOTE = 3
 
 _LOGGER_NAME = "audel"
 
@@ -34,25 +43,38 @@ def register_secret(value: str | None) -> None:
         _KNOWN_SECRETS.add(value)
 
 
-def scrub_text(text: str) -> str:
-    """Redact known secret values (and shape-matched ones) from arbitrary text.
-
-    Value-based redaction is sound (config registers every key it resolves); the regex is a
-    backstop. Used by the workspace so a credential can never reach disk via persisted session
-    state, and by the log filter below."""
-    if "%" in text:  # a credential misplaced in a URL may be percent-encoded
-        from urllib.parse import unquote
-
-        decoded = unquote(text)
-        if decoded != text and any(s in decoded for s in _KNOWN_SECRETS):
-            text = decoded
+def _redact(text: str) -> str:
     # Longest first: a secret containing a shorter registered secret must be redacted whole.
     for secret in sorted(_KNOWN_SECRETS, key=len, reverse=True):
         if secret in text:
             text = text.replace(secret, "[REDACTED]")
-    if _SECRET_RE.search(text):
-        text = _SECRET_RE.sub("[REDACTED]", text)
-    return text
+    return _SECRET_RE.sub("[REDACTED]", text)
+
+
+def scrub_text(text: str) -> str:
+    """Redact known secret values (and shape-matched ones) from arbitrary text.
+
+    Value-based redaction is sound (config registers every key it resolves); the regex is a
+    backstop. A credential misplaced in a URL may be percent-encoded (once, twice, or fully): the
+    text is also decoded up to three times, and when the DECODED form reveals a credential the
+    decoded, redacted form is kept, with control characters escaped so decoding can't inject
+    lines. Used by the workspace so a credential can never reach disk via persisted session
+    state, and by the log filter below."""
+    out = _redact(text)
+    if "%" in text:
+        from urllib.parse import unquote
+
+        decoded = text
+        for _ in range(_MAX_UNQUOTE):
+            nxt = unquote(decoded)
+            if nxt == decoded:
+                break
+            decoded = nxt
+        if decoded != text:
+            red = _redact(decoded)
+            if red != decoded:  # the decoded text hid a credential
+                out = _CTRL_RE.sub(lambda m: f"\\x{ord(m.group()):02x}", red)
+    return out
 
 
 class _SecretScrubber(logging.Filter):
@@ -70,8 +92,9 @@ class _SecretScrubber(logging.Filter):
             full = record.getMessage()
         except Exception:
             return True
-        if scrub_text(full) != full:  # a secret spanning template + argument: flatten
-            record.msg, record.args = scrub_text(full), ()
+        clean = scrub_text(full)
+        if clean != full:  # a secret spanning template + argument: flatten
+            record.msg, record.args = clean, ()
         if record.exc_info:
             # Tracebacks can carry secrets too (exception text, locals in messages).
             import traceback

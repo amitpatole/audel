@@ -81,9 +81,12 @@ class Settings(BaseSettings):
     gemini_audio_model: str = DEFAULT_MODELS["gemini_audio"]
 
     # Provider credentials (conventional names; never logged/persisted)
-    ollama_api_key: str | None = Field(default=None, validation_alias="OLLAMA_API_KEY", repr=False)
-    anthropic_api_key: str | None = Field(default=None, validation_alias="ANTHROPIC_API_KEY", repr=False)
-    google_api_key: str | None = Field(default=None, validation_alias="GOOGLE_API_KEY", repr=False)
+    ollama_api_key: str | None = Field(default=None, validation_alias="OLLAMA_API_KEY", repr=False,
+                                       exclude=True)
+    anthropic_api_key: str | None = Field(default=None, validation_alias="ANTHROPIC_API_KEY", repr=False,
+                                       exclude=True)
+    google_api_key: str | None = Field(default=None, validation_alias="GOOGLE_API_KEY", repr=False,
+                                       exclude=True)
 
     # Admin-only diagnostics (/doctor, /metrics) when auth is on: these tenants (plus the shared
     # AUDEL_API_TOKEN principal) may read them; everyone else gets 404.
@@ -167,7 +170,8 @@ class Settings(BaseSettings):
     proxy_idle_timeout_s: float = 30.0
 
     # HTTP service (REST): bind + auth + DoS bounds (Phase 6, extended Phase 12)
-    api_token: str | None = Field(default=None, validation_alias="AUDEL_API_TOKEN", repr=False)
+    api_token: str | None = Field(default=None, validation_alias="AUDEL_API_TOKEN", repr=False,
+                                  exclude=True)
     api_tokens_file: Path | None = None   # per-tenant SHA-256 token hashes (audel token new)
     jwt_jwks_file: Path | None = None     # local JWKS; no IdP fetch at request time
     jwt_issuer: str | None = None
@@ -236,9 +240,13 @@ class Settings(BaseSettings):
             if net.version == 6:
                 # IPv4-mapped / -compatible space stands for IPv4 clients: hold it to the IPv4
                 # floor (/8 of the embedded address = /104), or ::ffff:0:0/96 trusts everyone.
-                for v4ish in (ipaddress.ip_network("::ffff:0:0/96"), ipaddress.ip_network("::/96")):
+                # NAT64 prefixes (RFC 6052 well-known and RFC 8215 local-use) embed IPv4 too.
+                for v4ish, v4floor in ((ipaddress.ip_network("::ffff:0:0/96"), 104),
+                                       (ipaddress.ip_network("::/96"), 104),
+                                       (ipaddress.ip_network("64:ff9b::/96"), 104),
+                                       (ipaddress.ip_network("64:ff9b:1::/48"), 104)):
                     if net.overlaps(v4ish):
-                        floor = 104
+                        floor = max(floor, v4floor)
             if net.prefixlen < floor:
                 raise ValueError(f"forwarded_allow_ips entry {entry!r} is too broad (/{net.prefixlen}); "
                                  f"use /{floor} or narrower")

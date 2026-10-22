@@ -121,6 +121,24 @@ All notable changes to Audel are recorded here. The format follows
     at most 2 fetches, in a pool of 8.
   - **Low-Medium.** Work abandoned while waiting on its tenant share still ran later. Abandonment now
     propagates through both waits.
+- Red-team round 8 fixes (auth and network surfaces), each pinned by a regression test:
+  - **High.** The JWT redaction pattern added in round 7 backtracked quadratically, so one
+    unauthenticated request with a long URL could block the server for seconds while its access
+    line was logged. Every redaction pattern is now anchored at a token boundary and can't
+    backtrack (64 KB of hostile text scrubs in milliseconds), and each log record is scrubbed once.
+  - **Low.** Provider-key and keyword patterns blanked ordinary words (such as `task-0123...`,
+    `desk-reporting.example.com`, "token expired") in logs and audit records. They now need a word
+    boundary or a `key=value` shape.
+  - **Low.** NAT64 prefixes (`64:ff9b::/96`, `64:ff9b:1::/48`) are held to the IPv4 floor, and NAT64
+    clients are rate-limited by their own IPv4 address.
+  - **Low.** Double-encoded and fully percent-encoded tokens in a URL are redacted. When decoding
+    reveals a credential, control characters are escaped so a log line can't be forged.
+  - **Low.** A file refused partway now stops its packet scans at once, so they can't outlive the
+    grading slot. A scan that prints nothing is still killed on time.
+  - **Low.** A job deleted while running is audited as `cancelled`, not `ok`.
+  - **Low.** A host that can't start another process returns 429 "retry later" instead of a 500.
+  - **Info.** Secrets are excluded from settings dumps, and Helm refuses more spellings of the
+    IPv4-mapped and NAT64 ranges.
 - Red-team round 7 fixes (decode and timeline accuracy), each pinned by a regression test. The 69
   legitimate and edge-case files still grade with no false integrity findings.
   - **Medium.** Streamed WAVs from GStreamer and arecord use other "unknown length" placeholders

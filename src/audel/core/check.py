@@ -12,7 +12,7 @@ import asyncio
 
 from ..backends.local import LocalBackend
 from ..config import Settings, load_settings
-from ..errors import AudelError
+from ..errors import AudelError, BusyError
 from ..models import (
     Conformance,
     Issue,
@@ -70,6 +70,8 @@ async def check(source, *, settings: Settings | None = None, brief=None, spec=No
     sp = effective_spec(settings, spec)  # raises ConfigError on an unknown spec (fail closed)
     try:
         rr = await asyncio.to_thread(_render_sync, source, settings, sp)
+    except BusyError:
+        raise  # host capacity, not the media: the caller retries (REST: 429)
     except AudelError as e:
         return _decode_error(source, e)
 

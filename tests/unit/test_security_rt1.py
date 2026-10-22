@@ -2320,3 +2320,136 @@ def test_whole_track_spans_stay_inside_the_programme():
                                              channels=2, start_s=3.0), decoded_s=7.0)
     sp = _track_span(tm, 10.0)
     assert (sp.start_ms, sp.end_ms) == (3000, 10000)
+
+
+# ==== round 8, auth surface ===================================================================
+
+@pytest.mark.parametrize("hostile", ["eyJ" * 22000, "eyJAAAAAAAAA." + "eyJ" * 22000,
+                                     "sk-" * 22000, "token=" * 11000, "audel_" * 11000,
+                                     "Bearer " * 9000, "%41" * 22000, "eyJaaaaaaaaa." * 5000])
+def test_redaction_is_linear_on_hostile_log_lines(hostile):
+    from audel.logging import scrub_text
+
+    t0 = time.perf_counter()
+    scrub_text("GET /" + hostile + " HTTP/1.1")
+    assert time.perf_counter() - t0 < 0.5   # was seconds (quadratic) for 16 KB
+
+
+@pytest.mark.parametrize("text", ["GET /jobs/task-0123456789abcdef",
+                                  "source_host=desk-reporting.example.com",
+                                  "risk-assessment-2024", "mask-channels-5.1.4", "token expired",
+                                  "secret rotation", "Api-Key header missing"])
+def test_ordinary_words_are_not_redacted(text):
+    from audel.logging import scrub_text
+
+    assert scrub_text(text) == text
+
+
+def test_encoded_tenant_tokens_are_redacted_and_decoding_cannot_inject_lines():
+    from audel.auth import new_token
+    from audel.logging import scrub_text
+
+    tok = new_token()
+    for enc in (tok.replace("_", "%255F"), "".join(f"%{b:02X}" for b in tok.encode())):
+        assert tok not in scrub_text(f"GET /?a={enc}") and enc not in scrub_text(f"GET /?a={enc}")
+    out = scrub_text("GET /?x=%0Aforged&a=" + tok.replace("_", "%5F"))
+    assert "\n" not in out and tok not in out
+
+
+@pytest.mark.parametrize("entry", ["64:ff9b::/96", "64:ff9b:1::/48", "0::ffff:0:0/96"])
+def test_nat64_and_mapped_spellings_are_refused(entry):
+    with pytest.raises(ValueError):
+        Settings(forwarded_allow_ips=[entry])
+
+
+def test_nat64_clients_are_keyed_by_their_own_ipv4():
+    from audel.auth import client_key
+
+    assert client_key("64:ff9b::808:808") == "8.8.8.8"
+    assert client_key("64:ff9b::101:101") != client_key("64:ff9b::808:808")
+
+
+def test_settings_dumps_never_carry_secrets():
+    s = Settings(api_token="audel_secret_value_zzzzzz", ollama_api_key="k-ollama-123456",
+                 anthropic_api_key="k-anthropic-123456", google_api_key="k-google-123456")
+    dumped = s.model_dump_json() + repr(s.model_dump())
+    for v in ("audel_secret_value_zzzzzz", "k-ollama-123456", "k-anthropic-123456",
+              "k-google-123456"):
+        assert v not in dumped
+    assert s.api_token == "audel_secret_value_zzzzzz"   # still usable in-process
+
+
+# ==== round 8, network surface ================================================================
+
+def _scan_threads():
+    import threading
+
+    return [t for t in threading.enumerate() if t.name.startswith("audel-scan")]
+
+
+@requires_ffmpeg
+def test_refused_file_stops_its_packet_scans(tmp_path, monkeypatch):
+    import audel.signals.measure as ms
+    from audel.mediaguard import probe
+
+    a = tmp_path / "a.wav"
+    _ff("-f", "lavfi", "-i", "sine=d=4", a)
+    mkv = tmp_path / "m.mkv"
+    _ff(*sum((["-i", str(a)] for _ in range(6)), []),
+        *sum((["-map", f"{i}:a"] for i in range(6)), []), "-c:a", "pcm_s16le", mkv)
+
+    def boom(*a, **k):
+        time.sleep(0.2)
+        raise UnsafeSourceError("analysis exceeded the per-file time budget")
+
+    monkeypatch.setattr(ms, "_main_pass", boom)
+    s = Settings()
+    with pytest.raises(UnsafeSourceError):
+        ms.measure(mkv, probe(mkv, s), s)
+    deadline = time.monotonic() + 3
+    while _scan_threads() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert not _scan_threads()
+
+
+def test_spawn_failure_is_busy_not_a_500(tmp_path, media, monkeypatch):
+    import subprocess as sp
+
+    real = sp.Popen
+
+    def no_fork(argv, *a, **k):
+        if "ffmpeg" in str(argv[0]):
+            raise BlockingIOError(11, "Resource temporarily unavailable")
+        return real(argv, *a, **k)
+
+    monkeypatch.setattr(sp, "Popen", no_fork)
+    s = Settings(cache_dir=tmp_path / "ws")
+    with TestClient(build_app(settings=s)) as c:
+        r = c.post("/check", files={"file": ("a.wav", media["good"].read_bytes(), "audio/wav")})
+    assert r.status_code == 429, r.text
+
+
+def test_deleted_running_job_is_audited_as_cancelled(tmp_path, media, monkeypatch):
+    import audel.core as core
+
+    started = []
+
+    async def slow_check(*a, **k):
+        started.append(1)
+        await asyncio.sleep(30)
+
+    monkeypatch.setattr(core, "check", slow_check)
+    log = tmp_path / "audit.jsonl"
+    s = Settings(cache_dir=tmp_path / "ws", audit_log=log)
+    with TestClient(build_app(settings=s)) as c:
+        jid = c.post("/jobs", files={"file": ("a.wav", media["good"].read_bytes(), "audio/wav")}
+                     ).json()["job_id"]
+        for _ in range(200):
+            if started:
+                break
+            time.sleep(0.02)
+        assert started
+        assert c.delete(f"/jobs/{jid}").status_code == 200
+        time.sleep(0.3)
+    rows = [json.loads(x) for x in log.read_text().splitlines() if jid in x]
+    assert rows and rows[-1]["status"] == "cancelled", rows

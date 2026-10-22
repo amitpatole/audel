@@ -20,7 +20,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from ..config import Settings
-from ..errors import AudelError, UnsafeSourceError
+from ..errors import AudelError, BusyError, UnsafeSourceError
 from ..mediaguard import MediaInfo, StreamInfo, _tool, pass_timeout, pcm_pipeline
 from ..signals._parse import (
     parse_astats,
@@ -317,26 +317,25 @@ def measure(path, info: MediaInfo, settings: Settings) -> Measurements:
         return placed[st.index]
 
     m.tracks = []
-    for st in streams:
-        try:
-            m.tracks.append(measure_track(path, st, settings, info.duration_s, deadline,
-                                          timeline=timeline))
-        except UnsafeSourceError:
-            raise  # caps / budgets / deadline: the whole file is refused (fail closed)
-        except AudelError as e:
-            # One undecodable track must not discard the others' results: grade what decodes
-            # and report this track by name.
-            from ..errors import sanitize_message
-
-            m.tracks.append(TrackMeasurements(stream=st, failed=sanitize_message(str(e), limit=160)))
-        except BaseException:
-            stop.set()
-            pool.shutdown(wait=False, cancel_futures=True)
-            raise
     try:
+        for st in streams:
+            try:
+                m.tracks.append(measure_track(path, st, settings, info.duration_s, deadline,
+                                              timeline=timeline))
+            except UnsafeSourceError:
+                raise  # caps / budgets / deadline: the whole file is refused (fail closed)
+            except BusyError:
+                raise  # the host, not the media: never report a track as undecodable for it
+            except AudelError as e:
+                # One undecodable track must not discard the others' results: grade what
+                # decodes and report this track by name.
+                from ..errors import sanitize_message
+
+                m.tracks.append(TrackMeasurements(stream=st,
+                                                  failed=sanitize_message(str(e), limit=160)))
         timeline(streams[0])  # place every track (also those that failed to decode)
     except BaseException:
-        stop.set()
+        stop.set()  # every early exit: running scans are killed, queued ones never start
         raise
     finally:
         pool.shutdown(wait=False, cancel_futures=True)

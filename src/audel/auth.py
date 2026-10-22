@@ -323,6 +323,21 @@ class RateLimiter:
         return ok, (0 if ok else max(1, int((1.0 - tokens) / refill) + 1))
 
 
+def _nat64():
+    import ipaddress
+
+    class _Nets:
+        nets = (ipaddress.ip_network("64:ff9b::/96"), ipaddress.ip_network("64:ff9b:1::/48"))
+
+        def __contains__(self, ip) -> bool:
+            return any(ip in n for n in self.nets)
+
+    return _Nets()
+
+
+_NAT64 = _nat64()
+
+
 def client_key(host: str | None) -> str:
     """Rate-limit key for a client address: IPv6 is bucketed by /64 (one subscriber's prefix),
     so rotating addresses inside a prefix does not buy fresh attempts."""
@@ -335,5 +350,7 @@ def client_key(host: str | None) -> str:
     except ValueError:
         return host[:64]
     if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is None:
+        if ip in _NAT64:  # an IPv4 client seen through NAT64: key on its own IPv4 address
+            return str(ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF))
         return str(ipaddress.ip_network(f"{ip}/64", strict=False))
     return str(ip.ipv4_mapped or ip) if isinstance(ip, ipaddress.IPv6Address) else str(ip)
