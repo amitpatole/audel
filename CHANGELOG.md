@@ -121,6 +121,18 @@ All notable changes to Audel are recorded here. The format follows
     at most 2 fetches, in a pool of 8.
   - **Low-Medium.** Work abandoned while waiting on its tenant share still ran later. Abandonment now
     propagates through both waits.
+- Red-team round 10 fixes (auth surface), each pinned by a regression test:
+  - **Medium.** A flood of tiny runs (`%!%!...`) made each byte of an unauthenticated request line
+    costly to scrub, cutting throughput about twelvefold. Only runs long enough to hold a
+    credential are examined, and decoding happens only where a real `%XX` escape is present (an
+    8 KB field now costs under a millisecond).
+  - **Low.** Some request lines made the scrubber flatten the access record, which crashed
+    uvicorn's access formatter and lost the line. Records are flattened only for a credential that
+    spans the template and an argument, and `key=` no longer swallows the protocol after it.
+  - **Low.** Names containing "eyJ" (`keyArchive2024.tar.gz`, `surveyAnalytics.s3...`) were
+    redacted as JWTs, including audit hostnames. A JWT header must now decode to a JSON object
+    key. Prose such as "Bearer authentication required" is no longer redacted; explicit
+    assignments (`password=...`) always are.
 - Red-team round 9 fixes (decode and network surfaces), each pinned by a regression test. 197
   legitimate and edge-case files grade with no new integrity findings.
   - **Medium.** Decoy packets could capture the stray-packet logic and switch off the round-8

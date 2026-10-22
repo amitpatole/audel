@@ -2630,9 +2630,9 @@ def test_log_records_are_bounded_before_scrubbing():
 
 
 @pytest.mark.parametrize("text", ["x=1{tok}", "GET /files/v2{tok}", "v1{jwt}", "jwt=x{jwt}",
-                                  "nonceBearer abcdefghij", "accessToken=Zx81kQpLmN0vR7tY",
+                                  "nonceBearer Zx81kQpLmN0vR7tY", "accessToken=Zx81kQpLmN0vR7tY",
                                   "clientSecret=abcdefgh", "dbPassword=abcdefgh",
-                                  "Authorization: Token abcdefghij", "Bearer\nabcdefghij",
+                                  "Authorization: Token abcdefghij", "Bearer\nZx81kQpLmN0vR7tY",
                                   "{enc4}", "{full}"])
 def test_glued_cased_and_deeply_encoded_credentials_are_redacted(text):
     from audel.auth import new_token
@@ -2916,3 +2916,64 @@ def test_mcp_tools_report_busy():
     del wrapped
     out = asyncio.run(seen["fn"]())
     assert out["error"] == "busy" and out["retry"] is True
+
+
+# ==== round 10, auth surface ==================================================================
+
+@pytest.mark.parametrize("unit", ["%!", "%%%%%%!", ".!", "a!", "%41!", "aaaaa!", "%41%41!"])
+def test_tiny_run_floods_are_cheap_per_byte(unit):
+    from audel.logging import scrub_text
+
+    text = unit * (8192 // len(unit))
+    best = 1e9
+    for _ in range(5):
+        t0 = time.perf_counter()
+        scrub_text(text)
+        best = min(best, time.perf_counter() - t0)
+    assert best < 0.03, best          # was 27-48 ms per 8 KB field for "%!"
+
+
+@pytest.mark.parametrize("path", ["/specs?token=", "/specs?authorization=x", "/x bearer ",
+                                  "/" + "a" * 8170, "/specs?token={tok}"])
+def test_access_lines_always_format(path):
+    import logging as lg
+
+    from uvicorn.logging import AccessFormatter
+
+    from audel.auth import new_token
+    from audel.logging import _SecretScrubber
+
+    tok = new_token()
+    rec = lg.LogRecord("uvicorn.access", 20, "x", 1, '%s - "%s %s HTTP/%s" %d',
+                       ("1.2.3.4", "GET", path.format(tok=tok), "1.1", 401), None)
+    _SecretScrubber().filter(rec)
+    line = AccessFormatter('%(client_addr)s - "%(request_line)s" %(status_code)s',
+                           use_colors=False).format(rec)
+    assert "HTTP/1.1" in line and tok not in line
+
+
+@pytest.mark.parametrize("text", ["GET /files/keyArchive2024.tar.gz HTTP/1.1",
+                                  '{"source_host": "surveyAnalytics.s3.amazonaws.com"}',
+                                  "honeyJar_collection.items.list",
+                                  "https://journeyAnalytics.example.com/a.wav",
+                                  "Bearer authentication required", "the standard-bearer position",
+                                  "token: expired at noon"])
+def test_names_and_prose_are_not_redacted(text):
+    from audel.logging import scrub_text
+
+    assert scrub_text(text) == text
+
+
+def test_real_jwts_still_redacted_in_every_header_form():
+    import base64
+    import json as _json
+
+    from audel.logging import scrub_text
+
+    def b64(b):
+        return base64.urlsafe_b64encode(b).decode().rstrip("=")
+
+    for hdr in (b'{"alg":"RS256","typ":"JWT"}', b'{ "alg": "HS256" }', b'{"kid":"k1","alg":"ES256"}',
+                b'{"x5t#S256":"abc","alg":"RS256"}'):
+        jwt = f"{b64(hdr)}.{b64(_json.dumps({'tenant': 'a'}).encode())}.c2lnbmF0dXJlLWJ5dGVz"
+        assert jwt[:20] not in scrub_text(f"GET /x?jwt={jwt}")

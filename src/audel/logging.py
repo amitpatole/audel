@@ -19,17 +19,48 @@ import re
 #      so decoding never rewrites (or forges) the rest of the line;
 #   3. three context patterns (key=value, Authorization:, Bearer) that start only at a keyword
 #      and use possessive quantifiers, so a failed attempt never rescans.
-_RUN = re.compile(r"[A-Za-z0-9_.~+/=%\-]++")
+# Runs shorter than any credential (6+ chars) never reach Python: one callback per short run let
+# a flood of tiny runs (``%!%!...``) make scrubbing costly per byte.
+_RUN = re.compile(r"[A-Za-z0-9_.~+/=%\-]{6,}+")
+_RUN_CH = re.compile(r"[A-Za-z0-9_.~+/=%\-]")
+_PCT = re.compile(r"%[0-9A-Fa-f]{2}")
 _TOKCH = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-")
 _MINTED = re.compile(r"audel_[A-Za-z0-9_\-]{43}_[a-z2-7]{8}", re.IGNORECASE)        # fixed length
 _PROVIDER = re.compile(r"(?<![A-Za-z0-9])(?:sk-|AIza)[A-Za-z0-9_\-]{8}", re.IGNORECASE)
+# ``key=value`` takes no space after ``=`` (so ``?token= HTTP/1.1`` can't swallow the protocol);
+# ``key: value`` may. The value must look like a credential, not a word.
 _KV = re.compile(
-    r"((?:api[_-]?key|token|secret|password|passwd)[\"'`]?+[ \t]*+[:=][ \t]*+[\"'`]?+)"
-    r"[A-Za-z0-9._~+/=%\-]{6,}+", re.IGNORECASE)
-_AUTHZ = re.compile(r"(authorization[\"'`]?+[ \t]*+[:=][ \t]*+[\"'`]?+)[^\s\"'`,;]++"
-                    r"(?:[ \t]++[^\s\"'`,;]++)?+", re.IGNORECASE)
-_BEARER = re.compile(r"(bearer\s++)[A-Za-z0-9._~+/=\-]{8,}+", re.IGNORECASE)
+    r"((?:api[_-]?key|token|secret|password|passwd)[\"'`]?+(?:=|[ \t]*+:[ \t]*+)[\"'`]?+)"
+    r"([A-Za-z0-9._~+/=%\-]{6,}+)", re.IGNORECASE)
+_AUTHZ = re.compile(r"(authorization[\"'`]?+[ \t]*+[:=][ \t]*+[\"'`]?+)"
+                    r"((?:(?:bearer|basic|token|digest|negotiate|apikey)[ \t]++)?+[^\s\"'`,;\\]++)",
+                    re.IGNORECASE)
+_BEARER = re.compile(r"(bearer\s++)([A-Za-z0-9._~+/=\-]{8,}+)", re.IGNORECASE)
+_SECRETISH = frozenset("0123456789._~+/=-%")
+
+
+def _looks_secret(value: str) -> bool:
+    """A word ("authentication", "expired") is not a credential; a token has a digit or a
+    token separator, or is long."""
+    return len(value) >= 24 or any(c in _SECRETISH for c in value)
 _MAX_UNQUOTE = 5
+
+
+_JWT_HDR = re.compile(r'\{\s*"[A-Za-z0-9_$#]{1,12}"\s*:')
+
+
+def _jwt_header(chunk: str) -> bool:
+    """The candidate header really is base64url JSON (``{"alg":`` ...), not a word that happens to
+    contain "eyJ" (``honeyJar``, ``keyArchive``). Fixed cost: at most 24 characters decoded."""
+    import base64
+    import binascii
+
+    chunk = chunk[: len(chunk) // 4 * 4]
+    try:
+        dec = base64.urlsafe_b64decode(chunk).decode("latin-1")
+    except (binascii.Error, ValueError):
+        return False
+    return _JWT_HDR.match(dec) is not None
 
 
 def _jwt_in(run: str) -> bool:
@@ -43,9 +74,10 @@ def _jwt_in(run: str) -> bool:
         j = len(seg)
         while j > 0 and seg[j - 1] in _TOKCH:   # the maximal token-character tail
             j -= 1
-        tail = seg[j:].lower()
-        k = min((x for x in (tail.find("eyj"), tail.find("eya")) if x >= 0), default=-1)
-        if k < 0 or len(tail) - k < 11:
+        tail = seg[j:]
+        low_t = tail.lower()
+        k = min((x for x in (low_t.find("eyj"), low_t.find("eya")) if x >= 0), default=-1)
+        if k < 0 or len(tail) - k < 11 or not _jwt_header(tail[k:k + 24]):
             continue
         mid, last = segs[i + 1], segs[i + 2]
         if len(mid) >= 2 and all(c in _TOKCH for c in mid) and len(last) >= 2 \
@@ -66,9 +98,7 @@ def _credential(run: str) -> bool:
 def _run_holds_secret(run: str) -> bool:
     if _credential(run):
         return True
-    if "%" in run:  # a credential misplaced in a URL may be percent-encoded, even repeatedly
-        from urllib.parse import unquote
-
+    if "%" in run and _PCT.search(run):  # a credential may be percent-encoded, even repeatedly
         cur = run
         for _ in range(_MAX_UNQUOTE):
             nxt = unquote(cur)
@@ -79,6 +109,8 @@ def _run_holds_secret(run: str) -> bool:
                 return True
     return False
 
+
+from urllib.parse import unquote  # noqa: E402 - kept beside its only use
 
 _LOGGER_NAME = "audel"
 
@@ -102,12 +134,20 @@ def scrub_text(text: str) -> str:
     holding a credential is replaced whole, in its original encoding, so the rest of the line
     is left exactly as it was. Used by the workspace so a credential can never reach disk via
     persisted session state, and by the log filter below."""
+    text = _AUTHZ.sub(lambda m: m.group(1) + "[REDACTED]", _scrub_shapes(text))
+    text = _BEARER.sub(lambda m: m.group(1) + "[REDACTED]" if _looks_secret(m.group(2))
+                       else m.group(), text)
+    # An explicit assignment (``password=...``) is a credential whatever it looks like; prose
+    # (``token: expired``) is redacted only when the value looks like a credential.
+    return _KV.sub(lambda m: m.group(1) + "[REDACTED]"
+                   if "=" in m.group(1) or _looks_secret(m.group(2)) else m.group(), text)
+
+
+def _scrub_shapes(text: str) -> str:
+    """Registered values and credential-shaped runs only (no keyword context)."""
     for secret in sorted(_KNOWN_SECRETS, key=len, reverse=True):  # longest first
         if secret in text:
             text = text.replace(secret, "[REDACTED]")
-    text = _AUTHZ.sub(lambda m: m.group(1) + "[REDACTED]", text)
-    text = _BEARER.sub(lambda m: m.group(1) + "[REDACTED]", text)
-    text = _KV.sub(lambda m: m.group(1) + "[REDACTED]", text)
     return _RUN.sub(lambda m: "[REDACTED]" if _run_holds_secret(m.group()) else m.group(), text)
 
 
@@ -120,7 +160,7 @@ def _clip(text: str) -> str:
     if len(text) <= _MAX_LOG_TEXT:
         return text
     cut = _MAX_LOG_TEXT
-    while cut > 0 and _RUN.fullmatch(text[cut - 1]):
+    while cut > 0 and _RUN_CH.fullmatch(text[cut - 1]):
         cut -= 1
     return text[:cut] + f"...[{len(text) - cut} chars truncated]"
 
@@ -141,9 +181,13 @@ class _SecretScrubber(logging.Filter):
             full = record.getMessage()
         except Exception:
             return True
-        clean = scrub_text(_clip(full))
-        if clean != full:  # a secret spanning template + argument: flatten
-            record.msg, record.args = clean, ()
+        if record.args:
+            # Arguments were scrubbed in place. Flatten only for a credential that SPANS the
+            # template and an argument (a run crossing them): formatters such as uvicorn's
+            # access formatter need the original argument tuple.
+            joined = _clip(full)
+            if _scrub_shapes(joined) != joined:
+                record.msg, record.args = scrub_text(joined), ()
         if record.stack_info:
             record.stack_info = scrub_text(record.stack_info)
         if record.exc_info:
