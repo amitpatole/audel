@@ -21,6 +21,16 @@ log = get_logger("proxy")
 _ALLOWED_PORTS = frozenset({80, 443})  # web ports only: no tunnelling to arbitrary services
 
 
+_HOST_ERRNOS = frozenset(getattr(__import__("errno"), n) for n in
+                         ("EMFILE", "ENFILE", "ENOSPC", "ENOMEM", "ENOBUFS")
+                         if hasattr(__import__("errno"), n))
+BUSY_STATUS = b"503 Audel Host Busy"  # our own reply: the host, not the source, is at its limits
+
+
+def _upstream_failure(e: OSError) -> bytes:
+    return BUSY_STATUS if e.errno in _HOST_ERRNOS else b"502 Bad Gateway"
+
+
 class VettingProxy:
     def __init__(self, host: str = "127.0.0.1", *, max_connections: int = 64,
                  idle_timeout_s: float = 30.0, max_lifetime_s: float = 600.0):
@@ -105,6 +115,8 @@ class VettingProxy:
             return await _reply_close(writer, b"403 Forbidden")
         try:
             up_r, up_w = await asyncio.open_connection(ip, port)
+        except OSError as e:
+            return await _reply_close(writer, _upstream_failure(e))
         except Exception:  # noqa: BLE001
             return await _reply_close(writer, b"502 Bad Gateway")
         writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
@@ -117,6 +129,8 @@ class VettingProxy:
             return await _reply_close(writer, b"403 Forbidden")
         try:
             up_r, up_w = await asyncio.open_connection(ip, port)
+        except OSError as e:
+            return await _reply_close(writer, _upstream_failure(e))
         except Exception:  # noqa: BLE001
             return await _reply_close(writer, b"502 Bad Gateway")
         origin = path + (("?" + query) if query else "")

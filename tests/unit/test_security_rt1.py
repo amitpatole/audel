@@ -3598,3 +3598,79 @@ def test_speech_detection_respects_the_file_deadline(tmp_path):
         speech_regions(f, Settings(), stream=0, labels=["FL", "FR"],
                        channel_rms=[-20.0, -20.0], timeout_s=2.0)
     assert time.monotonic() - t0 < 30
+
+
+# ==== round 13, network + auth surfaces =======================================================
+
+def test_uvicorn_error_templates_are_scrubbed_and_bools_format():
+    from audel.auth import new_token
+    from audel.logging import register_secret
+
+    tok = new_token()
+    register_secret(tok)
+    assert tok not in _emit(f"... Authorization: Bearer {tok}", name="uvicorn.error")
+    assert tok not in _emit(f"token={tok} %s", "x", name="uvicorn.error")
+    assert _emit("flag %d", True, name="uvicorn.error") == "flag 1"
+
+
+@pytest.mark.parametrize("text", [
+    "authorization: bearer abcdefghijklmnop", "authorization: token abcdefghijklmnopq",
+    "Bearer abcd_efgh-ijkl_mnop", "token: ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+    "xoxb-1234567890-abcdefghij", "AKIAABCDEFGHIJKLMNOP"])
+def test_lowercase_schemes_and_known_token_shapes_are_redacted(text):
+    from audel.logging import scrub_text
+
+    assert "[REDACTED]" in scrub_text(text)
+
+
+def test_quoted_values_with_quotes_and_escapes_are_redacted():
+    import json as _json
+
+    from audel.logging import scrub_text
+
+    pem = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwgg\n-----END PRIVATE KEY-----"
+    for text in ['{"password": "it\'s my secret"}', _json.dumps({"password": 'ab"cdefgh'}),
+                 _json.dumps({"password": "p@ss\\w0rd!!"}), repr({"password": "it's a secret"}),
+                 _json.dumps({"private_key": pem})]:
+        out = scrub_text(text)
+        assert "secret" not in out.split(":", 1)[1] and "MIIE" not in out and "cdefgh" not in out, out
+
+
+def test_keyword_floods_cost_like_ordinary_text():
+    from audel.logging import scrub_text
+
+    def cost(u):
+        text = u * (8192 // len(u))
+        best = 9.0
+        for _ in range(5):
+            t0 = time.process_time()
+            scrub_text(text)
+            best = min(best, time.process_time() - t0)
+        return best
+
+    assert cost("authorization=a,") < 0.01 and cost("token: a ") < 0.01
+
+
+def test_our_proxys_busy_reply_and_wrapped_host_errors_are_busy():
+    import errno
+    import urllib.error
+
+    from audel.ingest import _host_failure
+    from audel.proxy import BUSY_STATUS, _upstream_failure
+
+    assert _upstream_failure(OSError(errno.EMFILE, "x")) == BUSY_STATUS
+    assert _upstream_failure(OSError(errno.ECONNREFUSED, "x")) == b"502 Bad Gateway"
+    assert _host_failure(urllib.error.URLError(OSError(errno.EMFILE, "Too many open files")))
+    assert _host_failure(OSError("Tunnel connection failed: 503 Audel Host Busy"))
+    assert not _host_failure(urllib.error.URLError(OSError(errno.ECONNREFUSED, "refused")))
+
+
+def test_a_client_request_id_cannot_rename_audit_keys(tmp_path):
+    import json as _json
+
+    from audel.ops import AuditLog
+
+    log = tmp_path / "a.jsonl"
+    AuditLog(log).write(request_id="abc-token", source="upload", tenant="t", endpoint="/check")
+    rec = _json.loads(log.read_text().splitlines()[-1])
+    assert rec["source"] == "upload" and "request_id" in rec

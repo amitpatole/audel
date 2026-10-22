@@ -96,7 +96,9 @@ class AuditLog:
     def write(self, **event) -> None:
         rec = {k: v for k, v in event.items() if k in self._ALLOWED and v is not None}
         rec.setdefault("ts", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
-        line = scrub_text(json.dumps(rec, sort_keys=True, default=str))
+        # Scrub each VALUE, then serialise: a client-chosen value can never rewrite a key.
+        rec = {k: scrub_text(v) if isinstance(v, str) else v for k, v in rec.items()}
+        line = json.dumps(rec, sort_keys=True, default=str)
         _audit_log.info(line)
         if self._path is None:
             return

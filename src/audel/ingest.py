@@ -115,12 +115,28 @@ def _download(url: str, dest: Path, proxy_url: str, settings: Settings,
         return _download_inner(url, dest, proxy_url, settings, stop)
     except OSError as e:
         dest.unlink(missing_ok=True)  # the thread removes what IT created, however it ends
-        if e.errno in _HOST_ERRNOS:  # out of fds / memory / disk here: retry, not a bad source
+        if _host_failure(e):  # out of fds / memory / disk here: retry, not a bad source
             raise BusyError("could not download: the host is at capacity; retry later") from None
         raise
     except BaseException:
         dest.unlink(missing_ok=True)
         raise
+
+
+def _host_failure(e: OSError) -> bool:
+    """A host-capacity failure, however urllib wraps it: our own errno, the reason inside a
+    URLError, or our vetting proxy's own busy reply (plain HTTP 503 or a refused tunnel)."""
+    import urllib.error
+
+    if e.errno in _HOST_ERRNOS:
+        return True
+    reason = getattr(e, "reason", None)
+    if isinstance(reason, OSError) and reason.errno in _HOST_ERRNOS:
+        return True
+    if isinstance(e, urllib.error.HTTPError) and e.code == 503 and \
+            "Audel Host Busy" in str(getattr(e, "reason", "") or e.msg or ""):
+        return True
+    return "Audel Host Busy" in str(reason or e)
 
 
 _HOST_ERRNOS = frozenset(getattr(__import__("errno"), n) for n in

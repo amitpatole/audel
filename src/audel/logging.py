@@ -26,7 +26,9 @@ _PCT = re.compile(r"%[0-9A-Fa-f]{2}")
 _TOKCH = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-")
 _MINTED = re.compile(r"audel_[A-Za-z0-9_\-]{43}_[a-z2-7]{8}", re.IGNORECASE)        # fixed length
 # Real provider-key shapes, case-sensitive (so "aizawa-studios" or "sk-broadband.co.kr" are names).
-_PROVIDER = re.compile(r"(?<![A-Za-z0-9])(?:AIza[0-9A-Za-z_\-]{35}|sk-[A-Za-z0-9_\-]{20,}+)")
+_PROVIDER = re.compile(r"(?<![A-Za-z0-9])(?:AIza[0-9A-Za-z_\-]{35}|sk-[A-Za-z0-9_\-]{20,}+"
+                       r"|gh[pousr]_[A-Za-z0-9]{36}|glpat-[A-Za-z0-9_\-]{20}"
+                       r"|xox[abprs]-[A-Za-z0-9-]{10,}+|AKIA[0-9A-Z]{16})")
 # Keys whose value is a credential whatever it looks like when assigned or quoted. Short keys
 # (pwd/pass/sig) only as whole words or a camelCase suffix (not "compass:", "bypass=", "COMPASS:").
 _STRONG_KEYS = (r"password|passwd|passphrase|secret|client[_-]?secret|api[_-]?key|apikey"
@@ -36,14 +38,17 @@ _STRONG_KEYS = (r"password|passwd|passphrase|secret|client[_-]?secret|api[_-]?ke
 _WEAK_KEYS = r"token|signature|credentials?"
 _KEYS = "(?:" + _STRONG_KEYS + "|" + _WEAK_KEYS + ")"
 # Unquoted value: up to whitespace / separators.
+_KEY_START = r"(?=[pPsScCaAxXtT])"  # every key starts with one of these: skip other positions fast
 _KV = re.compile(
-    r"(" + _KEYS + r"([\"'`]?+)[ \t]*+([:=])[ \t]*+[\"'`]?+)"
+    _KEY_START + r"(" + _KEYS + r"([\"'`]?+)[ \t]*+([:=])[ \t]*+[\"'`]?+)"
     r"([^\s&\"'`,;<>\\]{6,}+)", re.IGNORECASE)
 # Quoted value (JSON / Python repr / header tuples), redacted up to its closing quote, spaces and
 # all: ``"password": "correct horse"``, ``{'password': b'x'}``, ``('x-api-key', 'abc')``.
 _KVQ = re.compile(
-    r"((?:" + _KEYS + r"|authorization|cookie|set-cookie)[\"'`]?+[ \t]*+(?:[:=]|,)[ \t]*+b?([\"'`]))([^\"'`\n\\]{4,256}+)(?=\2)",
+    _KEY_START + r"((?:" + _KEYS + r"|authorization|cookie|set-cookie)[\"'`]?+[ \t]*+(?:[:=]|,)[ \t]*+b?([\"'`]))"
+    r"((?:[^\"'`\n\\]|\\.|(?!\2)[\"'`]){4,4096}+)(?=\2)",
     re.IGNORECASE)
+_MAX_KEYWORDS = 128
 _KV_HINT = ("pass", "pwd", "secret", "key", "credential", "signature", "sig", "token",
             "authorization", "cookie")
 _AUTHZ = re.compile(r"(authorization([\"'`]?+)[ \t]*+([:=])[ \t]*+([\"'`]?+))"
@@ -131,7 +136,8 @@ def _credential(run: str, budget: _Budget, *, decoded: bool = False) -> bool:
         return True
     low = run.lower()
     return bool(("audel" in low and _MINTED.search(run))
-                or (("sk-" in low or "aiza" in low) and _PROVIDER.search(run))
+                or (any(p in low for p in ("sk-", "aiza", "gh", "glpat-", "xox", "akia"))
+                    and _PROVIDER.search(run))
                 or _jwt_in(run, budget))
 
 
@@ -182,7 +188,12 @@ def _authz(m: re.Match) -> str:
     # ``Authorization: <scheme> <credential>`` and ``authorization="..."`` are credentials; prose
     # (``authorization: required for this endpoint``) is kept.
     value = m.group(5)
-    scheme = " " in value and value[:1].isupper()  # "<Scheme> <credential>": Basic, Token, SSWS
+    # "<Scheme> <credential>" (Basic, Token, SSWS, bearer ...): a second word of 8+ token
+    # characters is a credential whatever its case; "required for this" is prose.
+    parts = value.split()
+    scheme = (len(parts) == 2 and len(parts[1]) >= 8
+              and all(c.isalnum() or c in "-_.~+/=" for c in parts[1])) or \
+        (" " in value and value[:1].isupper())
     explicit = m.group(3) == "=" or bool(m.group(2)) or bool(m.group(4)) or scheme
     return m.group(1) + "[REDACTED]" if explicit or _looks_secret(value) else m.group()
 
@@ -197,11 +208,16 @@ def scrub_text(text: str) -> str:
     persisted session state, and by the log filter below."""
     text = _scrub_shapes(text)
     low = text.lower()
+    if sum(low.count(h) for h in _KV_HINT) > _MAX_KEYWORDS:
+        # Hundreds of credential keywords in one field is a flood, not a log line: redact it
+        # whole (fail closed) rather than spend per-keyword matching on it.
+        return "[REDACTED: too many credential keywords]"
     if "authorization" in low:
         text = _AUTHZ.sub(_authz, text)
     if "bearer" in low:
-        text = _BEARER.sub(lambda m: m.group(1) + "[REDACTED]" if _looks_secret(m.group(2))
-                           else m.group(), text)
+        text = _BEARER.sub(lambda m: m.group(1) + "[REDACTED]"
+                       if _looks_secret(m.group(2)) or any(c in "_-" for c in m.group(2))
+                       else m.group(), text)
     if any(h in low for h in _KV_HINT):  # every key contains one of these: skip the regexes
         text = _KVQ.sub(lambda m: m.group(1) + "[REDACTED]", text)
         text = _KV.sub(_kv, text)
@@ -246,10 +262,11 @@ class _SecretScrubber(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003
         if record.name in _TUPLE_FORMATTED and isinstance(record.args, tuple) \
                 and isinstance(record.msg, str):
+            record.msg = scrub_text(_clip(record.msg))  # the template is text too (f-strings)
             record.args = tuple(
-                a if isinstance(a, (int, float)) and not isinstance(a, bool)
+                a if isinstance(a, (int, float))   # numbers (and bools) stay as they are (%d)
                 else scrub_text(_clip(a if isinstance(a, str) else str(a)))
-                for a in record.args)  # numbers stay numbers (``%d``); anything else is text
+                for a in record.args)
         else:
             # Everything else: render first (``str()`` of any message or argument object, so an
             # exception or a dict is covered), then scrub the whole line once and flatten. A

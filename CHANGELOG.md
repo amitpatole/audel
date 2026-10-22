@@ -121,6 +121,22 @@ All notable changes to Audel are recorded here. The format follows
     at most 2 fetches, in a pool of 8.
   - **Low-Medium.** Work abandoned while waiting on its tenant share still ran later. Abandonment now
     propagates through both waits.
+- Red-team round 13 fixes (network and auth surfaces), each pinned by a regression test. No
+  bypass, escalation, tenant crossing or leak was found; the real-media leak stress returned to
+  baseline.
+  - **Low-Medium.** `uvicorn.error` records whose template carried text (an f-string) were not
+    scrubbed. The template is scrubbed too, and booleans format again.
+  - **Low-Medium.** One credential keyword anywhere in a field multiplied the scrub cost. Keyword
+    patterns now skip non-key positions quickly, and a field with hundreds of keywords is redacted
+    whole: keyword floods cost about what ordinary text does.
+  - **Low.** Quoted values containing quotes or backslash escapes (as `json.dumps` writes them,
+    including PEM keys) are redacted whole. Lower-case schemes (`authorization: bearer ...`),
+    bearer tokens with `_` or `-`, and known token formats (GitHub, GitLab, Slack, AWS access key
+    ids) are redacted.
+  - **Low.** A host failure during URL ingest that urllib or the vetting proxy wrapped (a
+    `URLError`, a proxy 502) is now a retry: the proxy replies with its own busy status.
+  - **Info.** The audit log scrubs each value before serialising, so a client request id can't
+    rename a key.
 - Red-team round 12 fixes (network surface), each pinned by a regression test. A crafted-file
   corpus of 480 grades never produced a busy signal, and a cancellation fuzz of about 1,900
   requests left every slot and counter at baseline.
