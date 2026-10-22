@@ -121,6 +121,15 @@ All notable changes to Audel are recorded here. The format follows
     at most 2 fetches, in a pool of 8.
   - **Low-Medium.** Work abandoned while waiting on its tenant share still ran later. Abandonment now
     propagates through both waits.
+- Red-team round 7 fixes (auth surface), each pinned by a regression test. No bypass or
+  escalation was found.
+  - **Low.** About one minted token in a million failed the structure check, so it would be refused
+    at startup. Minting now re-checks its own output, and the run check counts only strictly
+    ascending or descending runs.
+  - **Low.** A JWT, or a percent-encoded token, misplaced in a URL reached the access log. Both are
+    now redacted.
+  - **Info.** IPv4-mapped IPv6 ranges are held to the IPv4 floor, so `::ffff:0:0/96` can't trust
+    every client. Helm also refuses zero-padded prefixes and netmask forms.
 - Red-team round 6 fixes (decode and accuracy), each pinned by a regression test. A fuzz of 350
   byte mutations across 14 codecs confirmed CRC enforcement never loses legitimate audio, and 69
   legitimate and edge-case files grade with no false integrity findings.

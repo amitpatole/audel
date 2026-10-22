@@ -12,7 +12,8 @@ import os
 import re
 
 _SECRET_RE = re.compile(
-    r"(audel_[A-Za-z0-9_\-]{43}_[a-z2-7]{8}"                       # minted Audel tokens, anywhere
+    r"(audel(?:_|%5[Ff])[A-Za-z0-9_\-%]{43,60}(?:_|%5[Ff])[a-z2-7]{8}"   # minted tokens, anywhere
+    r"|eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"          # JWTs, anywhere
     r"|sk-[A-Za-z0-9_\-]{8,}|AIza[A-Za-z0-9_\-]{8,}"
     r"|[Bb]earer\s+[A-Za-z0-9._~+/=\-]{8,}"
     r"|(?:api[_-]?key|token|secret|password)[\"'`:=\s]+[A-Za-z0-9._\-]{6,})",
@@ -39,6 +40,12 @@ def scrub_text(text: str) -> str:
     Value-based redaction is sound (config registers every key it resolves); the regex is a
     backstop. Used by the workspace so a credential can never reach disk via persisted session
     state, and by the log filter below."""
+    if "%" in text:  # a credential misplaced in a URL may be percent-encoded
+        from urllib.parse import unquote
+
+        decoded = unquote(text)
+        if decoded != text and any(s in decoded for s in _KNOWN_SECRETS):
+            text = decoded
     # Longest first: a secret containing a shorter registered secret must be redacted whole.
     for secret in sorted(_KNOWN_SECRETS, key=len, reverse=True):
         if secret in text:

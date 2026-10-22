@@ -233,6 +233,12 @@ class Settings(BaseSettings):
             except ValueError as e:
                 raise ValueError(f"forwarded_allow_ips entry {entry!r} is not an address or network") from e
             floor = 8 if net.version == 4 else 32
+            if net.version == 6:
+                # IPv4-mapped / -compatible space stands for IPv4 clients: hold it to the IPv4
+                # floor (/8 of the embedded address = /104), or ::ffff:0:0/96 trusts everyone.
+                for v4ish in (ipaddress.ip_network("::ffff:0:0/96"), ipaddress.ip_network("::/96")):
+                    if net.overlaps(v4ish):
+                        floor = 104
             if net.prefixlen < floor:
                 raise ValueError(f"forwarded_allow_ips entry {entry!r} is too broad (/{net.prefixlen}); "
                                  f"use /{floor} or narrower")

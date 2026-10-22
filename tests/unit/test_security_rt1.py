@@ -2014,3 +2014,62 @@ def test_incomplete_gap_scan_is_reported_not_assumed_clean(media, monkeypatch):
     r = asyncio.run(check(str(media["good"])))
     assert _checks(r, "gap_scan_incomplete")
     assert seen["timeout"] is not None and seen["timeout"] <= 120.0   # inside the file budget
+
+
+# ==== round 7, auth surface ===================================================================
+
+def test_minting_never_returns_a_token_the_server_would_refuse(monkeypatch):
+    import secrets
+
+    from audel.auth import new_token, strong_token
+
+    bodies = iter(["gwDY1nlHUWOsZoVYF8gZBABCDEFtW5MROuGaPa79cAps"[:43], secrets.token_urlsafe(32)])
+    monkeypatch.setattr(secrets, "token_urlsafe", lambda n: next(bodies))
+    t = new_token()
+    assert strong_token(t) and "ABCDEF" not in t
+
+
+def test_zig_zag_bodies_are_not_called_structured():
+    from audel.auth import _structured
+
+    assert not _structured("gwDY1nlHUWOsZoVYF8gZBABCDCtW5MROuGaPa79cAps")
+    assert _structured("gwDY1nlHUWOsZoVYF8gZABCDEFtW5MROuGaPa79cAps")
+    assert _structured("gwDY1nlHUWOsZoVYF8gZFEDCBAtW5MROuGaPa79cAps")
+
+
+def test_jwts_and_percent_encoded_tokens_are_redacted_from_urls():
+    from audel.auth import new_token
+    from audel.logging import register_secret, scrub_text
+
+    jwt = "eyJhbGciOiJSUzI1NiJ9.eyJ0ZW5hbnQiOiJhIn0.c2lnbmF0dXJlLWJ5dGVz"
+    assert jwt not in scrub_text(f'"GET /specs?jwt={jwt} HTTP/1.1" 401')
+    tok = new_token()
+    enc = tok.replace("_", "%5F")
+    assert enc not in scrub_text(f'"GET /specs?auth={enc} HTTP/1.1" 401')
+    shared = "s3cret-shared-value_x"
+    register_secret(shared)
+    assert "s3cret" not in scrub_text("GET /?k=" + shared.replace("_", "%5F").replace("-", "%2D"))
+
+
+@pytest.mark.parametrize("entry", ["::ffff:0:0/96", "::ffff:0.0.0.0/96", "::/32", "::/96",
+                                   "0.0.0.0/0.0.0.0", "0.0.0.0/00"])
+def test_ipv4_mapped_and_netmask_wildcards_are_refused(entry):
+    with pytest.raises(ValueError):
+        Settings(forwarded_allow_ips=[entry])
+
+
+def test_specific_ipv4_mapped_proxy_is_accepted():
+    assert Settings(forwarded_allow_ips=["::ffff:10.0.0.0/104", "2001:db8::/32"])
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="helm not installed")
+@pytest.mark.parametrize("entry,ok", [("0.0.0.0/00", False), ("0.0.0.0/0.0.0.0", False),
+                                      ("::/0000", False), ("::ffff:0:0/96", False),
+                                      ("10.0.0.0/8", True), ("fd00::/48", True)])
+def test_helm_proxy_entry_forms(entry, ok):
+    from pathlib import Path
+
+    chart = Path(__file__).resolve().parents[2] / "deploy" / "helm" / "audel"
+    r = subprocess.run(["helm", "template", "t", str(chart), "--set", "auth.existingSecret=s",
+                        "--set", f"forwardedAllowIps={{{entry}}}"], capture_output=True, text=True)
+    assert (r.returncode == 0) == ok, r.stderr

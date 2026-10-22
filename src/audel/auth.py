@@ -91,8 +91,11 @@ def new_token() -> str:
     token would still need to pass the character-variety floor below. Always mint tokens."""
     import secrets
 
-    body = secrets.token_urlsafe(32)
-    return f"audel_{body}_{_checksum(body)}"
+    while True:  # re-mint the (about 1 in 10^6) body the structure check would refuse
+        body = secrets.token_urlsafe(32)
+        token = f"audel_{body}_{_checksum(body)}"
+        if strong_token(token):
+            return token
 
 
 _MIN_DISTINCT = 18  # minted bodies use >= 22 distinct characters in 200k samples
@@ -121,11 +124,12 @@ def _structured(body: str) -> bool:
     for p in range(1, 22):
         if all(body[i] == body[i + p] for i in range(n - p)):
             return True
-    run = 1
-    for a, b in zip(body, body[1:], strict=False):
-        run = run + 1 if abs(ord(b) - ord(a)) == 1 else 1
-        if run >= 6:
-            return True
+    for step in (1, -1):  # strictly ascending or strictly descending, never a zig-zag
+        run = 1
+        for a, b in zip(body, body[1:], strict=False):
+            run = run + 1 if ord(b) - ord(a) == step else 1
+            if run >= 6:
+                return True
     return False
 
 
