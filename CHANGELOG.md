@@ -121,6 +121,16 @@ All notable changes to Audel are recorded here. The format follows
     at most 2 fetches, in a pool of 8.
   - **Low-Medium.** Work abandoned while waiting on its tenant share still ran later. Abandonment now
     propagates through both waits.
+- Red-team round 16 fixes (auth surface), each pinned by a regression test. No bypass,
+  escalation or ReDoS was found; a differential fuzz of 80,000 cases found no new leaks.
+  - **Low-Medium.** Common credential names (`SECRET_KEY`, `signing_key`, `encryption_key`,
+    `master_key`, `hmac_key`, `ssh_key`, `license_key`, `sessionid`, `auth`, `Cookie`) were never
+    redacted, including in the access log. They are now.
+  - **Low.** Key/value pairs with a compound key (`('OPENAI_API_KEY', ...)`, `('DB_PASSWORD',
+    ...)`, the shape of a logged environment) are redacted; a list of names (`['password',
+    'username']`) is not. Double-encoded JSON values with escapes, quotes or non-ASCII text are
+    redacted, as are `Authorization` and `Cookie` there. Past the keyword budget, backtick-quoted
+    values are covered and a comma no longer pairs a word with the next key.
 - Red-team round 15 fixes (multichannel), each pinned by a regression test. A 94-file legitimate
   multichannel corpus (every standard layout up to 22.2, unlabelled 3-24 channel WAVs, FLAC,
   Opus, AAC, AC-3, E-AC-3, custom-order MOV/CAF) matches ffmpeg's own loudness on the true layout

@@ -3958,3 +3958,46 @@ def test_asr_decode_keeps_an_unlabelled_lcr_centre(tmp_path):
         return 20 * np.log10(np.sqrt(np.mean(a ** 2)) / 32768 + 1e-12)
 
     assert abs(level(m0) - level(lab)) < 1.0        # the centre isn't dropped as "LFE"
+
+
+# ==== round 16, auth surface ==================================================================
+
+@pytest.mark.parametrize("text", [
+    "SECRET_KEY=CANARY6x", "secret_key: CANARY6x", "secretKey=CANARY6x", "JWT_SECRET_KEY=CANARY6x",
+    "encryption_key=CANARY6x", "signing_key: CANARY6x", "master_key=CANARY6x", "ssh_key=CANARY6x",
+    "license_key=CANARY6x", "hmac_key=CANARY6x", "sessionid=CANARY6x", "auth=CANARY6x",
+    "Cookie: sid=CANARY6x", "Cookie=CANARY6x",
+    "pass " * 130 + '"note": "key", x-api-key: CANARY6x', "pass " * 130 + "api_key=`CANARY6x`",
+    "[('OPENAI_API_KEY', 'CANARY6x'), ('PATH', '/bin')]", "[('DB_PASSWORD', 'CANARY6x')]",
+    "[('aws_secret_access_key','CANARY6x')]", "[('access_token','CANARY6x9')]",
+    "[('jwt_secret','CANARY6x')]", "[('userPassword','CANARY6x')]", "[('token','CANARY6x9')]"])
+def test_round16_key_names_and_pairs_are_redacted(text):
+    from audel.logging import scrub_text
+
+    assert "CANARY6x" not in scrub_text(text)
+
+
+@pytest.mark.parametrize("value", ["éCANARY6x", "a'CANARY6x", 'a"CANARY6x', "a\\bCANARY6x"])
+def test_double_encoded_values_with_escapes_are_redacted(value):
+    import json as _json
+
+    from audel.logging import scrub_text
+
+    out = scrub_text(_json.dumps(_json.dumps({"password": value, "note": "ok"})))
+    assert "CANARY6x" not in out and "note" in out
+
+
+@pytest.mark.parametrize("text", ['["password", "username", "email"]',
+                                  "visibility in ['secret', 'public', 'private']",
+                                  "['api_key', 'cache_dir', 'spec']", "author: Jane",
+                                  "authentication required", "session started"])
+def test_name_lists_and_prose_are_not_redacted(text):
+    from audel.logging import scrub_text
+
+    assert scrub_text(text) == text
+
+
+def test_access_log_redacts_secret_key_queries():
+    out = _emit('%s - "%s %s HTTP/%s" %d', "1.2.3.4", "GET", "/specs?SECRET_KEY=CANARY6x", "1.1",
+                401, name="uvicorn.access")
+    assert "CANARY6x" not in out and "/specs?SECRET_KEY=" in out

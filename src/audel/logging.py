@@ -30,42 +30,55 @@ _PROVIDER = re.compile(r"(?<![A-Za-z0-9])(?:AIza[0-9A-Za-z_\-]{35}|sk-[A-Za-z0-9
                        r"|gh[pousr]_[A-Za-z0-9]{36}|glpat-[A-Za-z0-9_\-]{20}"
                        r"|xox[abprs]-[A-Za-z0-9-]{10,}+|AKIA[0-9A-Z]{16})")
 # Keys whose value is a credential whatever it looks like when assigned or quoted. Short keys
-# (pwd/pass/sig) only as whole words or a camelCase suffix (not "compass:", "bypass=", "COMPASS:").
-_STRONG_KEYS = (r"password|passwd|passphrase|secret|client[_-]?secret|api[_-]?key|apikey"
-                r"|access[_-]?key|private[_-]?key|auth[_-]?token|x-api-key"
-                r"|(?<![A-Za-z])(?:pwd|pass|sig)(?![A-Za-z])|(?-i:(?<=[a-z])(?:Pwd|Pass|Sig))")
+# (pwd/pass/sig/auth) only as whole words or a camelCase suffix (not "compass:", "author:").
+_STRONG_KEYS = (r"password|passwd|passphrase|secret[_-]?key|secretkey|secret|client[_-]?secret"
+                r"|api[_-]?key|apikey|access[_-]?key|private[_-]?key|auth[_-]?token|x-api-key"
+                r"|(?:signing|encryption|master|hmac|ssh|license)[_-]?key"
+                r"|session[_-]?id|cookie"
+                r"|(?<![A-Za-z])(?:pwd|pass|sig|auth)(?![A-Za-z])"
+                r"|(?-i:(?<=[a-z])(?:Pwd|Pass|Sig))")
 # Weaker keys: ``key: value`` prose after them is redacted only for credential-like values.
 _WEAK_KEYS = r"token|signature|credentials?"
 _KEYS = "(?:" + _STRONG_KEYS + "|" + _WEAK_KEYS + ")"
 # Unquoted value: up to whitespace / separators.
-_KEY_START = r"(?=[pPsScCaAxXtT])"  # every key starts with one of these: skip other positions fast
+_KEY_START = r"(?=[pPsScCaAxXtTeEmMhHlL])"  # every key starts with one of these
 _KV = re.compile(
     _KEY_START + r"(" + _KEYS + r"([\"'`]?+)[ \t]*+([:=])[ \t]*+[\"'`]?+)"
     r"([^\s&\"'`]{1,4096}+)", re.IGNORECASE)
-# Quoted value (JSON / Python repr / header tuples), redacted up to its closing quote, spaces and
-# all: ``"password": "correct horse"``, ``{'password': b'x'}``, ``('x-api-key', 'abc')``.
+# Quoted value (JSON / Python repr), redacted up to its closing quote, spaces and all:
+# ``"password": "correct horse"``, ``{'password': b'x'}``.
 _KVQ = re.compile(
-    _KEY_START + r"((?:" + _KEYS + r"|authorization|cookie|set-cookie)[\"'`]?+[ \t]*+[:=][ \t]*+b?([\"'`]))"
+    _KEY_START + r"((?:" + _KEYS + r"|authorization|set-cookie)[\"'`]?+[ \t]*+[:=][ \t]*+b?([\"'`]))"
     r"((?:[^\"'`\n\\]|\\.|(?!\2)[\"'`]){1,4096}+)(?=\2)",
     re.IGNORECASE)
 _HEADER_KEYS = (r"(?:proxy-)?authorization|set-cookie|cookie|x-api-key|api-key|apikey|x-auth-token"
                 r"|x-amz-security-token|x-goog-api-key|private-token")
-# Header tuples: ``(b'authorization', b'Basic ...')``, ``('x-api-key', 'abc')``. Only in a tuple
-# or list opening, so a bare "pass" in ``['pass', 'warn']`` doesn't redact its neighbour.
-_TUPLE_KEYS = (_HEADER_KEYS + r"|password|passwd|passphrase|secret|client[_-]?secret"
-               r"|api[_-]?key|access[_-]?key|private[_-]?key|auth[_-]?token")
+# Key / value PAIRS: ``(b'authorization', b'Basic ...')``, ``('OPENAI_API_KEY', '...')`` (the
+# shape of a logged ``os.environ.items()``). Anchored on the pair's own bracket, and only a
+# 2-item pair, so a list of names (``['password', 'username']``) is left alone. The key may
+# carry a prefix / suffix (``DB_PASSWORD``, ``aws_secret_access_key``).
+_TUPLE_KEYS = (_HEADER_KEYS + r"|password|passwd|passphrase|secret|api[_-]?key|access[_-]?key"
+               r"|private[_-]?key|auth[_-]?token|access[_-]?token|(?:signing|encryption|master"
+               r"|hmac|ssh|license)[_-]?key|session[_-]?id")
 _TUPLE_HINT_RE = re.compile(r"[\(\[][ \t]*+b?[\"']", re.IGNORECASE)
 _KVT = re.compile(
-    r"([\(\[][ \t]*+b?[\"'](?:" + _TUPLE_KEYS + r")[\"'][ \t]*+,"
-    r"[ \t]*+b?([\"']))((?:[^\"'\n\\]|\\.|(?!\2)[\"']){1,4096}+)(?=\2)", re.IGNORECASE)
-# Double-encoded JSON: ``{\"password\": \"hunter2\"}`` inside another JSON string.
+    r"([\(\[][ \t]*+b?[\"'][A-Za-z0-9_.\-]{0,32}?(?:" + _TUPLE_KEYS + r")[A-Za-z0-9_.\-]{0,16}?"
+    r"[\"'][ \t]*+,[ \t]*+b?([\"']))((?:[^\"'\n\\]|\\.|(?!\2)[\"']){1,4096}+)"
+    r"(?=\2[ \t]*+[\)\]])", re.IGNORECASE)
+# Weak keys in a pair (``('token', v)``): only a credential-like value.
+_KVTW = re.compile(
+    r"([\(\[][ \t]*+b?[\"'][A-Za-z0-9_.\-]{0,32}?(?:token|signature|credentials?|pwd|pass)"
+    r"[A-Za-z0-9_.\-]{0,16}?[\"'][ \t]*+,[ \t]*+b?([\"']))((?:[^\"'\n\\]|\\.|(?!\2)[\"']){1,4096}+)"
+    r"(?=\2[ \t]*+[\)\]])", re.IGNORECASE)
+# Double-encoded JSON: ``{\"password\": \"hunter2\"}`` inside another JSON string. The value may
+# hold escaped escapes (``\\u00e9``), an escaped quote (``\\\"``) or the other quote kind.
 _KVQE = re.compile(
-    _KEY_START + r"(" + _KEYS + r"\\?+[\"']?+[ \t]*+[:=][ \t]*+\\([\"']))"
-    r"([^\"'\\\n]{1,4096}+)(?=\\\2)", re.IGNORECASE)
+    _KEY_START + r"((?:" + _KEYS + r"|authorization|set-cookie)\\?+[\"']?+[ \t]*+[:=][ \t]*+"
+    r"\\([\"']))((?:\\\\\\[\"']|\\\\|[^\"'\\\n]|(?!\2)[\"']){1,4096}+)(?=\\\2)", re.IGNORECASE)
 _MAX_KEYWORDS = 128   # keyword positions matched with the patterns; beyond, a linear fallback
-_KEY_BACK = 8         # a key starts at most this far before its hint ("client_" + "secret")
+_KEY_BACK = 12        # a key starts at most this far before its hint ("encryption_" + "key")
 _KV_HINT = ("pass", "pwd", "secret", "key", "credential", "signature", "sig", "token",
-            "authorization", "cookie")
+            "authorization", "cookie", "session", "auth")
 _AUTHZ = re.compile(r"(authorization([\"'`]?+)[ \t]*+([:=])[ \t]*+([\"'`]?+))"
                     r"((?:[A-Za-z][A-Za-z0-9_-]{1,31}\s++)?+[^\s\"'`,;\\]++)", re.IGNORECASE)
 _BEARER = re.compile(r"(bearer\s++)([A-Za-z0-9._~+/=\-]{8,}+)", re.IGNORECASE)
@@ -73,6 +86,8 @@ _SECRETISH = frozenset("0123456789.~+/=%")  # not "_" or "-": snake_case / kebab
 # Keys explicit even in ``key: value`` prose. The short keys, "signature" and "credential" are
 # not: "VERDICT PASS: loudness_ok", "credential: missing" are prose unless the value looks secret.
 _EXPLICIT_RE = re.compile(r"password|passwd|passphrase|secret|api[_-]?key|apikey|access[_-]?key"
+                          r"|(?:signing|encryption|master|hmac|ssh|license)[_-]?key|session[_-]?id"
+                          r"|cookie|(?<![A-Za-z])auth(?![A-Za-z])"
                           r"|private[_-]?key|auth[_-]?token|x-api-key", re.IGNORECASE)
 
 
@@ -212,7 +227,7 @@ def _fold(text: str) -> str:
         return low
     return "".join(c if len(c.lower()) != 1 else c.lower() for c in text)
 _VALUE_END = frozenset(" \t\r\n\"'`&")
-_KEY_FIRST = frozenset("pscaxt([")  # first characters of every key, and of a tuple opening
+_KEY_FIRST = frozenset("pscaxtemhl([")  # first characters of every key, and of a tuple opening
 
 
 def _scrub_keywords(text: str) -> str:  # noqa: C901 - one linear pass, kept together
@@ -223,6 +238,8 @@ def _scrub_keywords(text: str) -> str:  # noqa: C901 - one linear pass, kept tog
     if ("(" in text or "[" in text) and _TUPLE_HINT_RE.search(text):
         # Header / key tuples anchor on their own bracket: no back-window to fall outside of.
         text = _KVT.sub(lambda m: m.group(1) + "[REDACTED]", text)
+        text = _KVTW.sub(lambda m: m.group(1) + "[REDACTED]" if _looks_secret(m.group(3))
+                         else m.group(), text)
     low = _fold(text)
     hits: list[int] = []
     for hm in _HINT_RE.finditer(low):  # in order, C-speed; stop just past the pattern budget
@@ -248,7 +265,7 @@ def _scrub_keywords(text: str) -> str:  # noqa: C901 - one linear pass, kept tog
         for i in range(max(last, p - _KEY_BACK), p + 1):
             if low[i] not in _KEY_FIRST:
                 continue  # no key (or tuple opening) starts here: skip the patterns
-            m = _KVT.match(text, i) or _KVQ.match(text, i)
+            m = _KVQ.match(text, i)
             if m:
                 span = (m.start(), m.end(), m.group(1) + "[REDACTED]")
                 break
@@ -259,9 +276,10 @@ def _scrub_keywords(text: str) -> str:  # noqa: C901 - one linear pass, kept tog
             m = _KV.match(text, i)
             if m:
                 rep = _kv(m)
-                if rep != m.group():  # kept prose doesn't consume: a key after it is still tried
+                if rep != m.group():
                     span = (m.start(), m.end(), rep)
-                break
+                    break
+                # Kept prose doesn't consume: keep trying later starts (a key glued after it).
         if span is not None:
             out.append(text[last:span[0]])
             out.append(span[2])
@@ -271,9 +289,9 @@ def _scrub_keywords(text: str) -> str:  # noqa: C901 - one linear pass, kept tog
 
 
 _FALLBACK = re.compile(
-    r"((?:pass|pwd|secret|key|credential|signature|sig|token|authorization|cookie)"
-    r"[A-Za-z_\-]{0,24}+[\"'`]?+[ \t]*+[:=,][ \t]*+b?)"
-    r"(\"[^\"\n]{0,4096}+\"|'[^'\n]{0,4096}+'|[^\s\"'`&]{1,4096}+)",
+    r"((?:pass|pwd|secret|key|credential|signature|sig|token|authorization|cookie|session|auth)"
+    r"[A-Za-z_\-]{0,24}+[\"'`]?+[ \t]*+[:=][ \t]*+b?)"  # pairs: _KVT covers them, unbudgeted
+    r"(\"[^\"\n]{0,4096}+\"|'[^'\n]{0,4096}+'|`[^`\n]{0,4096}+`|[\"'`]?+[^\s\"'`&]{1,4096}+)",
     re.IGNORECASE)
 
 
