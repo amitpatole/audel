@@ -1,0 +1,48 @@
+image:
+  repository: ghcr.io/amitpatole/audel
+  tag: "1.0.0rc1"
+  pullPolicy: IfNotPresent
+
+# Sync grading scales horizontally. Async jobs (/jobs) live in each pod's memory: keep
+# replicaCount 1 for the jobs API, or route a tenant's job calls to one pod (see docs).
+replicaCount: 2
+
+auth:
+  # Name of an existing Secret with key AUDEL_API_TOKEN (and optionally AUDEL_API_TOKENS_FILE
+  # contents mounted below). The chart never generates or embeds a token.
+  existingSecret: ""
+
+env:
+  AUDEL_DELIVERY_SPEC: ""
+  AUDEL_MAX_CONCURRENT_JOBS: "2"
+  AUDEL_MAX_REQUEST_BYTES: "200000000"
+  AUDEL_MAX_MEDIA_BYTES: "200000000"
+  AUDEL_REQUEST_TIMEOUT_S: "600"
+  AUDEL_ALLOW_URL_INGEST: "false"
+  AUDEL_REST_ALLOW_UNDERSTAND: "false"
+  AUDEL_EGRESS: "allow"
+  AUDEL_LOG_LEVEL: "WARNING"
+
+resources:
+  requests: {cpu: "1", memory: 1Gi}
+  limits: {cpu: "2", memory: 3Gi}
+
+cacheSizeLimit: 2Gi
+
+service:
+  type: ClusterIP
+  port: 8000
+
+networkPolicy:
+  enabled: true
+  # Default: egress denied except DNS. Add CIDRs for an on-prem LLM or object store.
+  egressCIDRs: []
+  ingressFrom: []   # podSelector/namespaceSelector entries allowed to call the service
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

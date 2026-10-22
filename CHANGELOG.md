@@ -35,6 +35,19 @@ All notable changes to Audel are recorded here. The format follows
 - `audel listen` CLI, `POST /listen` (understanding is operator opt-in via
   `AUDEL_REST_ALLOW_UNDERSTAND`), and the MCP tool `listen_audio`. `audel doctor` reports
   local-LLM reachability.
+- **Async jobs.** `POST /jobs` takes `check`, `listen` or `analyze` and returns 202 with a job id.
+  `GET` and `DELETE /jobs/{id}` work on your tenant's jobs only. The queue is bounded and returns
+  429 with `Retry-After` when full. Results expire after a TTL.
+- **URL ingestion** for object-store and signed URLs (`AUDEL_ALLOW_URL_INGEST`, off by default).
+  It is https-only, limited to ports 80 and 443, honours an optional host allowlist, routes
+  through the vetting proxy, re-checks every redirect hop, and is byte- and time-capped.
+- Prometheus `GET /metrics`, `X-Request-ID` on every response, and a JSON-lines audit log
+  (`AUDEL_AUDIT_LOG`) that holds hashes and outcomes only.
+- `audel purge` for crash leftovers and retention.
+- Production Dockerfile: the model is baked in, the runtime is offline for models, it works with
+  a read-only root filesystem, and it fails closed without a token. A hardened Helm chart lives in
+  `deploy/helm/audel`.
+- `AUDEL_ASR_MODEL_DIR` for pre-downloaded whisper models.
 - `audel bench` measures precision and recall per check, on a synthetic labelled corpus or on your
   own labelled corpus.
 - `SECURITY.md` with a private reporting path and supported-version table.

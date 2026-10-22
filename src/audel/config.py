@@ -103,6 +103,7 @@ class Settings(BaseSettings):
     asr_language: str | None = None    # None = autodetect
     asr_device: str = "auto"           # auto | cpu | cuda
     asr_compute_type: str = "auto"     # auto = int8 on CPU, float16 on CUDA
+    asr_model_dir: Path | None = None  # pre-downloaded models (containers: no runtime download)
 
     # Listening (Phase 10): pace, pauses, intelligibility, script adherence, captions.
     listen_min_wpm: float = 110.0      # narration slower than this reads as dragging
@@ -163,6 +164,19 @@ class Settings(BaseSettings):
     # uses only the server's configured default (a remote caller can't redirect egress or pick a
     # paid model). Loopback/CLI is unaffected. Set e.g. ["local"] to permit explicit offline ASR.
     rest_enabled_backends: list[str] = Field(default_factory=list)
+    # URL ingestion (Phase 11): grade media from object-store / signed URLs. Egress: off by default.
+    allow_url_ingest: bool = False
+    ingest_allow_http: bool = False
+    ingest_allowed_hosts: list[str] = Field(default_factory=list)  # exact host or ".suffix"
+    ingest_timeout_s: float = 300.0
+
+    # Async jobs + operations (Phase 11)
+    max_queued_jobs: int = 64          # submissions beyond this get 429 (backpressure)
+    max_stored_jobs: int = 1000        # finished results kept (oldest evicted first)
+    job_result_ttl_s: float = 3600.0   # finished results are purged after this
+    audit_log: Path | None = None      # JSON-lines audit file (hashes + outcomes, never content)
+    metrics_enabled: bool = True
+
     # listen(understand=True) over REST sends the transcript (and, for audio-capable models, audio
     # excerpts) to the server's configured backend. Off by default: the operator decides egress.
     rest_allow_understand: bool = False

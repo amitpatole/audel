@@ -128,6 +128,20 @@ class Workspace:
 
     # ---- garbage collection ----------------------------------------------------
 
+    def purge_tmp(self, max_age_s: float) -> int:
+        """Delete server temp files (uploads / ingests / excerpts) older than ``max_age_s``.
+        Normal requests delete their own files; this reaps what a crash left behind."""
+        removed = 0
+        now = time.time()
+        for f in self.tmp.iterdir():
+            try:
+                if f.is_file() and not f.is_symlink() and now - f.stat().st_mtime > max_age_s:
+                    f.unlink()
+                    removed += 1
+            except OSError:
+                continue
+        return removed
+
     def gc(self) -> int:
         """Reap stale or schema-mismatched sessions whose lock is unheld. Returns count removed."""
         removed = 0

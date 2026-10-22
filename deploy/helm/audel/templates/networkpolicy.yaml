@@ -1,0 +1,21 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "audel.fullname" . }}
+  labels: {{- include "audel.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {{- include "audel.selector" . | nindent 6 }}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - ports: [{port: 8000, protocol: TCP}]
+      {{- with .Values.networkPolicy.ingressFrom }}
+      from: {{- toYaml . | nindent 8 }}
+      {{- end }}
+  egress:
+    - ports: [{port: 53, protocol: UDP}, {port: 53, protocol: TCP}]
+    {{- range .Values.networkPolicy.egressCIDRs }}
+    - to: [{ipBlock: {cidr: {{ . | quote }}}}]
+    {{- end }}
+{{- end }}

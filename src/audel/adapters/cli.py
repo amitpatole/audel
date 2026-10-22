@@ -127,6 +127,18 @@ def listen(
 
 
 @app.command()
+def purge(hours: float = typer.Option(24.0, help="Remove temp files older than this many hours."),
+          sessions: bool = typer.Option(True, help="Also reap expired loop sessions.")) -> None:
+    """Delete stale workspace temp files and expired sessions (crash leftovers, retention)."""
+    from ..workspace import Workspace
+
+    ws = Workspace(load_settings())
+    n = ws.purge_tmp(hours * 3600)
+    m = ws.gc() if sessions else 0
+    typer.echo(f"removed {n} temp file(s) and {m} session(s) from {ws.root}")
+
+
+@app.command()
 def specs() -> None:
     """List the built-in delivery specs."""
     from ..specs import BUILTIN_SPECS

@@ -1,28 +1,32 @@
-"""REST service (FastAPI) — for non-MCP / networked / CI agents.
+"""REST service (FastAPI) — for pipelines, CI and networked agents.
 
-Security (mirrors AgentVision's rest.py, the reviewed sibling template):
-- Provider keys are read server-side only, NEVER accepted in a request; per-request backend
-  selection is limited to the server's allowlist (``rest_enabled_backends``), so a remote caller
-  cannot redirect egress or pick a paid model.
-- Bearer-token auth in CONSTANT time (``hmac.compare_digest``); zero-config on loopback, REQUIRED
-  once a token is set; binding a non-loopback host without a token is refused in :func:`serve`.
-- Request bodies are capped (Content-Length AND the raw stream, so a chunked upload can't bypass);
-  heavy jobs run behind a concurrency semaphore (DoS bound).
-- Audio enters ONLY as a multipart upload written to a server-named temp file — a remote caller can
-  never make the service read a host file by path (``allow_local_files=False`` for path sources).
-  The one URL path (``/watch``) keeps the SSRF guard ON (``block_private_networks``).
-- Errors are sanitized: only ``UnsafeSourceError`` text is returned; everything else is logged
-  server-side and the caller gets a generic message (no host paths/IPs leak). ``audio_path`` (a
-  server temp path) is stripped from every response.
+Security (mirrors AgentVision's reviewed rest.py, extended for production use):
+
+- **Authentication before anything else.** Every request except ``/healthz`` is resolved to a
+  tenant by :mod:`audel.auth` before its body is read; constant-time comparison; a non-loopback
+  bind without credentials is refused in :func:`serve`.
+- **Bounded.** Request bodies are capped (Content-Length AND the raw stream). Grading runs behind
+  a concurrency semaphore; async submissions beyond ``max_queued_jobs`` get 429.
+- **No host-file reads.** Media arrives as a multipart upload written to a server-named temp file,
+  or (operator opt-in) as an http(s) URL fetched through the SSRF-vetting proxy. A caller can
+  never name a path on the server, a spec file, or a backend outside ``rest_enabled_backends``.
+- **Tenant isolation.** Async jobs belong to the submitting tenant; anyone else gets 404.
+- **No leaks.** Errors are sanitized (only validation / unsafe-source text is returned, with
+  workspace paths redacted); ``audio_path`` is stripped from every report; signed-URL query
+  strings are never logged, audited or echoed.
+- **Observable.** ``X-Request-ID`` on every response, Prometheus ``/metrics``, and a JSON-lines
+  audit record per grade (hashes and outcomes, never content).
 """
 
 from __future__ import annotations
 
 import asyncio
-import hmac
+import hashlib
+import time
 import uuid
 from pathlib import Path
 
+from ..auth import Authenticator, Principal
 from ..config import Settings, load_settings
 from ..errors import AudelError, ConfigError, MissingDependencyError, UnsafeSourceError
 from ..logging import get_logger
@@ -30,12 +34,14 @@ from ..models import Brief, Report
 
 try:
     from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
-    from fastapi.responses import JSONResponse
+    from fastapi.responses import JSONResponse, PlainTextResponse
 except ImportError:  # pragma: no cover - only without the [serve] extra
     FastAPI = None  # type: ignore
 
 log = get_logger("rest")
 _LOOPBACK = {"127.0.0.1", "::1", "localhost", "0:0:0:0:0:0:0:1"}
+_KINDS = ("check", "listen", "analyze")
+_REQUEST_ID_OK = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.")
 
 
 def _is_loopback(host: str) -> bool:
@@ -56,65 +62,86 @@ def _public(report: Report) -> dict:
     return data
 
 
+def _request_id(raw: str | None) -> str:
+    if raw and 0 < len(raw) <= 64 and set(raw) <= _REQUEST_ID_OK:
+        return raw
+    return uuid.uuid4().hex
+
+
+def _sha256(path: Path) -> tuple[str, int]:
+    h = hashlib.sha256()
+    n = 0
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+            n += len(chunk)
+    return h.hexdigest(), n
+
+
 def build_app(settings: Settings | None = None):
     if FastAPI is None:
         raise MissingDependencyError("REST service needs FastAPI; pip install audel[serve]")
 
     from .. import __version__
+    from ..jobs import JobStore, QueueFull
+    from ..ops import AuditLog, Metrics
 
     # Service hardening: a remote caller must not read host files via a bare-path source. Grading
     # only ever runs on server-written temp files, so path sources are disabled service-wide.
     settings = settings or load_settings(allow_local_files=False)
-    # A separate settings for grading our OWN temp uploads (server-named paths only — never caller
+    # A separate settings for grading our OWN temp files (server-named paths only — never caller
     # controlled), so validate_source accepts them while caller path-sources stay refused.
     grade_settings = settings.model_copy(update={"allow_local_files": True})
-
-    def _auth(request: Request):
-        """Bearer-token auth (constant-time). /healthz is exempt; loopback is zero-config."""
-        if request.url.path == "/healthz":
-            return
-        if _unauthorized(request):
-            raise HTTPException(status_code=401, detail="Unauthorized")
-
-    def _unauthorized(request: Request) -> bool:
-        """True if the request must be rejected. /healthz is exempt; loopback is zero-config."""
-        if request.url.path == "/healthz":
-            return False
-        token = settings.api_token
-        if not token:
-            return False
-        provided = request.headers.get("authorization", "")
-        # Compare as BYTES: headers are latin-1 decoded by Starlette, and hmac.compare_digest on a
-        # str with a non-ASCII char raises TypeError (a crafted header would 500 instead of 401).
-        return not hmac.compare_digest(provided.encode("utf-8", "ignore"),
-                                       f"Bearer {token}".encode())
-
-    # FastAPI's auto-doc routes (/docs, /redoc, /openapi.json) are NOT covered by router-level
-    # dependencies, so they'd leak the API schema to unauthenticated callers. When a token is set
-    # (the service is meant to be exposed), disable them; keep them for loopback zero-config dev.
-    app = FastAPI(title="Audel", version=__version__, dependencies=[Depends(_auth)],
-                  openapi_url=(None if settings.api_token else "/openapi.json"))
+    auth = Authenticator(settings)
+    metrics = Metrics()
+    audit = AuditLog(settings.audit_log)
     _job_sem = asyncio.Semaphore(settings.max_concurrent_jobs)
+    jobs = JobStore(max_queued=settings.max_queued_jobs, max_stored=settings.max_stored_jobs,
+                    ttl_s=settings.job_result_ttl_s, semaphore=_job_sem)
     _ws_marker = str(settings.cache_dir)  # redacted from error detail (no temp-path leak)
+
+    def _principal(request: Request) -> Principal:
+        p = getattr(request.state, "principal", None)
+        if p is None:  # middleware always sets it; defensive fail-closed
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        return p
+
+    # FastAPI's auto-doc routes (/docs, /redoc, /openapi.json) are not covered by route
+    # dependencies, so they'd leak the API schema to unauthenticated callers. When auth is on (the
+    # service is meant to be exposed), disable them; keep them for loopback zero-config dev.
+    app = FastAPI(title="Audel", version=__version__,
+                  openapi_url=(None if auth.required else "/openapi.json"))
 
     @app.middleware("http")
     async def _gate(request: Request, call_next):
-        # Authenticate BEFORE buffering the body — an unauthenticated caller must not be able to
-        # make the server read up to max_request_bytes (DoS amplification).
-        if _unauthorized(request):
-            return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+        rid = _request_id(request.headers.get("x-request-id"))
+        request.state.request_id = rid
+        route = request.url.path if request.url.path in _ROUTES else "other"
+
+        def reply(resp):
+            resp.headers["X-Request-ID"] = rid
+            metrics.request(route, resp.status_code)
+            return resp
+
+        if request.url.path != "/healthz":
+            # Authenticate BEFORE buffering the body: an unauthenticated caller must not be able
+            # to make the server read up to max_request_bytes (DoS amplification).
+            principal = auth.authenticate(request.headers.get("authorization"))
+            if principal is None:
+                return reply(JSONResponse({"detail": "Unauthorized"}, status_code=401))
+            request.state.principal = principal
         cap = settings.max_request_bytes
         cl = request.headers.get("content-length")
         if cl and cl.isdigit() and int(cl) > cap:
-            return JSONResponse({"detail": "Request body too large."}, status_code=413)
-        # Enforce on the stream too — a chunked request (no Content-Length) would otherwise buffer
+            return reply(JSONResponse({"detail": "Request body too large."}, status_code=413))
+        # Enforce on the stream too: a chunked request (no Content-Length) would otherwise buffer
         # unbounded past the header check.
         total = 0
         chunks: list[bytes] = []
         async for chunk in request.stream():
             total += len(chunk)
             if total > cap:
-                return JSONResponse({"detail": "Request body too large."}, status_code=413)
+                return reply(JSONResponse({"detail": "Request body too large."}, status_code=413))
             chunks.append(chunk)
         body = b"".join(chunks)
 
@@ -123,21 +150,22 @@ def build_app(settings: Settings | None = None):
 
         request._body = body
         request._receive = _replay
-        return await call_next(request)
+        return reply(await call_next(request))
 
     async def _job_slot():
         async with _job_sem:
-            yield
+            metrics.inflight += 1
+            try:
+                yield
+            finally:
+                metrics.inflight -= 1
 
     def _http_error(e: Exception) -> HTTPException:
-        if isinstance(e, ConfigError):
-            # Caller-input validation (spec, language code, tone, caption/script shape). Safe to
-            # surface after redacting any workspace path.
+        if isinstance(e, (ConfigError, UnsafeSourceError)):
+            # Caller-input validation or an unsafe source. Safe to surface once any workspace
+            # path is redacted.
             return HTTPException(status_code=400, detail=str(e).replace(_ws_marker, "<workspace>"))
-        if isinstance(e, UnsafeSourceError):
-            # Safe to surface, but redact any server workspace path the message may embed.
-            return HTTPException(status_code=400, detail=str(e).replace(_ws_marker, "<workspace>"))
-        log.warning("request failed: %s: %s", type(e).__name__, e)
+        log.warning("request failed: %s", type(e).__name__)
         return HTTPException(status_code=400, detail="Could not decode or grade the source.")
 
     def _check_backend(name: str | None):
@@ -147,6 +175,33 @@ def build_app(settings: Settings | None = None):
                 detail=f"Backend {name!r} is not enabled on this server. "
                        f"Allowed: {settings.rest_enabled_backends or '(none — server default only)'}",
             )
+
+    def _spec_for(name: str | None):
+        """Remote callers may name a BUILT-IN spec only — never a server file path."""
+        if not name:
+            return None
+        from ..specs import builtin_spec
+
+        try:
+            return builtin_spec(name)
+        except ConfigError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+
+    def _settings_for(content: str | None) -> Settings:
+        if not content:
+            return grade_settings
+        if content not in ("speech", "music", "mixed"):
+            raise HTTPException(status_code=400, detail="content must be speech, music or mixed")
+        return grade_settings.model_copy(update={"content_type": content})
+
+    def _languages(items: list[str] | None) -> dict[int, str]:
+        langs: dict[int, str] = {}
+        for item in items or []:
+            idx, sep, code = item.partition("=")
+            if not sep or not idx.strip().isdigit() or len(langs) >= 32:
+                raise HTTPException(status_code=400, detail="language must be TRACK=CODE, e.g. 1=es")
+            langs[int(idx)] = code.strip()
+        return langs
 
     async def _spool(upload: UploadFile) -> Path:
         """Write an uploaded file to a server-NAMED temp file under the workspace (path is never
@@ -175,6 +230,73 @@ def build_app(settings: Settings | None = None):
             raise UnsafeSourceError("uploaded file is empty")
         return dest
 
+    async def _acquire(file: UploadFile | None, url: str | None) -> tuple[Path, str, str | None]:
+        """(server temp path, source kind, source host). Exactly one of file / url."""
+        if (file is None) == (not url):
+            raise UnsafeSourceError("send exactly one of: a 'file' upload or a 'url'")
+        if file is not None:
+            return await _spool(file), "upload", None
+        from ..ingest import fetch_to_file, url_host
+        from ..workspace import Workspace
+
+        assert url is not None
+        return await fetch_to_file(url, Workspace(settings).tmp, settings), "url", url_host(url)
+
+    async def _grade(kind: str, path: Path, p: dict, gs: Settings):
+        from ..core import analyze, check, listen
+
+        brief = _brief_from(p.get("brief"), p.get("expect"))
+        if kind == "check":
+            return await check(str(path), settings=gs, brief=brief, spec=p.get("spec"))
+        if kind == "analyze":
+            return await analyze(str(path), settings=gs, brief=brief, backend=p.get("backend"),
+                                 spec=p.get("spec"))
+        return await listen(str(path), settings=gs, spec=p.get("spec"), brief=brief,
+                            script=p.get("script"), captions=p.get("captions"),
+                            required=p.get("require"), forbidden=p.get("forbid"),
+                            languages=p.get("languages"), key_messages=p.get("key_message"),
+                            tone=p.get("tone"), understand=bool(p.get("understand")),
+                            backend=p.get("backend"))
+
+    def _validate(kind: str, p: dict) -> tuple[dict, Settings]:
+        if kind not in _KINDS:
+            raise HTTPException(status_code=400, detail=f"kind must be one of {', '.join(_KINDS)}")
+        if p.get("understand") and not settings.rest_allow_understand:
+            raise HTTPException(status_code=403, detail="understand is disabled on this server.")
+        _check_backend(p.get("backend"))
+        p = {**p, "spec": _spec_for(p.get("spec")), "languages": _languages(p.get("language"))}
+        return p, _settings_for(p.get("content"))
+
+    async def _run_and_audit(kind: str, path: Path, src: str, host: str | None, p: dict,
+                             gs: Settings, principal: Principal, request_id: str,
+                             job_id: str | None = None) -> dict:
+        t0 = time.monotonic()
+        digest, size = await asyncio.to_thread(_sha256, path)
+        status, verdict, n_issues, err = "ok", None, None, None
+        try:
+            report = await asyncio.wait_for(_grade(kind, path, p, gs),
+                                            timeout=settings.request_timeout_s)
+            verdict, n_issues = report.verdict.value, len(report.issues)
+            return _public(report)
+        except TimeoutError:
+            status, err = "timeout", "timeout"
+            raise UnsafeSourceError(f"grading exceeded {settings.request_timeout_s:.0f}s") from None
+        except Exception as e:
+            status, err = "error", type(e).__name__
+            raise
+        finally:
+            secs = time.monotonic() - t0
+            if verdict:
+                metrics.graded(kind, verdict, secs)
+            spec = p.get("spec")
+            audit.write(request_id=request_id, tenant=principal.tenant, endpoint=f"/{kind}",
+                        job_id=job_id, kind=kind, input_sha256=digest, input_bytes=size,
+                        source=src, source_host=host,
+                        spec=getattr(spec, "name", None), verdict=verdict, issues=n_issues,
+                        status=status, duration_ms=int(secs * 1000), error=err)
+
+    # ---- routes -----------------------------------------------------------------------------
+
     @app.get("/healthz")
     def healthz():
         return {"status": "ok", "version": __version__}
@@ -186,23 +308,12 @@ def build_app(settings: Settings | None = None):
         return {"checks": [{"name": c.name, "ok": c.ok, "detail": c.detail}
                            for c in run_checks(settings)]}
 
-    def _spec_for(name: str | None):
-        """Remote callers may name a BUILT-IN spec only — never a server file path."""
-        if not name:
-            return None
-        from ..specs import builtin_spec
-
-        try:
-            return builtin_spec(name)
-        except ConfigError as e:
-            raise HTTPException(status_code=400, detail=str(e)) from e
-
-    def _settings_for(content: str | None) -> Settings:
-        if not content:
-            return grade_settings
-        if content not in ("speech", "music", "mixed"):
-            raise HTTPException(status_code=400, detail="content must be speech, music or mixed")
-        return grade_settings.model_copy(update={"content_type": content})
+    @app.get("/metrics")
+    def metrics_ep():
+        if not settings.metrics_enabled:
+            raise HTTPException(status_code=404, detail="Not Found")
+        metrics.queued = sum(1 for j in jobs._jobs.values() if j.status == "queued")
+        return PlainTextResponse(metrics.render(), media_type="text/plain; version=0.0.4")
 
     @app.get("/specs")
     def specs_ep():
@@ -210,122 +321,100 @@ def build_app(settings: Settings | None = None):
 
         return {"specs": [s.model_dump(mode="json") for s in BUILTIN_SPECS.values()]}
 
-    @app.post("/check")
-    async def check_ep(file: UploadFile = File(...), brief: str | None = Form(None),
-                       expect: list[str] | None = Form(None), spec: str | None = Form(None),
-                       content: str | None = Form(None), _slot=Depends(_job_slot)):
-        """Deterministic grade of an uploaded clip (no LLM, no egress)."""
-        from ..core import check
-
-        sp, gs = _spec_for(spec), _settings_for(content)
-        dest = None
+    async def _sync(request: Request, kind: str, file: UploadFile | None, url: str | None,
+                    params: dict) -> dict:
+        p, gs = _validate(kind, params)
+        path = None
         try:
-            dest = await _spool(file)
-            report = await check(str(dest), settings=gs, brief=_brief_from(brief, expect), spec=sp)
-            return _public(report)
+            path, src, host = await _acquire(file, url)
+            return await _run_and_audit(kind, path, src, host, p, gs, _principal(request),
+                                        request.state.request_id)
         except AudelError as e:
             raise _http_error(e) from e
         finally:
-            if dest is not None:
-                dest.unlink(missing_ok=True)
+            if path is not None:
+                path.unlink(missing_ok=True)
+
+    @app.post("/check")
+    async def check_ep(request: Request, file: UploadFile | None = File(None),
+                       url: str | None = Form(None), brief: str | None = Form(None),
+                       expect: list[str] | None = Form(None), spec: str | None = Form(None),
+                       content: str | None = Form(None), _slot=Depends(_job_slot)):
+        """Deterministic grade (no LLM, no egress except an opted-in URL fetch)."""
+        return await _sync(request, "check", file, url, {"brief": brief, "expect": expect,
+                                                         "spec": spec, "content": content})
 
     @app.post("/analyze")
-    async def analyze_ep(file: UploadFile = File(...), brief: str | None = Form(None),
+    async def analyze_ep(request: Request, file: UploadFile | None = File(None),
+                         url: str | None = Form(None), brief: str | None = Form(None),
                          expect: list[str] | None = Form(None), backend: str | None = Form(None),
                          spec: str | None = Form(None), content: str | None = Form(None),
                          _slot=Depends(_job_slot)):
         """Full grade (signals + ASR + backend critique). Egress only to the server's backend."""
-        from ..core import analyze
-
-        _check_backend(backend)
-        sp, gs = _spec_for(spec), _settings_for(content)
-        dest = None
-        try:
-            dest = await _spool(file)
-            report = await analyze(str(dest), settings=gs,
-                                   brief=_brief_from(brief, expect), backend=backend, spec=sp)
-            return _public(report)
-        except AudelError as e:
-            raise _http_error(e) from e
-        finally:
-            if dest is not None:
-                dest.unlink(missing_ok=True)
+        return await _sync(request, "analyze", file, url, {
+            "brief": brief, "expect": expect, "backend": backend, "spec": spec,
+            "content": content})
 
     @app.post("/listen")
-    async def listen_ep(file: UploadFile = File(...), script: str | None = Form(None),
+    async def listen_ep(request: Request, file: UploadFile | None = File(None),
+                        url: str | None = Form(None), script: str | None = Form(None),
                         captions: str | None = Form(None), require: list[str] | None = Form(None),
                         forbid: list[str] | None = Form(None),
                         language: list[str] | None = Form(None),
                         key_message: list[str] | None = Form(None), tone: str | None = Form(None),
                         understand: bool = Form(False), backend: str | None = Form(None),
                         spec: str | None = Form(None), content: str | None = Form(None),
+                        brief: str | None = Form(None), expect: list[str] | None = Form(None),
                         _slot=Depends(_job_slot)):
         """Hear and listen: signal QC plus script / wording / pace / captions (offline). With
         ``understand`` (operator opt-in), key messages and delivery via the server's backend."""
-        from ..core import listen
-
-        if understand and not settings.rest_allow_understand:
-            raise HTTPException(status_code=403, detail="understand is disabled on this server.")
-        _check_backend(backend)
-        langs: dict[int, str] = {}
-        for item in language or []:
-            idx, sep, code = item.partition("=")
-            if not sep or not idx.strip().isdigit() or len(langs) >= 32:
-                raise HTTPException(status_code=400, detail="language must be TRACK=CODE, e.g. 1=es")
-            langs[int(idx)] = code.strip()
-        sp, gs = _spec_for(spec), _settings_for(content)
-        dest = None
-        try:
-            dest = await _spool(file)
-            report = await listen(str(dest), settings=gs, spec=sp, script=script,
-                                  captions=captions, required=require, forbidden=forbid,
-                                  languages=langs, key_messages=key_message, tone=tone,
-                                  understand=understand, backend=backend)
-            return _public(report)
-        except AudelError as e:
-            raise _http_error(e) from e
-        finally:
-            if dest is not None:
-                dest.unlink(missing_ok=True)
+        return await _sync(request, "listen", file, url, {
+            "script": script, "captions": captions, "require": require, "forbid": forbid,
+            "language": language, "key_message": key_message, "tone": tone,
+            "understand": understand, "backend": backend, "spec": spec, "content": content,
+            "brief": brief, "expect": expect})
 
     @app.post("/render")
-    async def render_ep(file: UploadFile = File(...), _slot=Depends(_job_slot)):
-        """Decode to trustworthy signals (loudness/true-peak/RMS/silent spans)."""
+    async def render_ep(request: Request, file: UploadFile | None = File(None),
+                        url: str | None = Form(None), _slot=Depends(_job_slot)):
+        """Decode to trustworthy signals (loudness / true peak / RMS / silent spans, per track)."""
         from ..core import render
 
-        dest = None
+        path = None
         try:
-            dest = await _spool(file)
-            rr = await render(str(dest), settings=grade_settings)
+            path, _src, _host = await _acquire(file, url)
+            rr = await render(str(path), settings=grade_settings)
             return {"duration_ms": rr.duration_ms, "channels": rr.channels,
                     "sample_rate": rr.sample_rate, "codec": rr.codec, "has_audio": rr.has_audio,
                     "integrated_lufs": rr.integrated_lufs, "true_peak_dbtp": rr.true_peak_dbtp,
-                    "rms_dbfs": rr.rms_dbfs, "lra": rr.lra, "silences": len(rr.silences)}
+                    "rms_dbfs": rr.rms_dbfs, "lra": rr.lra, "silences": len(rr.silences),
+                    "tracks": [t.model_dump(mode="json") for t in rr.tracks]}
         except AudelError as e:
             raise _http_error(e) from e
         finally:
-            if dest is not None:
-                dest.unlink(missing_ok=True)
+            if path is not None:
+                path.unlink(missing_ok=True)
 
     @app.post("/handoff")
-    async def handoff_ep(file: UploadFile = File(...), brief: str | None = Form(None),
+    async def handoff_ep(request: Request, file: UploadFile | None = File(None),
+                         url: str | None = Form(None), brief: str | None = Form(None),
                          expect: list[str] | None = Form(None), backend: str | None = Form(None),
                          _slot=Depends(_job_slot)):
         """Grade + return the distilled ears→brain handoff (verdict + next action + todo)."""
         from ..core import analyze
 
         _check_backend(backend)
-        dest = None
+        path = None
         try:
-            dest = await _spool(file)
-            report = await analyze(str(dest), settings=grade_settings,
+            path, _src, _host = await _acquire(file, url)
+            report = await analyze(str(path), settings=grade_settings,
                                    brief=_brief_from(brief, expect), backend=backend)
             return report.to_handoff().model_dump(mode="json")
         except AudelError as e:
             raise _http_error(e) from e
         finally:
-            if dest is not None:
-                dest.unlink(missing_ok=True)
+            if path is not None:
+                path.unlink(missing_ok=True)
 
     @app.post("/watch")
     async def watch_ep(body: dict, _slot=Depends(_job_slot)):
@@ -342,12 +431,95 @@ def build_app(settings: Settings | None = None):
         except AudelError as e:
             raise _http_error(e) from e
 
+    # ---- async jobs -------------------------------------------------------------------------
+
+    @app.post("/jobs", status_code=202)
+    async def submit_job(request: Request, kind: str = Form("check"),
+                         file: UploadFile | None = File(None), url: str | None = Form(None),
+                         brief: str | None = Form(None), expect: list[str] | None = Form(None),
+                         spec: str | None = Form(None), content: str | None = Form(None),
+                         backend: str | None = Form(None), script: str | None = Form(None),
+                         captions: str | None = Form(None), require: list[str] | None = Form(None),
+                         forbid: list[str] | None = Form(None),
+                         language: list[str] | None = Form(None),
+                         key_message: list[str] | None = Form(None), tone: str | None = Form(None),
+                         understand: bool = Form(False)):
+        """Queue a grade; poll ``GET /jobs/{id}``. The upload is spooled now; a URL is fetched
+        when the job runs. Returns 429 when the queue is full."""
+        principal = _principal(request)
+        p, gs = _validate(kind, {
+            "brief": brief, "expect": expect, "spec": spec, "content": content,
+            "backend": backend, "script": script, "captions": captions, "require": require,
+            "forbid": forbid, "language": language, "key_message": key_message, "tone": tone,
+            "understand": understand})
+        if (file is None) == (not url):
+            raise HTTPException(status_code=400, detail="send exactly one of: a 'file' upload or a 'url'")
+        if jobs.pending() >= settings.max_queued_jobs:
+            raise HTTPException(status_code=429, detail="job queue is full; retry later",
+                                headers={"Retry-After": "30"})
+        spooled: Path | None = None
+        try:
+            if file is not None:
+                spooled = await _spool(file)
+            else:
+                from ..ingest import validate_ingest_url
+
+                validate_ingest_url(url or "", settings)  # fail fast on a bad URL
+        except AudelError as e:
+            raise _http_error(e) from e
+        rid = request.state.request_id
+        holder: dict[str, str] = {}
+
+        async def work() -> dict:
+            path = spooled
+            src, host = "upload", None
+            try:
+                if path is None:
+                    path, src, host = await _acquire(None, url)
+                return await _run_and_audit(kind, path, src, host, p, gs, principal, rid,
+                                            job_id=holder.get("id"))
+            finally:
+                if path is not None:
+                    path.unlink(missing_ok=True)
+
+        try:
+            job = jobs.submit(principal.tenant, kind, work)
+        except QueueFull as e:
+            if spooled is not None:
+                spooled.unlink(missing_ok=True)
+            raise HTTPException(status_code=429, detail=str(e), headers={"Retry-After": "30"}) from e
+        holder["id"] = job.id
+        return {"job_id": job.id, "status": job.status, "status_url": f"/jobs/{job.id}"}
+
+    @app.get("/jobs")
+    def list_jobs(request: Request):
+        return {"jobs": [{"job_id": j.id, "kind": j.kind, "status": j.status, "created": j.created}
+                         for j in jobs.list(_principal(request).tenant)]}
+
+    @app.get("/jobs/{job_id}")
+    def get_job(request: Request, job_id: str):
+        job = jobs.get(_principal(request).tenant, job_id)
+        if job is None:  # same answer for "not yours" and "does not exist" (no oracle)
+            raise HTTPException(status_code=404, detail="Not Found")
+        return job.public()
+
+    @app.delete("/jobs/{job_id}")
+    def delete_job(request: Request, job_id: str):
+        if not jobs.cancel(_principal(request).tenant, job_id):
+            raise HTTPException(status_code=404, detail="Not Found")
+        return {"job_id": job_id, "status": "deleted"}
+
     return app
 
 
+_ROUTES = frozenset({"/healthz", "/doctor", "/metrics", "/specs", "/check", "/analyze", "/listen",
+                     "/render", "/handoff", "/watch", "/jobs"})
+
+
 def serve(host: str = "127.0.0.1", port: int = 8000) -> None:
-    # Fail closed: never expose a routable interface without a token.
-    if not _is_loopback(host) and not load_settings().api_token:
+    # Fail closed: never expose a routable interface without auth.
+    s = load_settings()
+    if not _is_loopback(host) and not Authenticator(s).required:
         raise SystemExit(
             f"Refusing to bind non-loopback host {host!r} without auth. Set AUDEL_API_TOKEN to "
             "expose the service (clients send 'Authorization: Bearer <token>'), or bind 127.0.0.1."

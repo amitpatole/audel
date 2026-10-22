@@ -1,0 +1,66 @@
+{{- if not .Values.auth.existingSecret }}
+{{- fail "auth.existingSecret is required: Audel refuses to serve a routable interface without auth" }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "audel.fullname" . }}
+  labels: {{- include "audel.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels: {{- include "audel.selector" . | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "audel.selector" . | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: audel
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["--host", "0.0.0.0", "--port", "8000"]
+          ports:
+            - {name: http, containerPort: 8000}
+          env:
+            {{- range $k, $v := .Values.env }}
+            - {name: {{ $k }}, value: {{ $v | quote }}}
+            {{- end }}
+            - name: AUDEL_API_TOKEN
+              valueFrom:
+                secretKeyRef: {name: {{ .Values.auth.existingSecret }}, key: AUDEL_API_TOKEN}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 30
+            failureThreshold: 3
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - {name: cache, mountPath: /var/cache/audel}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: cache
+          emptyDir: {sizeLimit: {{ .Values.cacheSizeLimit }}}
+        - name: tmp
+          emptyDir: {sizeLimit: 1Gi}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}

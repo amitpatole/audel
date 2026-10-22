@@ -1,0 +1,12 @@
+.git
+.venv
+site
+dist
+docs
+tests
+brand
+**/__pycache__
+.mypy_cache
+.ruff_cache
+.pytest_cache
+.security-local
