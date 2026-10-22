@@ -121,6 +121,20 @@ All notable changes to Audel are recorded here. The format follows
     at most 2 fetches, in a pool of 8.
   - **Low-Medium.** Work abandoned while waiting on its tenant share still ran later. Abandonment now
     propagates through both waits.
+- Red-team round 6 fixes (decode and accuracy), each pinned by a regression test. A fuzz of 350
+  byte mutations across 14 codecs confirmed CRC enforcement never loses legitimate audio, and 69
+  legitimate and edge-case files grade with no false integrity findings.
+  - **Medium.** A dropout remuxed into MP4 or MOV was stored as one long sample and graded PASS.
+    Packets far longer than the stream's normal packet are now reported as `packet_gap`.
+  - **Low-Medium.** Findings were timed from the earliest audio, not the container start. Broadcast
+    TS gaps were reported at their raw timestamps, audio starting after video got a false
+    `duration_mismatch`, and the truncation tail was read from the wrong place. Everything is now on
+    the programme timeline.
+  - **Low-Medium.** A WAV or W64 file cut short in transfer graded PASS, because its length is
+    estimated from the bytes present. The header's declared size is now compared with the bytes
+    present (`container_truncated`). Streamed files that declare an unknown length are not judged.
+  - **Low.** The missing-packet scan now runs inside the per-file time budget, and an incomplete
+    scan is reported (`gap_scan_incomplete`) instead of being treated as clean.
 - Red-team round 6 fixes (network surface), each pinned by a regression test:
   - **Medium.** Synchronous routes given a URL fetched it while holding a grading slot, and waited
     for the per-tenant fetch share without limit. All grading routes now acquire their input first

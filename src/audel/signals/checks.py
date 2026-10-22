@@ -81,7 +81,13 @@ def _track_label(tm: TrackMeasurements, multi: bool) -> str:
     return f"track {tm.stream.index}{lang}: "
 
 
-def _issue(kind, sev, msg, span, check, tm, *, conf=Confidence.HIGH, **detail) -> Issue:
+def _issue(kind, sev, msg, span, check, tm, *, conf=Confidence.HIGH, programme=False,
+           **detail) -> Issue:
+    """``span`` is track-relative unless ``programme``: shift it onto the programme timeline by
+    the track's start, so every finding is reported at programme time."""
+    off = 0 if programme else _ms(tm.stream.start_s)
+    if off and span is not None:
+        span = Span(start_ms=span.start_ms + off, end_ms=span.end_ms + off)
     return Issue.make(kind, sev, msg, span=span, source=IssueSource.DSP, confidence=conf,
                       detail={"check": check, "stream": tm.stream.index, **detail})
 
@@ -279,6 +285,14 @@ def evaluate(m: Measurements, settings: Settings, spec: DeliverySpec | str | Non
     sp = effective_spec(settings, spec)
     content = effective_content(settings, sp)
     multi = len(m.tracks) > 1
+    if m.info.container_shortfall_s > 0.1:
+        miss = m.info.container_shortfall_s
+        issues.append(Issue.make(
+            IssueKind.TRUNCATION, Severity.ERROR,
+            f"the file is cut short: its header declares {miss:.1f}s more audio than it contains "
+            "(incomplete transfer?)", span=Span(start_ms=_ms(dur), end_ms=_ms(dur + miss)),
+            source=IssueSource.DSP, detail={"check": "container_truncated",
+                                            "missing_s": round(miss, 3)}))
     if m.declared_s is not None:
         issues.append(Issue.make(
             IssueKind.DURATION, Severity.WARNING,
@@ -306,7 +320,13 @@ def evaluate(m: Measurements, settings: Settings, spec: DeliverySpec | str | Non
                 IssueKind.DROPOUT, Severity.WARNING,
                 f"{label}{b - a:.2f}s of audio packets missing (timeline gap)",
                 Span(start_ms=_ms(a), end_ms=_ms(b)), "packet_gap", tm, conf=Confidence.MEDIUM,
-                gap_s=round(b - a, 3)))
+                programme=True, gap_s=round(b - a, 3)))
+        if tm.gap_scan_incomplete:
+            issues.append(_issue(
+                IssueKind.OTHER, Severity.WARNING,
+                f"{label}the packet timeline could not be checked in full (missing-packet "
+                "detection incomplete)", _full_span(dur), "gap_scan_incomplete", tm,
+                conf=Confidence.LOW, programme=True))
         start, end = tm.stream.start_s, tm.stream.start_s + tm.decoded_s
         tol = max(1.0, 0.02 * longest)
         if multi and longest > 0 and tm.decoded_s > 0 and (start > tol or end < longest - tol):
@@ -318,7 +338,7 @@ def evaluate(m: Measurements, settings: Settings, spec: DeliverySpec | str | Non
                     IssueKind.TRUNCATION, Severity.ERROR,
                     f"{label}track has no audio from {a:.1f}s to {b:.1f}s of a "
                     f"{longest:.1f}s programme", Span(start_ms=_ms(a), end_ms=_ms(b)),
-                    "short_track", tm, track_start_s=round(start, 3),
+                    "short_track", tm, programme=True, track_start_s=round(start, 3),
                     track_end_s=round(end, 3), programme_s=round(longest, 3)))
         if not tm.frames and (tm.rms_dbfs is None or not math.isfinite(tm.rms_dbfs)):
             # No samples were measured at all: report it once instead of trusting the meters'

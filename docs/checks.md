@@ -23,7 +23,9 @@ consumers of the contract key on. It also has a precise rule name in `detail.che
 | `decode_errors` | `dropout` | the decoder reported corrupt data or CRC failures in this stream | warning, error at 10 or more |
 | `duration_mismatch` | `duration` | the container's declared length differs from the decoded audio | warning |
 | `empty_stream` | `silence` | an audio stream contains no samples | critical |
-| `packet_gap` | `dropout` | audio packets are missing from the stream's timeline | warning |
+| `packet_gap` | `dropout` | audio packets are missing from the stream's timeline, including a hole stored as one long sample | warning |
+| `gap_scan_incomplete` | `other` | the packet timeline couldn't be read in full, so missing-packet detection is incomplete | warning (low confidence) |
+| `container_truncated` | `truncation` | the file header declares more audio than the file contains (WAV, RF64, W64) | error |
 | `track_decode_error` | `decode_error` | one audio track can't be decoded (the others are still graded) | critical |
 | `dead_channel` | `channel_issue` | one channel is silent while the track is live (LFE excluded) | error |
 | `polarity_inversion` | `channel_issue` | left and right cancel to silence in a mono fold-down | error |

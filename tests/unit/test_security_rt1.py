@@ -1762,10 +1762,10 @@ def test_one_undecodable_track_does_not_discard_the_others(tmp_path, monkeypatch
     _ff("-i", a, "-i", a, "-map", "0:a", "-map", "1:a", "-c:a", "pcm_s16le", mkv)
     real = ms.measure_track
 
-    def flaky(path, st, settings, dur_s=0.0, deadline=None):
+    def flaky(path, st, settings, dur_s=0.0, deadline=None, **kw):
         if st.index == 1:
             raise DecodeError("no decoder found")
-        return real(path, st, settings, dur_s, deadline)
+        return real(path, st, settings, dur_s, deadline, **kw)
 
     monkeypatch.setattr(ms, "measure_track", flaky)
     r = asyncio.run(check(str(mkv)))
@@ -1927,3 +1927,90 @@ def test_download_thread_removes_its_own_file_on_failure(tmp_path, monkeypatch):
     with pytest.raises(UnsafeSourceError):
         ing._download("https://x/a.wav", dest, "http://127.0.0.1:1", Settings())
     assert not dest.exists()
+
+
+# ==== round 6, decode surface =================================================================
+
+def _checks(r, name):
+    return [i for i in r.issues if i.detail.get("check") == name]
+
+
+@requires_ffmpeg
+@pytest.mark.parametrize("ext", ["mp4", "ts"])
+def test_dropped_packets_survive_a_remux_and_are_placed_on_programme_time(tmp_path, ext):
+    from audel import check
+
+    ts = tmp_path / "cap.ts"
+    _ff("-f", "lavfi", "-i", "anoisesrc=d=30:c=pink:a=0.2", "-c:a", "aac",
+        "-bsf:a", "noise=drop='between(pts*tb,10,10.9)'", "-output_ts_offset", "1000", ts)
+    f = ts if ext == "ts" else tmp_path / "cap.mp4"
+    if ext == "mp4":
+        _ff("-i", ts, "-c", "copy", f)
+    gaps = _checks(asyncio.run(check(str(f))), "packet_gap")
+    assert gaps and 9_500 <= gaps[0].span.start_ms <= 10_500, [g.span for g in gaps]
+
+
+@requires_ffmpeg
+def test_audio_after_video_is_timed_against_the_programme(tmp_path):
+    from audel import check
+
+    a = tmp_path / "a.wav"
+    _ff("-f", "lavfi", "-i", "sine=f=440:d=12", "-af",
+        "volume=enable='between(t,5,5.4)':volume=40,afade=t=out:st=10:d=2", a)
+    mkv = tmp_path / "av.mkv"
+    _ff("-f", "lavfi", "-i", "color=c=black:s=64x64:d=15", "-itsoffset", "3", "-i", a,
+        "-map", "0:v", "-map", "1:a", "-c:v", "ffv1", "-c:a", "pcm_s16le", mkv)
+    r = asyncio.run(check(str(mkv)))
+    assert not _checks(r, "duration_mismatch")
+    clip = _checks(r, "clipping")
+    assert clip and 7_500 <= clip[0].span.start_ms <= 8_500
+
+
+@requires_ffmpeg
+def test_cut_short_wav_and_w64_transfers_are_caught(tmp_path):
+    from audel import check
+
+    for ext in ("wav", "w64"):
+        full = tmp_path / f"full.{ext}"
+        _ff("-f", "lavfi", "-i", "sine=d=30", "-af", "volume=0.3", "-ac", "2", full)
+        data = full.read_bytes()
+        cut = tmp_path / f"cut.{ext}"
+        cut.write_bytes(data[: (len(data) * 2 // 3) // 4 * 4])
+        assert not _checks(asyncio.run(check(str(full))), "container_truncated")
+        bad = _checks(asyncio.run(check(str(cut))), "container_truncated")
+        assert bad and 8 <= bad[0].detail["missing_s"] <= 12, ext
+
+
+@requires_ffmpeg
+def test_streamed_wav_with_unknown_length_is_not_called_truncated(tmp_path):
+    import struct
+
+    from audel import check
+
+    f = tmp_path / "s.wav"
+    _ff("-f", "lavfi", "-i", "sine=d=5", f)
+    b = bytearray(f.read_bytes())
+    i = b.index(b"data")
+    b[i + 4:i + 8] = struct.pack("<I", 0xFFFFFFFF)
+    f.write_bytes(bytes(b))
+    assert not _checks(asyncio.run(check(str(f))), "container_truncated")
+
+
+@requires_ffmpeg
+def test_incomplete_gap_scan_is_reported_not_assumed_clean(media, monkeypatch):
+    import audel.signals.measure as ms
+    from audel import check
+
+    seen = {}
+
+    def gaps(path, settings, idx, *, origin=0.0, timeout_s=None, **kw):
+        seen["timeout"] = timeout_s
+        return None
+
+    import audel.mediaguard as mg
+
+    monkeypatch.setattr(mg, "packet_gaps", gaps)
+    del ms
+    r = asyncio.run(check(str(media["good"])))
+    assert _checks(r, "gap_scan_incomplete")
+    assert seen["timeout"] is not None and seen["timeout"] <= 120.0   # inside the file budget

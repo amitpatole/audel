@@ -69,6 +69,7 @@ class TrackMeasurements:
     gaps: list[tuple[float, float]] = field(default_factory=list)  # missing-packet gaps (s)
     start_s: float = 0.0                     # start on the programme timeline
     failed: str | None = None                # this track could not be decoded (reason)
+    gap_scan_incomplete: bool = False        # the packet timeline couldn't be read in full
     dialogue_lufs: float | None = None       # speech-gated integrated loudness, when computed
     dialogue_coverage: float | None = None   # fraction of the programme that is speech
 
@@ -215,15 +216,20 @@ def _tail_pass(ffmpeg: str, path, idx: int, tm: TrackMeasurements, settings: Set
 
 
 def measure_track(path, st: StreamInfo, settings: Settings, dur_s: float = 0.0,
-                  deadline: float | None = None) -> TrackMeasurements:
+                  deadline: float | None = None, origin: float = 0.0) -> TrackMeasurements:
     ffmpeg = _tool("ffmpeg", settings.ffmpeg_path)
     tm = _main_pass(ffmpeg, path, st.index, st, settings, dur_s, deadline)
+    import time as _t
+
     from ..mediaguard import packet_gaps
 
-    try:
-        tm.gaps = packet_gaps(path, settings, st.abs_index) or []
-    except AudelError:
-        tm.gaps = []
+    left = (deadline - _t.monotonic()) if deadline is not None else None
+    if left is not None and left <= 1:
+        raise UnsafeSourceError("analysis exceeded the per-file time budget")
+    gaps = packet_gaps(path, settings, st.abs_index, origin=origin,
+                       timeout_s=min(120.0, left) if left is not None else None)
+    tm.gaps = gaps or []
+    tm.gap_scan_incomplete = gaps is None and st.abs_index >= 0
     if settings.hum_detection or st.channels >= 2:
         _spectral_pass(ffmpeg, path, st.index, tm, settings, max(dur_s, tm.decoded_s), deadline)
     _tail_pass(ffmpeg, path, st.index, tm, settings, deadline)
@@ -249,12 +255,16 @@ def measure(path, info: MediaInfo, settings: Settings) -> Measurements:
     channel_s = sum(max(1, s.channels) for s in streams) * dur
     deadline = time.monotonic() + settings.decode_timeout_s + \
         channel_s * settings.decode_timeout_per_channel_s
-    origin = min((st.start_s for st in streams), default=0.0)
+    # The programme timeline starts at the CONTAINER start (video may begin before the audio).
+    first_audio = min((st.start_s for st in streams), default=0.0)
+    origin = (info.format_start if info.format_start is not None
+              and info.format_start <= first_audio else first_audio)
     m.tracks = []
     for st in streams:
         st_rel = dataclasses.replace(st, start_s=max(0.0, st.start_s - origin))
         try:
-            m.tracks.append(measure_track(path, st_rel, settings, info.duration_s, deadline))
+            m.tracks.append(measure_track(path, st_rel, settings, info.duration_s, deadline,
+                                          origin=origin))
         except UnsafeSourceError:
             raise  # caps / budgets / deadline: the whole file is refused (fail closed)
         except AudelError as e:
