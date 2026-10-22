@@ -87,15 +87,46 @@ def _gap_span(words: list[Word], j: int, duration_ms: int) -> tuple[int, int]:
     return start, max(start, end)
 
 
+_EXACT_LIMIT = 4_000_000   # script x heard tokens below this: one exact alignment
+_CHUNK = 600               # otherwise align ~600-token script windows against nearby speech
+
+
+def _opcodes(s_toks: list[str], h_toks: list[str]):
+    """difflib opcodes, exact for normal sizes; windowed (O(n x window)) for very large pairs so
+    alignment time stays bounded whatever the input."""
+    if len(s_toks) * max(1, len(h_toks)) <= _EXACT_LIMIT:
+        yield from difflib.SequenceMatcher(None, s_toks, h_toks, autojunk=False).get_opcodes()
+        return
+    j = 0
+    ratio = len(h_toks) / max(1, len(s_toks))
+    for i in range(0, len(s_toks), _CHUNK):
+        a = s_toks[i:i + _CHUNK]
+        last = i + _CHUNK >= len(s_toks)
+        # heard window: proportional extent plus slack, starting where the last chunk ended
+        jend = len(h_toks) if last else min(len(h_toks), j + int(len(a) * ratio * 1.5) + 50)
+        b = h_toks[j:jend]
+        ops = difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes()
+        if not last:
+            # keep heard tokens after the chunk's last match for the next window
+            keep = [op for op in ops if not (op[0] == "insert" and op[3] >= max(
+                (o[4] for o in ops if o[0] == "equal"), default=0))]
+            consumed = max((o[4] for o in keep), default=0)
+            ops = keep
+        else:
+            consumed = len(b)
+        for tag, i1, i2, j1, j2 in ops:
+            yield tag, i + i1, i + i2, j + j1, j + j2
+        j += consumed
+
+
 def align_script(script: str, transcript: Transcript, duration_ms: int) -> ScriptResult:
     script = (script or "")[:MAX_SCRIPT_CHARS]
     s_toks = _tokens(script)
     words = timed_words(transcript)
     h_toks = [w.text for w in words]
-    sm = difflib.SequenceMatcher(None, s_toks, h_toks, autojunk=False)
     edits = 0
     devs: list[ScriptDeviation] = []
-    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+    for tag, i1, i2, j1, j2 in _opcodes(s_toks, h_toks):
         if tag == "equal":
             continue
         a, b = i2 - i1, j2 - j1

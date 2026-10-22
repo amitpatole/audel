@@ -60,6 +60,10 @@ class Workspace:
         self.tmp = self.root / "tmp"
         # Private to the service user: uploads may be unreleased media.
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        from .errors import register_sensitive_path
+
+        register_sensitive_path(self.root)
+        register_sensitive_path(self.root.resolve())
         for d in (self.artifacts, self.sessions, self.tmp):
             d.mkdir(parents=True, exist_ok=True, mode=0o700)
             try:

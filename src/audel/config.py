@@ -180,6 +180,7 @@ class Settings(BaseSettings):
     tls_client_ca: Path | None = None     # set = mutual TLS (client certificate required)
     max_request_bytes: int = 50_000_000      # cap request bodies before buffering/decoding
     max_concurrent_jobs: int = 4
+    max_concurrent_uploads: int | None = None  # bodies read at once (default 2 x concurrent jobs)
     request_timeout_s: float = 180.0
     # Backends a REMOTE caller may name per-request. Empty = none selectable, so analyze() over REST
     # uses only the server's configured default (a remote caller can't redirect egress or pick a

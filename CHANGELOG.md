@@ -111,6 +111,20 @@ All notable changes to Audel are recorded here. The format follows
   - **Low.** The docs build excludes local-only files.
   - **Low.** The OG-image workflow no longer holds a write token while it installs third-party
     packages, and its docs and OG dependencies are pinned.
+- Red-team round 2 fixes (network and input surface), each pinned by a regression test:
+  - **Medium.** Listening analysis ran on the event loop, so one large caption or script stalled
+    every tenant. It now runs in a worker thread. Caption matching uses a bisect window with a
+    comparison budget, and very large script alignments are windowed. All of it stays bounded.
+  - **Medium.** Deleting a queued job leaked its spooled upload. Cleanup now runs on every job
+    exit, including cancellation while queued.
+  - **Low-Medium.** A cancelled URL fetch leaked its partial download and kept its thread running.
+    The download now stops and is removed.
+  - **Low-Medium.** In-flight form bodies were unbounded in aggregate. Body intake is
+    concurrency-limited, with slots taken only after authentication
+    (`AUDEL_MAX_CONCURRENT_UPLOADS`), and list fields are capped.
+  - **Low.** The message sanitizer now redacts registered server roots exactly, plus Windows,
+    percent-encoded and IPv6 forms, server temp names and ffmpeg pointer addresses.
+  - **Low.** `/render` and `/handoff` now go through the grading timeout and the audit log.
 - **Per-tenant tokens.** `AUDEL_API_TOKENS_FILE` holds SHA-256 hashes only, and
   `audel token new` mints a token. All tenant hashes are compared in constant time on every
   request.

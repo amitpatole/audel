@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
 import time
 import urllib.request
 import uuid
@@ -87,7 +88,8 @@ class _SafeRedirect(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-def _download(url: str, dest: Path, proxy_url: str, settings: Settings) -> int:
+def _download(url: str, dest: Path, proxy_url: str, settings: Settings,
+              stop: threading.Event | None = None) -> int:
     opener = urllib.request.build_opener(
         urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url}),
         _SafeRedirect(settings))
@@ -104,6 +106,8 @@ def _download(url: str, dest: Path, proxy_url: str, settings: Settings) -> int:
             while True:
                 if time.monotonic() > deadline:
                     raise UnsafeSourceError("download exceeded the ingest time limit")
+                if stop is not None and stop.is_set():
+                    raise UnsafeSourceError("download cancelled")
                 chunk = resp.read(_CHUNK)
                 if not chunk:
                     break
@@ -126,9 +130,11 @@ async def fetch_to_file(url: str, tmp_dir: Path, settings: Settings) -> Path:
     proxy = VettingProxy(max_connections=settings.proxy_max_connections,
                          idle_timeout_s=settings.proxy_idle_timeout_s)
     await proxy.start()
+    stop = threading.Event()
     try:
         await asyncio.wait_for(
-            asyncio.to_thread(_download, url, dest, f"http://127.0.0.1:{proxy.port}", settings),
+            asyncio.to_thread(_download, url, dest, f"http://127.0.0.1:{proxy.port}", settings,
+                              stop),
             timeout=settings.ingest_timeout_s + 5)
     except UnsafeSourceError:
         dest.unlink(missing_ok=True)
@@ -137,6 +143,11 @@ async def fetch_to_file(url: str, tmp_dir: Path, settings: Settings) -> Path:
         dest.unlink(missing_ok=True)
         log.warning("ingest from %s failed: %s", url_host(url), type(e).__name__)
         raise UnsafeSourceError(f"could not fetch media from {url_host(url)!r}") from None
+    except BaseException:  # cancellation / timeout: stop the thread, drop the partial file
+        stop.set()
+        dest.unlink(missing_ok=True)
+        raise
     finally:
+        stop.set()  # any exit (success, error, timeout, cancel): the worker thread stops
         await proxy.stop()
     return dest

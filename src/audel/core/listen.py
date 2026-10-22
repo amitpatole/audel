@@ -20,6 +20,7 @@ your own network:
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 from ..backends.local import LocalBackend
@@ -101,43 +102,48 @@ async def listen(source, *, settings: Settings | None = None, spec=None, brief=N
                             language_confidence=transcript.language_confidence,
                             transcript=transcript.text[:_TRANSCRIPT_CAP])
 
-    found, delivery = lis.delivery_issues(transcript, settings, duration_ms)
-    silent_spans = [i.span for i in heard.issues if i.kind == IssueKind.SILENCE and i.span]
-    for i in found:  # a long pause already reported as a silence gap is one finding, not two
-        if i.detail.get("check") == "long_pause" and i.span and any(
-                s.start_ms <= i.span.end_ms and i.span.start_ms <= s.end_ms for s in silent_spans):
-            continue
-        issues.append(i)
-    summ.words, summ.speech_s, summ.wpm = delivery.words, round(delivery.speech_s, 2), (
-        round(delivery.wpm, 1) if delivery.wpm is not None else None)
-    summ.longest_pause_s = round(delivery.longest_pause_s, 2)
-    summ.mean_word_confidence = (round(delivery.mean_word_confidence, 3)
-                                 if delivery.mean_word_confidence is not None else None)
-    summ.low_confidence_ratio = (round(delivery.low_confidence_ratio, 3)
-                                 if delivery.low_confidence_ratio is not None else None)
+    def _deterministic() -> None:
+        """All post-ASR text analysis. CPU-bound (alignment, caption matching), so it runs in a
+        worker thread: one large caption file must not stall the event loop for every tenant."""
+        found, delivery = lis.delivery_issues(transcript, settings, duration_ms)
+        silent_spans = [i.span for i in heard.issues if i.kind == IssueKind.SILENCE and i.span]
+        for i in found:  # a long pause already reported as a silence gap is one finding, not two
+            if i.detail.get("check") == "long_pause" and i.span and any(
+                    s.start_ms <= i.span.end_ms and i.span.start_ms <= s.end_ms for s in silent_spans):
+                continue
+            issues.append(i)
+        summ.words, summ.speech_s, summ.wpm = delivery.words, round(delivery.speech_s, 2), (
+            round(delivery.wpm, 1) if delivery.wpm is not None else None)
+        summ.longest_pause_s = round(delivery.longest_pause_s, 2)
+        summ.mean_word_confidence = (round(delivery.mean_word_confidence, 3)
+                                     if delivery.mean_word_confidence is not None else None)
+        summ.low_confidence_ratio = (round(delivery.low_confidence_ratio, 3)
+                                     if delivery.low_confidence_ratio is not None else None)
 
-    if script:
-        res = lis.align_script(script, transcript, duration_ms)
-        issues.extend(lis.script_issues(res))
-        summ.script_words, summ.script_wer = res.script_words, round(res.wer, 3)
-        summ.script_adherence = round(res.adherence, 3)
-        if res.wer > 0.25:
-            issues.append(Issue.make(IssueKind.TRANSCRIPT_MISMATCH, Severity.ERROR,
-                                     f"read departs from the script: {res.adherence:.0%} adherence "
-                                     f"(word error rate {res.wer:.0%})",
-                                     span=Span(start_ms=0, end_ms=duration_ms),
-                                     source=IssueSource.ASR,
-                                     detail={"check": "script_adherence", "wer": round(res.wer, 3)}))
-    if required or forbidden:
-        t_issues, summ.terms = lis.term_issues(transcript, duration_ms, required=required,
-                                               forbidden=forbidden)
-        issues.extend(t_issues)
-    if cues is not None:
-        c_issues, cs = cap.caption_issues(cues, transcript, settings, duration_ms)
-        issues.extend(c_issues)
-        summ.caption_cues, summ.caption_matched_ratio = cs.cues, cs.matched_ratio
-        summ.caption_median_drift_ms, summ.caption_max_cps = cs.median_drift_ms, cs.max_cps
-        summ.uncaptioned_speech_s = cs.uncaptioned_speech_s
+        if script:
+            res = lis.align_script(script, transcript, duration_ms)
+            issues.extend(lis.script_issues(res))
+            summ.script_words, summ.script_wer = res.script_words, round(res.wer, 3)
+            summ.script_adherence = round(res.adherence, 3)
+            if res.wer > 0.25:
+                issues.append(Issue.make(IssueKind.TRANSCRIPT_MISMATCH, Severity.ERROR,
+                                         f"read departs from the script: {res.adherence:.0%} adherence "
+                                         f"(word error rate {res.wer:.0%})",
+                                         span=Span(start_ms=0, end_ms=duration_ms),
+                                         source=IssueSource.ASR,
+                                         detail={"check": "script_adherence", "wer": round(res.wer, 3)}))
+        if required or forbidden:
+            t_issues, summ.terms = lis.term_issues(transcript, duration_ms, required=required,
+                                                   forbidden=forbidden)
+            issues.extend(t_issues)
+        if cues is not None:
+            c_issues, cs = cap.caption_issues(cues, transcript, settings, duration_ms)
+            issues.extend(c_issues)
+            summ.caption_cues, summ.caption_matched_ratio = cs.cues, cs.matched_ratio
+            summ.caption_median_drift_ms, summ.caption_max_cps = cs.median_drift_ms, cs.max_cps
+            summ.uncaptioned_speech_s = cs.uncaptioned_speech_s
+
+    await asyncio.to_thread(_deterministic)
     for idx, want in langs.items():
         got = transcript if idx == 0 else await asr.transcribe(path, stream=idx)
         detected = (got.language or "").lower()

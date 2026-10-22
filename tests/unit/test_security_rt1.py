@@ -504,3 +504,200 @@ def test_helm_refuses_insecure_renders(args):
     r = subprocess.run(["helm", "template", "t", str(chart), "--set", "auth.existingSecret=s", *args],
                        capture_output=True, text=True)
     assert r.returncode != 0 and "TLS" in (r.stderr + r.stdout).upper()
+
+
+# ==== round 2, network surface ================================================================
+
+def _big_transcript(n=1500):
+    from audel.backends.base import Segment, Transcript, Word
+
+    ws = [Word(text="the", start_ms=i * 300, end_ms=i * 300 + 250, probability=0.9) for i in range(n)]
+    return Transcript(text=" ".join(w.text for w in ws), language="en",
+                      segments=[Segment(start_ms=0, end_ms=n * 300, text="x", words=ws)])
+
+
+@requires_ffmpeg
+def test_heavy_listening_analysis_does_not_block_the_event_loop(media, monkeypatch):
+    from audel.backends.local import LocalBackend
+    from audel.core import listen
+
+    async def fake_transcribe(self, path, **kw):
+        return _big_transcript()
+
+    monkeypatch.setattr(LocalBackend, "available", lambda self: True)
+    monkeypatch.setattr(LocalBackend, "transcribe", fake_transcribe)
+    cues = "".join(f"{i}\n00:00:00,000 --> 00:07:30,000\n{'the ' * 50}\n\n" for i in range(1, 3000))
+
+    async def scenario():
+        gaps = []
+
+        async def ticker():
+            last = time.monotonic()
+            while True:
+                await asyncio.sleep(0.02)
+                now = time.monotonic()
+                gaps.append(now - last)
+                last = now
+
+        t = asyncio.create_task(ticker())
+        await listen(str(media["good"]), script=" ".join(["the"] * 30_000), captions=cues)
+        t.cancel()
+        return max(gaps)
+
+    assert asyncio.run(scenario()) < 0.5
+
+
+def test_caption_and_script_cost_is_bounded():
+    from audel.speech.captions import Cue, caption_issues
+    from audel.speech.listening import align_script
+
+    t = _big_transcript(30_000)
+    t0 = time.monotonic()
+    align_script(" ".join(["the"] * 30_000), t, 9_000_000)
+    cues = [Cue(i * 500, i * 500 + 2000, "the " * 60) for i in range(20_000)]
+    issues, _ = caption_issues(cues, t, Settings(), 9_000_000)
+    assert time.monotonic() - t0 < 30
+
+
+def test_windowed_alignment_still_finds_a_dropped_line():
+    import random
+
+    from audel.backends.base import Segment, Transcript, Word
+    from audel.speech.listening import align_script
+
+    random.seed(1)
+    script = [f"w{random.randrange(3000)}" for _ in range(20_000)]
+    heard = script[:10_000] + script[10_010:]
+    ws = [Word(text=w, start_ms=i * 300, end_ms=i * 300 + 250, probability=0.9)
+          for i, w in enumerate(heard)]
+    t = Transcript(text=" ".join(heard), segments=[Segment(start_ms=0, end_ms=len(heard) * 300,
+                                                           text="x", words=ws)])
+    r = align_script(" ".join(script), t, len(heard) * 300)
+    assert [(d.op, d.words) for d in r.deviations] == [("omission", 10)]
+
+
+def test_deleted_queued_jobs_never_leak_their_uploads(tmp_path, media, monkeypatch):
+    import audel.core as core_pkg
+
+    gate = asyncio.Event()
+
+    async def slow_check(path, **kw):
+        await gate.wait()
+        return await core_pkg.check.__wrapped__(path, **kw) if hasattr(core_pkg.check, "__wrapped__") else None
+
+    monkeypatch.setattr(core_pkg, "check", slow_check)
+    ws = tmp_path / "ws"
+    s = Settings(cache_dir=ws, allow_local_files=False, max_concurrent_jobs=1, api_token=SHARED,
+                 max_queued_jobs_per_tenant=50)
+    h = {"authorization": f"Bearer {SHARED}"}
+    with TestClient(build_app(settings=s)) as c:
+        for _ in range(6):
+            with open(media["good"], "rb") as fh:
+                jid = c.post("/jobs", headers=h, files={"file": ("a.wav", fh, "audio/wav")}
+                             ).json()["job_id"]
+            assert c.delete(f"/jobs/{jid}", headers=h).status_code == 200
+        time.sleep(0.3)
+        leftovers = [f for f in (ws / "tmp").iterdir() if f.name.startswith("upload_")]
+        assert len(leftovers) <= 1, leftovers   # at most the one job still holding the slot
+
+
+def test_cancelled_download_leaves_nothing_and_stops(tmp_path, monkeypatch):
+    import threading
+
+    import audel.ingest as ing
+
+    stopped = threading.Event()
+
+    def slow_download(url, dest, proxy_url, settings, stop=None):
+        fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as fh:
+            for _ in range(200):
+                if stop is not None and stop.is_set():
+                    stopped.set()
+                    raise UnsafeSourceError("download cancelled")
+                fh.write(b"x" * 10_000)
+                time.sleep(0.02)
+        return 0
+
+    monkeypatch.setattr(ing, "_download", slow_download)
+    monkeypatch.setattr(ing, "validate_ingest_url", lambda u, s: None)
+
+    async def scenario():
+        task = asyncio.create_task(ing.fetch_to_file("https://example.com/a.wav", tmp_path,
+                                                     Settings(allow_url_ingest=True)))
+        await asyncio.sleep(0.2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.sleep(0.2)
+
+    asyncio.run(scenario())
+    assert list(tmp_path.iterdir()) == [] and stopped.is_set()
+
+
+def test_body_intake_slots_are_taken_only_when_a_body_is_read():
+    from audel.adapters.rest import _BodyLimit
+
+    active = {"now": 0, "max": 0}
+
+    async def app(scope, receive, send):
+        if scope["path"] == "/read":
+            await receive()
+            active["now"] += 1
+            active["max"] = max(active["max"], active["now"])
+            await asyncio.sleep(0.05)
+            active["now"] -= 1
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    mw = _BodyLimit(app, cap=1000, max_concurrent=2)
+
+    async def call(path):
+        async def receive():
+            return {"type": "http.request", "body": b"x", "more_body": False}
+
+        async def send(msg):
+            pass
+
+        await mw({"type": "http", "path": path}, receive, send)
+
+    async def scenario():
+        # many non-reading requests never touch the intake limit...
+        await asyncio.wait_for(asyncio.gather(*[call("/noread") for _ in range(50)]), 2)
+        # ...and body readers are capped at 2 at a time
+        await asyncio.gather(*[call("/read") for _ in range(8)])
+
+    asyncio.run(scenario())
+    assert active["max"] <= 2
+
+
+def test_rest_list_fields_are_capped(tmp_path, media):
+    c = TestClient(build_app(settings=Settings(cache_dir=tmp_path, allow_local_files=False)))
+    with open(media["good"], "rb") as fh:
+        r = c.post("/check", files={"file": ("a.wav", fh, "audio/wav")},
+                   data={"expect": ["must: x"] * 300})
+    assert r.status_code == 400
+
+
+@pytest.mark.parametrize("msg", [
+    "{root}/tmp/upload_436a417f948c4d8b.wav: Invalid data found",
+    "[wav @ 0x7d97800] bad header in C:\\\\Users\\\\bob\\\\a.wav",
+    "open %2Fetc%2Fpasswd failed", "connect [fd00::12]:8080 refused",
+])
+def test_sanitizer_closes_round2_gaps(tmp_path, msg):
+    from audel.errors import register_sensitive_path, sanitize_message
+
+    root = tmp_path / "media store, (prod)"
+    register_sensitive_path(root)
+    out = sanitize_message(msg.format(root=root))
+    for leak in ("store", "prod", "Users", "passwd", "fd00", "0x7d", "upload_436a"):
+        assert leak not in out, out
+
+
+def test_render_is_audited(tmp_path, media):
+    audit = tmp_path / "a.jsonl"
+    c = TestClient(build_app(settings=Settings(cache_dir=tmp_path / "ws", allow_local_files=False,
+                                               audit_log=audit)))
+    with open(media["good"], "rb") as fh:
+        assert c.post("/render", files={"file": ("a.wav", fh, "audio/wav")}).status_code == 200
+    assert json.loads(audit.read_text().splitlines()[-1])["endpoint"] == "/render"

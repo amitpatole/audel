@@ -41,15 +41,41 @@ class EgressDeniedError(UnsafeSourceError):
 
 
 _PATHLIKE = None
+_SENSITIVE: set[str] = set()
+
+
+def register_sensitive_path(path) -> None:
+    """Register a server path (workspace, temp dir) that must never reach a remote caller. It is
+    replaced EXACTLY before the pattern pass, so a path containing spaces or commas cannot leak
+    partially."""
+    v = str(path or "").rstrip("/\\")
+    if len(v) >= 2:
+        _SENSITIVE.add(v)
 
 
 def sanitize_message(msg: str, *, limit: int = 300) -> str:
-    """Strip anything that looks like a filesystem path or IP:port from a message that may reach
-    a remote caller (tool stderr echoes input paths). Keeps the human-readable reason."""
+    """Strip anything that looks like a filesystem path, server temp-file name, address or
+    pointer from a message that may reach a remote caller (tool stderr echoes input paths).
+    Keeps the human-readable reason."""
     import re
+    import tempfile
 
     global _PATHLIKE
     if _PATHLIKE is None:
-        _PATHLIKE = re.compile(r"(?:[A-Za-z]:)?(?:/[^\s'\"():,]+){2,}|/[^\s'\"():,]+\.[A-Za-z0-9]{1,8}"
-                               r"|\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b")
-    return _PATHLIKE.sub("<path>", str(msg))[:limit]
+        _PATHLIKE = re.compile(
+            r"[A-Za-z]:\\[^\s'\"]+"                                   # Windows paths
+            r"|(?:%2[fF][^\s'\"%]*)+"                                   # percent-encoded paths
+            r"|(?:[A-Za-z]:)?(?:/[^\s'\"():,]+){2,}"                     # POSIX paths (2+ parts)
+            r"|/[^\s'\"():,]+\.[A-Za-z0-9]{1,8}"                         # /file.ext
+            r"|\b(?:upload|ingest)_[0-9a-f]{8,}[\w.]*"                     # server temp names
+            r"|\baudel-[a-z]+-[\w.]+"
+            r"|\[[0-9A-Fa-f:.]{2,}\](?::\d+)?"                           # [IPv6]:port
+            r"|\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b")                    # IPv4[:port]
+    text = str(msg)
+    roots = set(_SENSITIVE)
+    roots.add(tempfile.gettempdir().rstrip("/\\"))
+    for root in sorted(roots, key=len, reverse=True):
+        if root:
+            text = text.replace(root, "<path>")
+    text = re.sub(r"\s*@\s*0x[0-9a-fA-F]+", "", text)                  # ffmpeg context pointers
+    return _PATHLIKE.sub("<path>", text)[:limit]

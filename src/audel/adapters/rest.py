@@ -48,6 +48,8 @@ except ImportError:  # pragma: no cover - only without the [serve] extra
 log = get_logger("rest")
 _LOOPBACK = {"127.0.0.1", "::1", "localhost", "0:0:0:0:0:0:0:1"}
 _KINDS = ("check", "listen", "analyze")
+_MAX_LIST_ITEMS = 200
+_MAX_ITEM_CHARS = 2000
 _REQUEST_ID_OK = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.")
 
 
@@ -164,7 +166,9 @@ def build_app(settings: Settings | None = None):
         # The streamed body is capped by _BodyLimit (no whole-body buffering in memory).
         return reply(await call_next(request))
 
-    app.add_middleware(_BodyLimit, cap=settings.max_request_bytes)
+    app.add_middleware(_BodyLimit, cap=settings.max_request_bytes,
+                       max_concurrent=settings.max_concurrent_uploads
+                       or 2 * settings.max_concurrent_jobs)
 
     def _admin_only(request: Request) -> None:
         """/doctor and /metrics expose server internals and cross-tenant totals: when auth is on,
@@ -291,6 +295,11 @@ def build_app(settings: Settings | None = None):
                             backend=p.get("backend"))
 
     def _validate(kind: str, p: dict) -> tuple[dict, Settings]:
+        for name in ("expect", "require", "forbid", "key_message", "language"):
+            items = p.get(name) or []
+            if len(items) > _MAX_LIST_ITEMS or any(len(x) > _MAX_ITEM_CHARS for x in items):
+                raise HTTPException(status_code=400, detail=(
+                    f"{name}: at most {_MAX_LIST_ITEMS} values of {_MAX_ITEM_CHARS} characters"))
         if kind not in _KINDS:
             raise HTTPException(status_code=400, detail=f"kind must be one of {', '.join(_KINDS)}")
         if p.get("understand") and not settings.rest_allow_understand:
@@ -301,7 +310,7 @@ def build_app(settings: Settings | None = None):
 
     async def _run_and_audit(kind: str, path: Path, src: str, host: str | None, p: dict,
                              gs: Settings, principal: Principal, request_id: str,
-                             job_id: str | None = None) -> dict:
+                             job_id: str | None = None, as_handoff: bool = False) -> dict:
         t0 = time.monotonic()
         digest, size = await asyncio.to_thread(_sha256, path)
         status, verdict, n_issues, err = "ok", None, None, None
@@ -309,7 +318,7 @@ def build_app(settings: Settings | None = None):
             report = await _shielded(lambda: _grade(kind, path, p, gs),
                                      settings.request_timeout_s)
             verdict, n_issues = report.verdict.value, len(report.issues)
-            return _public(report)
+            return report.to_handoff().model_dump(mode="json") if as_handoff else _public(report)
         except TimeoutError:
             status, err = "timeout", "timeout"
             raise UnsafeSourceError(f"grading exceeded {settings.request_timeout_s:.0f}s") from None
@@ -415,18 +424,29 @@ def build_app(settings: Settings | None = None):
         from ..core import render
 
         path = None
+        t0 = time.monotonic()
+        status = "ok"
         try:
-            path, _src, _host = await _acquire(file, url)
-            rr = await render(str(path), settings=grade_settings)
+            path, src, host = await _acquire(file, url)
+            digest, size = await asyncio.to_thread(_sha256, path)
+            rr = await _shielded(lambda: render(str(path), settings=grade_settings),
+                                 settings.request_timeout_s)
             return {"duration_ms": rr.duration_ms, "channels": rr.channels,
                     "sample_rate": rr.sample_rate, "codec": rr.codec, "has_audio": rr.has_audio,
                     "integrated_lufs": rr.integrated_lufs, "true_peak_dbtp": rr.true_peak_dbtp,
                     "rms_dbfs": rr.rms_dbfs, "lra": rr.lra, "silences": len(rr.silences),
                     "tracks": [t.model_dump(mode="json") for t in rr.tracks]}
+        except TimeoutError:
+            status = "timeout"
+            raise HTTPException(status_code=400, detail="render exceeded the time limit") from None
         except AudelError as e:
+            status = "error"
             raise _http_error(e) from e
         finally:
             if path is not None:
+                audit.write(request_id=request.state.request_id, tenant=_principal(request).tenant,
+                            endpoint="/render", kind="render", status=status,
+                            duration_ms=int((time.monotonic() - t0) * 1000))
                 path.unlink(missing_ok=True)
 
     @app.post("/handoff")
@@ -435,15 +455,12 @@ def build_app(settings: Settings | None = None):
                          expect: list[str] | None = Form(None), backend: str | None = Form(None),
                          _slot=Depends(_job_slot)):
         """Grade + return the distilled ears→brain handoff (verdict + next action + todo)."""
-        from ..core import analyze
-
-        _check_backend(backend)
+        p, gs = _validate("analyze", {"brief": brief, "expect": expect, "backend": backend})
         path = None
         try:
-            path, _src, _host = await _acquire(file, url)
-            report = await analyze(str(path), settings=grade_settings,
-                                   brief=_brief_from(brief, expect), backend=backend)
-            return report.to_handoff().model_dump(mode="json")
+            path, src, host = await _acquire(file, url)
+            return await _run_and_audit("analyze", path, src, host, p, gs, _principal(request),
+                                        request.state.request_id, as_handoff=True)
         except AudelError as e:
             raise _http_error(e) from e
         finally:
@@ -508,20 +525,23 @@ def build_app(settings: Settings | None = None):
         rid = request.state.request_id
         holder: dict[str, str] = {}
 
+        fetched: list[Path] = []
+
         async def work() -> dict:
             path = spooled
             src, host = "upload", None
-            try:
-                if path is None:
-                    path, src, host = await _acquire(None, url)
-                return await _run_and_audit(kind, path, src, host, p, gs, principal, rid,
-                                            job_id=holder.get("id"))
-            finally:
-                if path is not None:
-                    path.unlink(missing_ok=True)
+            if path is None:
+                path, src, host = await _acquire(None, url)
+                fetched.append(path)
+            return await _run_and_audit(kind, path, src, host, p, gs, principal, rid,
+                                        job_id=holder.get("id"))
+
+        def cleanup() -> None:  # runs on done, failure AND cancel (even while still queued)
+            for f in ([spooled] if spooled is not None else []) + fetched:
+                f.unlink(missing_ok=True)
 
         try:
-            job = jobs.submit(principal.tenant, kind, work)
+            job = jobs.submit(principal.tenant, kind, work, cleanup=cleanup)
         except QueueFull as e:
             if spooled is not None:
                 spooled.unlink(missing_ok=True)
@@ -574,11 +594,14 @@ async def run_shielded(sem: asyncio.Semaphore, coro_factory, timeout: float):
 
 class _BodyLimit:
     """Pure-ASGI request-body cap, enforced on the STREAM as it is read (chunked uploads
-    included) without buffering the whole body in memory. Past the cap the app's response is
-    replaced by 413."""
+    included) without buffering the whole body. Past the cap the app's response is replaced by
+    413. Body intake is also concurrency-limited: a request takes an intake slot only when it
+    first reads its body (i.e. after authentication), so total in-flight form memory is bounded
+    and unauthenticated clients cannot occupy slots."""
 
-    def __init__(self, app, cap: int) -> None:
+    def __init__(self, app, cap: int, max_concurrent: int = 8) -> None:
         self.app, self.cap = app, cap
+        self._intake = asyncio.Semaphore(max(1, max_concurrent))
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
@@ -586,9 +609,13 @@ class _BodyLimit:
         total = 0
         exceeded = False
         sent_ours = False
+        holding = False
 
         async def recv():
-            nonlocal total, exceeded
+            nonlocal total, exceeded, holding
+            if not holding:
+                await self._intake.acquire()
+                holding = True
             msg = await receive()
             if msg.get("type") == "http.request":
                 total += len(msg.get("body", b""))
@@ -615,6 +642,9 @@ class _BodyLimit:
         except Exception:
             if not exceeded:
                 raise
+        finally:
+            if holding:
+                self._intake.release()
         if exceeded and not sent_ours:
             await snd({"type": "http.response.start"})
 

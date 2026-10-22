@@ -83,7 +83,10 @@ class JobStore:
                    and (owner is None or j.owner == owner))
 
     def submit(self, owner: str, kind: str, work: Callable[[], Awaitable[dict]],
-               on_done: Callable[[Job], None] | None = None) -> Job:
+               on_done: Callable[[Job], None] | None = None,
+               cleanup: Callable[[], None] | None = None) -> Job:
+        """``cleanup`` ALWAYS runs exactly once when the job ends: done, failed, or cancelled
+        (including cancelled while still queued), so spooled inputs never leak."""
         self._purge(owner)
         if self.pending(owner) >= self._q_owner:
             raise QueueFull("your job queue is full; retry later")
@@ -93,6 +96,16 @@ class JobStore:
         self._jobs[job.id] = job
 
         async def run() -> None:
+            try:
+                await _body()
+            finally:
+                if cleanup is not None:
+                    try:
+                        cleanup()
+                    except OSError:
+                        pass
+
+        async def _body() -> None:
             async with self._sem:
                 if job.status == "cancelled":
                     return

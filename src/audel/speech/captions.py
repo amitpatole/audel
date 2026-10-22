@@ -7,6 +7,7 @@ bounded (file size, cue count, cue length); cue text is treated as untrusted dat
 
 from __future__ import annotations
 
+import bisect
 import difflib
 import re
 import statistics
@@ -21,6 +22,9 @@ MAX_CAPTION_BYTES = 2_000_000
 MAX_CUES = 20_000
 _MAX_CUE_CHARS = 1_000
 _MAX_REPORTED = 30
+_MAX_CUE_MS = 30_000          # a cue longer than this is malformed; its text is not matched
+_MAX_WINDOW_WORDS = 600       # words compared against one cue
+_COMPARE_BUDGET = 40_000_000  # total cue-token x heard-token comparisons per file
 _TS = r"(?:(\d{1,2}):)?(\d{1,2}):(\d{2})[.,](\d{3})"
 _RE_TIMING = re.compile(_TS + r"\s*-->\s*" + _TS)
 _RE_TAGS = re.compile(r"<[^>]{0,200}>|\{\\[^}]{0,200}\}")
@@ -87,6 +91,14 @@ def caption_issues(cues: list[Cue], transcript: Transcript, settings,
                               source=IssueSource.ASR, confidence=conf,
                               detail={"check": check, **detail}))
 
+    mids = [(w.start_ms + w.end_ms) // 2 for w in words]  # words are in time order
+
+    def window(a_ms: int, b_ms: int) -> list:
+        lo, hi = bisect.bisect_left(mids, a_ms), bisect.bisect_right(mids, b_ms)
+        return words[lo:min(hi, lo + _MAX_WINDOW_WORDS)]
+
+    budget = _COMPARE_BUDGET
+    truncated = False
     prev_end = -1
     for n, c in enumerate(cues):
         dur = c.end_ms - c.start_ms
@@ -106,13 +118,25 @@ def caption_issues(cues: list[Cue], transcript: Transcript, settings,
                       f"{settings.caption_max_cps:.0f}): too fast to read",
                       c.start_ms, c.end_ms, "caption_reading_rate", cps=round(cps, 1))
                 reported["cps"] += 1
-        ctoks = _tokens(c.text)
+        ctoks = _tokens(c.text)[:200]
         if len(ctoks) < 2:
             continue
+        if dur > _MAX_CUE_MS:
+            if reported["format"] < _MAX_REPORTED:
+                issue(IssueKind.OTHER, Severity.WARNING,
+                      f"cue {n + 1} is on screen for {dur / 1000:.0f}s (over "
+                      f"{_MAX_CUE_MS // 1000}s): malformed timing", c.start_ms, c.end_ms,
+                      "caption_format")
+                reported["format"] += 1
+            continue
+        if budget <= 0:
+            truncated = True
+            break
         # How much of the cue was actually heard while it was on screen (small tolerance either
         # side). Measured against the CUE's words, so neighbouring speech cannot dilute it.
-        near = [w for w in words if c.start_ms - 400 <= (w.start_ms + w.end_ms) // 2 <= c.end_ms + 400]
+        near = window(c.start_ms - 400, c.end_ms + 400)
         heard = [w.text for w in near]
+        budget -= len(ctoks) * max(1, len(heard))
         if heard:
             sm = difflib.SequenceMatcher(None, ctoks, heard, autojunk=False)
             ratio = sum(b.size for b in sm.get_matching_blocks()) / len(ctoks)
@@ -120,14 +144,14 @@ def caption_issues(cues: list[Cue], transcript: Transcript, settings,
             ratio = 0.0
         if ratio < 0.6:
             # Allow for a consistent caption offset: look again in a wider window before judging.
-            wide = [w.text for w in words
-                    if c.start_ms - 5000 <= (w.start_ms + w.end_ms) // 2 <= c.end_ms + 5000]
+            wide_words = window(c.start_ms - 5000, c.end_ms + 5000)
+            wide = [w.text for w in wide_words]
+            budget -= len(ctoks) * max(1, len(wide))
             if wide:
                 sm = difflib.SequenceMatcher(None, ctoks, wide, autojunk=False)
                 wide_ratio = sum(b.size for b in sm.get_matching_blocks()) / len(ctoks)
                 if wide_ratio >= 0.8:
-                    near = [w for w in words if c.start_ms - 5000 <= (w.start_ms + w.end_ms) // 2
-                            <= c.end_ms + 5000]
+                    near = wide_words
                     ratio = wide_ratio
         if ratio >= 0.6:
             matched += 1
@@ -144,6 +168,10 @@ def caption_issues(cues: list[Cue], transcript: Transcript, settings,
                   f"\"{' '.join(heard)[:100]}\"", c.start_ms, c.end_ms, "caption_text",
                   similarity=round(ratio, 2))
             reported["text"] += 1
+    if truncated:
+        issue(IssueKind.OTHER, Severity.WARNING,
+              "caption text check stopped early: the file is too large to compare in full",
+              0, duration_ms, "caption_truncated", conf=Confidence.LOW)
     summ.matched_ratio = matched / len(cues) if cues else None
     summ.max_cps = round(cps_max, 1) if cps_max else None
     if drifts:
