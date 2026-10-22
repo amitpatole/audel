@@ -12,10 +12,20 @@ from typing import Protocol, runtime_checkable
 from pydantic import BaseModel, Field
 
 
+class Word(BaseModel):
+    start_ms: int
+    end_ms: int
+    text: str
+    probability: float | None = None
+
+
 class Segment(BaseModel):
     start_ms: int
     end_ms: int
     text: str
+    words: list[Word] = Field(default_factory=list)
+    avg_logprob: float | None = None
+    no_speech_prob: float | None = None
 
 
 class Transcript(BaseModel):
@@ -26,6 +36,10 @@ class Transcript(BaseModel):
 
     def normalized(self) -> str:
         return _normalize(self.text)
+
+    def words(self) -> list[Word]:
+        """All words in order (empty if the ASR ran without word timestamps)."""
+        return [w for s in self.segments for w in s.words]
 
 
 def _normalize(s: str) -> str:

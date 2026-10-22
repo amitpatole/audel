@@ -130,6 +130,10 @@ def build_app(settings: Settings | None = None):
             yield
 
     def _http_error(e: Exception) -> HTTPException:
+        if isinstance(e, ConfigError):
+            # Caller-input validation (spec, language code, tone, caption/script shape). Safe to
+            # surface after redacting any workspace path.
+            return HTTPException(status_code=400, detail=str(e).replace(_ws_marker, "<workspace>"))
         if isinstance(e, UnsafeSourceError):
             # Safe to surface, but redact any server workspace path the message may embed.
             return HTTPException(status_code=400, detail=str(e).replace(_ws_marker, "<workspace>"))
@@ -240,6 +244,43 @@ def build_app(settings: Settings | None = None):
             dest = await _spool(file)
             report = await analyze(str(dest), settings=gs,
                                    brief=_brief_from(brief, expect), backend=backend, spec=sp)
+            return _public(report)
+        except AudelError as e:
+            raise _http_error(e) from e
+        finally:
+            if dest is not None:
+                dest.unlink(missing_ok=True)
+
+    @app.post("/listen")
+    async def listen_ep(file: UploadFile = File(...), script: str | None = Form(None),
+                        captions: str | None = Form(None), require: list[str] | None = Form(None),
+                        forbid: list[str] | None = Form(None),
+                        language: list[str] | None = Form(None),
+                        key_message: list[str] | None = Form(None), tone: str | None = Form(None),
+                        understand: bool = Form(False), backend: str | None = Form(None),
+                        spec: str | None = Form(None), content: str | None = Form(None),
+                        _slot=Depends(_job_slot)):
+        """Hear and listen: signal QC plus script / wording / pace / captions (offline). With
+        ``understand`` (operator opt-in), key messages and delivery via the server's backend."""
+        from ..core import listen
+
+        if understand and not settings.rest_allow_understand:
+            raise HTTPException(status_code=403, detail="understand is disabled on this server.")
+        _check_backend(backend)
+        langs: dict[int, str] = {}
+        for item in language or []:
+            idx, sep, code = item.partition("=")
+            if not sep or not idx.strip().isdigit() or len(langs) >= 32:
+                raise HTTPException(status_code=400, detail="language must be TRACK=CODE, e.g. 1=es")
+            langs[int(idx)] = code.strip()
+        sp, gs = _spec_for(spec), _settings_for(content)
+        dest = None
+        try:
+            dest = await _spool(file)
+            report = await listen(str(dest), settings=gs, spec=sp, script=script,
+                                  captions=captions, required=require, forbidden=forbid,
+                                  languages=langs, key_messages=key_message, tone=tone,
+                                  understand=understand, backend=backend)
             return _public(report)
         except AudelError as e:
             raise _http_error(e) from e

@@ -10,19 +10,18 @@ never constructs this backend).
 from __future__ import annotations
 
 import asyncio
-import json
-import urllib.request
 
 from ..config import Settings
 from ..errors import BackendAuthError, BackendError
 from ..logging import get_logger
-from ..netguard import assert_safe_url
+from ..netguard import assert_backend_url, post_json
 from .base import Transcript
 from .local import LocalBackend
 
 _log = get_logger("ollama")
 _MAX_RESPONSE_CHARS = 20_000
 _TIMEOUT_S = 60.0
+_MAX_RESPONSE_BYTES = 1_000_000
 
 
 class OllamaBackend:
@@ -43,29 +42,28 @@ class OllamaBackend:
         if not key:
             raise BackendAuthError("no Ollama key (set OLLAMA_API_KEY or ~/.config/ollama/key)")
         url = self._settings.ollama_base_url.rstrip("/") + "/chat/completions"
-        assert_safe_url(url)  # SSRF: reject an internal/misconfigured endpoint
+        assert_backend_url(url, self._settings.trusted_backend_hosts)  # SSRF: vet the endpoint
         return await asyncio.to_thread(self._post, url, key, system, user)
 
     async def critique_audio(self, audio_path: str, prompt: str) -> str:
         return ""  # Ollama's API cannot ingest audio
 
     def _post(self, url: str, key: str, system: str, user: str) -> str:
-        body = json.dumps({
+        body = {
             "model": self._settings.ollama_model,
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
             "max_tokens": 700,
             "temperature": 0,
-        }).encode()
-        req = urllib.request.Request(url, data=body, headers={
-            "Authorization": f"Bearer {key}", "Content-Type": "application/json",
-        })
+        }
         try:
-            with urllib.request.urlopen(req, timeout=_TIMEOUT_S) as resp:
-                data = json.loads(resp.read())
+            # No redirects, bounded read: a misbehaving endpoint can neither bounce the request to
+            # an internal address nor make us buffer an unbounded body.
+            data = post_json(url, body, headers={"Authorization": f"Bearer {key}"},
+                             timeout_s=_TIMEOUT_S, max_bytes=_MAX_RESPONSE_BYTES)
         except Exception as e:  # noqa: BLE001 - normalize transport/parse errors
             raise BackendError(f"Ollama request failed: {type(e).__name__}") from e
         try:
             content = data["choices"][0]["message"]["content"] or ""
         except (KeyError, IndexError, TypeError):
             content = ""
-        return content[:_MAX_RESPONSE_CHARS]
+        return str(content)[:_MAX_RESPONSE_CHARS]

@@ -44,11 +44,18 @@ def test_public_backend_url_allowed():
     assert_safe_url("https://ollama.com/v1/chat/completions")  # no raise
 
 
-def test_ollama_backend_vets_url_before_request():
-    import inspect
-
+def test_ollama_backend_vets_url_before_request(monkeypatch):
+    # Behavioural: aimed at an internal address, the backend refuses BEFORE any connection.
     from audel.backends.ollama import OllamaBackend
-    assert "assert_safe_url" in inspect.getsource(OllamaBackend.complete_text)
+    from audel.config import Settings
+    from audel.errors import UnsafeSourceError
+
+    monkeypatch.setattr(socket, "create_connection",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("egress")))
+    for url in ("http://169.254.169.254/v1", "http://127.0.0.1:11434/v1", "http://10.0.0.5/v1"):
+        be = OllamaBackend(Settings(ollama_base_url=url, ollama_api_key="k"))
+        with pytest.raises(UnsafeSourceError):
+            asyncio.run(be.complete_text("s", "u"))
 
 
 def test_analyze_with_local_backend_makes_no_network(media, monkeypatch):

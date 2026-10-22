@@ -18,6 +18,10 @@ def resolve_backend(name: str | None, settings: Settings | None = None) -> Audio
         from .ollama import OllamaBackend
 
         return OllamaBackend(settings)
+    if name in ("ollama-local", "local-llm"):
+        from .ollama_local import LocalLLMBackend
+
+        return LocalLLMBackend(settings)
     if name == "anthropic":
         from .anthropic_backend import AnthropicBackend
 

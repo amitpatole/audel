@@ -84,6 +84,29 @@ def build_server():
         return report.model_dump(mode="json")
 
     @mcp.tool()
+    async def listen_audio(source: str, script: str | None = None, captions: str | None = None,
+                           require: list[str] | None = None, forbid: list[str] | None = None,
+                           key_messages: list[str] | None = None, tone: str | None = None,
+                           understand: bool = False, backend: str | None = None,
+                           spec: str | None = None, content: str | None = None) -> dict:
+        """Hear AND listen to an audio/media file.
+
+        Hearing: the full deterministic signal check (see check_audio). Listening (offline,
+        local ASR): script adherence with time-grounded omissions/substitutions (pass the script
+        TEXT), required/forbidden wording, speech rate, dead-air pauses, hard-to-make-out
+        stretches, and caption conformance (pass SRT/WebVTT TEXT). With understand=True, a model
+        also judges key messages, the listener takeaway and the delivery tone; ollama-local keeps
+        that on the operator's network.
+        """
+        from ..core import listen
+
+        report = await listen(source, settings=_settings(content), spec=_builtin(spec),
+                              script=script, captions=captions, required=require,
+                              forbidden=forbid, key_messages=key_messages, tone=tone,
+                              understand=understand, backend=backend)
+        return report.model_dump(mode="json")
+
+    @mcp.tool()
     async def list_specs() -> list[dict]:
         """The built-in delivery specs (loudness target, tolerance, true-peak ceiling, gating)."""
         from ..specs import BUILTIN_SPECS

@@ -68,6 +68,64 @@ def check(source: str,
     raise typer.Exit(0 if report.verdict.value != "fail" else 1)
 
 
+def _parse_languages(items: list[str] | None) -> dict[int, str]:
+    out: dict[int, str] = {}
+    for it in items or []:
+        idx, sep, code = it.partition("=")
+        if not sep or not idx.strip().isdigit():
+            raise typer.BadParameter(f"--language expects TRACK=CODE, e.g. 1=es (got {it!r})")
+        out[int(idx)] = code.strip()
+    return out
+
+
+@app.command()
+def listen(
+    source: str,
+    script: Path = typer.Option(None, "--script", help="Approved script (text file) to check the read against."),
+    captions: Path = typer.Option(None, "--captions", help="SRT or WebVTT file to check against the audio."),
+    require: list[str] = typer.Option(None, "--require", help="Wording that must be said (repeatable)."),
+    forbid: list[str] = typer.Option(None, "--forbid", help="Wording that must not be said (repeatable)."),
+    language: list[str] = typer.Option(None, "--language", help="Expected language per track, TRACK=CODE (repeatable)."),
+    key_message: list[str] = typer.Option(None, "--key-message", help="What a listener should take away (repeatable; 'must:' prefix makes a miss an error)."),
+    tone: str = typer.Option(None, "--tone", help="Expected delivery: calm|warm|neutral|urgent|angry|monotone|rushed."),
+    understand: bool = typer.Option(False, "--understand", help="Use a model for key messages, takeaway and delivery (may egress; ollama-local stays on your network)."),
+    backend: str = typer.Option(None, help="Backend for --understand (default: ollama-local if AUDEL_LOCAL_LLM_URL is set)."),
+    spec: str = typer.Option(None, "--spec", help=_SPEC_HELP),
+    content: str = typer.Option(None, "--content", help=_CONTENT_HELP),
+    json_out: bool = typer.Option(False, "--json", help="Print the JSON report."),
+    html: Path = typer.Option(None, "--html", help="Write a self-contained HTML QC report here."),
+) -> None:
+    """Hear AND listen: signal QC, then what was said (script, wording, pace, captions, message)."""
+    from ..core import listen as _listen
+
+    report = asyncio.run(_listen(
+        source, settings=_settings_for(content), spec=spec,
+        script=script.read_text(encoding="utf-8") if script else None,
+        captions=captions.read_text(encoding="utf-8") if captions else None,
+        required=require or None, forbidden=forbid or None,
+        languages=_parse_languages(language), key_messages=key_message or None, tone=tone,
+        understand=understand, backend=backend))
+    if json_out:
+        typer.echo(report.model_dump_json(indent=2))
+    else:
+        _print_report(report)
+        ls = report.listening
+        if ls is not None:
+            if ls.takeaway:
+                typer.echo(f"  takeaway: {ls.takeaway}")
+            for d in ls.delivery:
+                typer.echo(f"  heard [{d.start_ms}–{d.end_ms}ms]: {d.delivery or '?'}, pace "
+                           f"{d.pace or '?'}, {d.intelligibility or '?'}")
+        if report.conformance:
+            for c in report.conformance.claims:
+                typer.echo(f"    [{c.importance.value}] {c.status.value}: {c.text}")
+    if html:
+        from ..qc_report import render_html
+
+        html.write_text(render_html(report, source_name=Path(source).name), encoding="utf-8")
+    raise typer.Exit(0 if report.verdict.value != "fail" else 1)
+
+
 @app.command()
 def specs() -> None:
     """List the built-in delivery specs."""

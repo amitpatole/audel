@@ -46,11 +46,36 @@ def run_checks(settings: Settings | None = None) -> list[Check]:
                         "installed" if chromium else "pip install audel[render]"))
 
     # Cloud/text backends: report only whether a credential resolves (never the value).
-    for backend in ("ollama", "anthropic", "gemini-audio", "deepgram", "groq", "assemblyai"):
+    for backend in ("ollama", "anthropic", "gemini-audio"):
         has_key = bool(s.key_for(backend))
         checks.append(Check(f"backend:{backend}", has_key,
                             "key resolved" if has_key else "no key (set env or ~/.config/.../key)"))
+    checks.append(_local_llm(s))
     return checks
+
+
+def _local_llm(s: Settings) -> Check:
+    """Is the operator's on-prem Ollama reachable (vetted URL, no redirects, short timeout)?"""
+    if not s.local_llm_url:
+        return Check("backend:ollama-local", False, "not configured (set AUDEL_LOCAL_LLM_URL)")
+    import json
+    import urllib.request
+
+    from ..errors import UnsafeSourceError
+    from ..netguard import _NoRedirect, assert_backend_url
+
+    url = s.local_llm_url.rstrip("/") + "/api/version"
+    try:
+        assert_backend_url(url, s.trusted_backend_hosts)
+        opener = urllib.request.build_opener(_NoRedirect())
+        with opener.open(url, timeout=3) as resp:
+            version = json.loads(resp.read(4096)).get("version", "?")
+        return Check("backend:ollama-local", True, f"reachable (Ollama {str(version)[:20]}), "
+                     f"model {s.local_llm_model}")
+    except UnsafeSourceError as e:
+        return Check("backend:ollama-local", False, f"refused: {e} (add it to trusted_backend_hosts)")
+    except Exception as e:  # noqa: BLE001 - diagnostics only
+        return Check("backend:ollama-local", False, f"unreachable ({type(e).__name__})")
 
 
 def format_checks(checks: list[Check]) -> str:

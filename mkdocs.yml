@@ -68,3 +68,5 @@ nav:
   - Quickstart: quickstart.md
   - Delivery specs: specs.md
   - Checks reference: checks.md
+  - Hearing and listening: listening.md
+  - On-prem inference: on-prem.md

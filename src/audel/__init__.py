@@ -49,11 +49,11 @@ __all__ = [
     "Verdict", "Report", "Brief", "IntentClaim", "Importance", "ClaimStatus", "ClaimResult",
     "Conformance", "Handoff", "NextAction",
     # lazy (built in later phases):
-    "analyze", "check", "watch", "render", "compute_diff",
+    "analyze", "check", "listen", "watch", "render", "compute_diff",
     "LoopSession", "GenerativeLoopSession", "StreamMonitor",
 ]
 
-_LAZY_CORE = {"analyze", "check", "watch", "render", "compute_diff",
+_LAZY_CORE = {"analyze", "check", "listen", "watch", "render", "compute_diff",
               "LoopSession", "GenerativeLoopSession", "StreamMonitor"}
 
 

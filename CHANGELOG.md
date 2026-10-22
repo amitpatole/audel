@@ -20,6 +20,21 @@ All notable changes to Audel are recorded here. The format follows
 - Mains hum detection at 50 and 60 Hz, and a noise-floor check for speech content.
 - `detail.check` names the precise rule on every DSP finding.
 - `audel qc` writes a self-contained HTML QC report for operators, with JSON alongside.
+- **`listen()`: hearing plus listening.** It runs the full `check`, then grades what was said
+  from a word-timed local transcript. That covers script adherence with time-grounded omissions,
+  substitutions and ad-libs, required and forbidden wording, speech rate and rushed passages,
+  dead-air pauses, hard-to-make-out stretches, and expected language per track.
+- Caption conformance for SRT and WebVTT: text, consistent offset, per-cue timing, reading rate,
+  uncaptioned speech, and malformed cues.
+- Opt-in understanding (`understand=True`): key-message claims, a listener takeaway, and
+  delivery and tone heard by an audio-capable model.
+- `ollama-local` backend for on-prem inference. Audio-native listening was verified with
+  `gemma4:12b-it-qat` on Ollama 0.34. An operator `AUDEL_TRUSTED_BACKEND_HOSTS` allowlist is the
+  only way a backend URL may reach a private address.
+- ASR word timestamps, `AUDEL_ASR_DEVICE` (`auto`, `cpu` or `cuda`) and `AUDEL_ASR_COMPUTE_TYPE`.
+- `audel listen` CLI, `POST /listen` (understanding is operator opt-in via
+  `AUDEL_REST_ALLOW_UNDERSTAND`), and the MCP tool `listen_audio`. `audel doctor` reports
+  local-LLM reachability.
 - `audel bench` measures precision and recall per check, on a synthetic labelled corpus or on your
   own labelled corpus.
 - `SECURITY.md` with a private reporting path and supported-version table.
@@ -27,12 +42,19 @@ All notable changes to Audel are recorded here. The format follows
 - CI now gates on strict type checking, the no-key demo, and a dependency vulnerability audit.
 
 ### Fixed
+- Local ASR no longer depends on PyAV's file loader, which broke with PyAV 19. Audel feeds
+  faster-whisper the samples it already decoded with ffmpeg.
 - MCP adapter works on `mcp` 2.x, where the high-level server moved to `mcp.server.MCPServer`.
   The 1.x import path is still supported.
 - Anthropic backend works on `anthropic` 2.x. Sampling parameters were removed from the Messages
   API, so the request now uses `output_config.effort = "low"` and handles a `refusal` stop reason.
 
+### Security
+- Backend HTTP calls refuse redirects and cap the response size before parsing.
+- Backend URLs with embedded credentials are refused.
+
 ### Changed
+- `audel doctor` no longer lists Deepgram, Groq or AssemblyAI. No backends for them exist.
 - Truncation now requires the tail to sit near programme level, so a steady noise or hum tail no
   longer reads as a cut.
 - Default Anthropic critique model is now `claude-haiku-5-5` (was `claude-haiku-4-5`).

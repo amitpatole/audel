@@ -23,13 +23,14 @@ class LocalBackend:
 
         return importlib.util.find_spec("faster_whisper") is not None
 
-    async def transcribe(self, audio_path: str, *, language: str | None = None) -> Transcript:
+    async def transcribe(self, audio_path: str, *, language: str | None = None,
+                         stream: int = 0) -> Transcript:
         from ..speech.asr import transcribe_file
 
         model = self._settings.asr_model
         lang = language if language is not None else self._settings.asr_language
         return await asyncio.to_thread(transcribe_file, audio_path, model_name=model,
-                                       language=lang, settings=self._settings)
+                                       language=lang, settings=self._settings, stream=stream)
 
     async def complete_text(self, system: str, user: str) -> str:
         return ""

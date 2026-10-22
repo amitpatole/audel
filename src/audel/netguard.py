@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import socket
+import urllib.request
 from urllib.parse import urlparse
 
 from .errors import UnsafeSourceError
@@ -116,3 +117,68 @@ async def resolve_safe_ip(host: str | None, port: int | None) -> str | None:
     if not ips or any(ip_is_blocked(ip) for ip in ips):
         return None
     return ips[0]
+
+
+# --- Operator-trusted backend hosts (Phase 10: on-prem / LAN inference) ------------------------
+
+def _always_blocked(addr: str) -> bool:
+    """Addresses no configuration can make reachable: cloud metadata, link-local, multicast,
+    unspecified, reserved. (Private and loopback stay reachable only for TRUSTED hosts.)"""
+    try:
+        ip = _normalize(ipaddress.ip_address(addr))
+    except ValueError:
+        return True
+    if str(ip) in _METADATA or addr in _METADATA:
+        return True
+    return bool(ip.is_link_local or ip.is_multicast or ip.is_unspecified or ip.is_reserved)
+
+
+def assert_backend_url(url: str, trusted_hosts: list[str] | tuple[str, ...] = ()) -> None:
+    """Vet a backend endpoint. Public hosts pass the normal SSRF check. A host the OPERATOR listed
+    in ``trusted_backend_hosts`` (exact, case-insensitive match) may be private or loopback — that
+    is how a LAN inference server is reached — but never metadata / link-local / multicast."""
+    parsed = urlparse(url)
+    if parsed.scheme not in ALLOWED_SCHEMES:
+        raise UnsafeSourceError(f"backend URL scheme {parsed.scheme!r} not allowed (http/https only)")
+    host = (parsed.hostname or "").lower()
+    if parsed.username or parsed.password:
+        raise UnsafeSourceError("backend URL may not embed credentials")
+    trusted = {h.strip().lower() for h in trusted_hosts if h and h.strip()}
+    if host and host in trusted:
+        if _is_literal_ip(host):
+            if _always_blocked(host):
+                raise UnsafeSourceError(f"refusing to reach {host!r} even though it is trusted")
+            return
+        try:
+            infos = socket.getaddrinfo(host, parsed.port or 443, proto=socket.IPPROTO_TCP)
+        except socket.gaierror as e:
+            raise UnsafeSourceError(f"could not resolve trusted host {host!r}") from e
+        if any(_always_blocked(str(i[4][0])) for i in infos):
+            raise UnsafeSourceError(f"refusing to reach {host!r}: resolves to a forbidden address")
+        return
+    assert_host_safe(parsed.hostname, parsed.port)
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """urllib handler that refuses every redirect (a backend must answer, not bounce us)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise UnsafeSourceError(f"backend redirected ({code}); redirects are refused")
+
+
+def post_json(url: str, body: dict, *, headers: dict[str, str] | None = None,
+              timeout_s: float = 60.0, max_bytes: int = 4_000_000) -> dict:
+    """POST JSON to an already-vetted backend URL: no redirects, bounded response read."""
+    import json
+
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST",
+                                 headers={"Content-Type": "application/json", **(headers or {})})
+    opener = urllib.request.build_opener(_NoRedirect())
+    with opener.open(req, timeout=timeout_s) as resp:
+        raw = resp.read(max_bytes + 1)
+    if len(raw) > max_bytes:
+        raise UnsafeSourceError(f"backend response over {max_bytes} bytes (refused)")
+    data = json.loads(raw)
+    if not isinstance(data, dict):
+        raise ValueError("backend returned non-object JSON")
+    return data

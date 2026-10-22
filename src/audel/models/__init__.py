@@ -37,7 +37,8 @@ __all__ = [
     "BBox", "Span", "Brief", "IntentClaim", "ClaimResult", "Conformance",
     "Handoff", "NextAction", "Sense", "verdict_from_issues",
     # audio specialisation
-    "IssueKind", "IssueSource", "Issue", "Report", "TrackSummary",
+    "IssueKind", "IssueSource", "Issue", "Report", "TrackSummary", "ListeningSummary",
+    "DeliveryReading",
 ]
 
 
@@ -99,6 +100,48 @@ class TrackSummary(BaseModel):
     rms_dbfs: float | None = None
 
 
+class DeliveryReading(BaseModel):
+    """What an audio-capable model heard in one excerpt (advisory)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    start_ms: int
+    end_ms: int
+    delivery: str = ""
+    pace: str = ""
+    intelligibility: str = ""
+    note: str = ""
+
+
+class ListeningSummary(BaseModel):
+    """The listening layer: what was said and how well it can be followed."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    language: str | None = None
+    language_confidence: float | None = None
+    words: int = 0
+    speech_s: float = 0.0
+    wpm: float | None = None
+    longest_pause_s: float = 0.0
+    mean_word_confidence: float | None = None
+    low_confidence_ratio: float | None = None
+    transcript: str = Field(default="", description="Transcript text (capped).")
+    script_words: int | None = None
+    script_adherence: float | None = None
+    script_wer: float | None = None
+    terms: dict[str, bool] = Field(default_factory=dict)
+    caption_cues: int | None = None
+    caption_matched_ratio: float | None = None
+    caption_median_drift_ms: int | None = None
+    caption_max_cps: float | None = None
+    uncaptioned_speech_s: float | None = None
+    track_languages: dict[str, str] = Field(default_factory=dict)
+    takeaway: str | None = None
+    delivery: list[DeliveryReading] = Field(default_factory=list)
+    understood_by: str | None = None
+
+
 class Report(ReportBase):
     """An audio report: shared fields + the decode/grading-specific surface."""
 
@@ -120,6 +163,8 @@ class Report(ReportBase):
     spec: str | None = Field(default=None, description="Delivery spec the audio was graded against.")
     tracks: list[TrackSummary] = Field(default_factory=list,
                                        description="Per-audio-stream measurements.")
+    listening: ListeningSummary | None = Field(
+        default=None, description="What was said and how well it can be followed (listen()).")
 
     @property
     def artifact_path(self) -> str | None:

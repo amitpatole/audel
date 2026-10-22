@@ -300,3 +300,22 @@ def decode_to_wav(path: Path, settings: Settings, *, sample_rate: int = 16000,
         out.unlink(missing_ok=True)
         raise DecodeError(f"could not decode audio for ASR: {proc.stderr.decode('utf-8', 'replace')[-200:]}")
     return out
+
+
+def excerpt_wav(path: Path, settings: Settings, *, start_s: float, dur_s: float,
+                stream: int = 0, sample_rate: int = 16000) -> Path:
+    """A short, bounded 16 kHz mono WAV excerpt (caller deletes) — what an audio-capable model
+    hears. Duration is clamped to 60 s whatever the caller asks for."""
+    ffmpeg = _tool("ffmpeg", settings.ffmpeg_path)
+    dur = max(0.5, min(60.0, float(dur_s)))
+    fd, name = tempfile.mkstemp(suffix=".wav", prefix="audel-excerpt-")
+    os.close(fd)
+    out = Path(name)
+    argv = [ffmpeg, "-nostdin", "-hide_banner", "-threads", "1", "-ss", f"{max(0.0, start_s):.3f}",
+            "-i", str(path), "-map", f"0:a:{int(stream)}?", "-t", f"{dur:.3f}",
+            "-ar", str(sample_rate), "-ac", "1", "-f", "wav", "-y", str(out)]
+    proc = run(argv, timeout_s=min(60.0, settings.decode_timeout_s))
+    if proc.returncode != 0 or out.stat().st_size == 0:
+        out.unlink(missing_ok=True)
+        raise DecodeError("could not cut an audio excerpt")
+    return out

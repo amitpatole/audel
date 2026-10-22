@@ -89,9 +89,30 @@ class Settings(BaseSettings):
     groq_api_key: str | None = Field(default=None, validation_alias="GROQ_API_KEY")
     assemblyai_api_key: str | None = Field(default=None, validation_alias="ASSEMBLYAI_API_KEY")
 
+    # On-prem / LAN inference (Phase 10): an Ollama server the OPERATOR runs and trusts. Audio and
+    # transcripts sent here never leave the operator's network. ``trusted_backend_hosts`` is the
+    # exact host allowlist that lets a backend URL resolve to a private/loopback address.
+    local_llm_url: str | None = None            # e.g. http://10.0.0.100:11434
+    local_llm_model: str = "gemma4:12b-it-qat"  # an audio-capable model hears the clip itself
+    local_llm_audio: bool = True                # send audio excerpts for delivery/tone listening
+    local_llm_timeout_s: float = 180.0
+    trusted_backend_hosts: list[str] = Field(default_factory=list)
+
     # ASR (local faster-whisper)
     asr_model: str = "base"            # whisper size; pinned name only (no arbitrary download path)
     asr_language: str | None = None    # None = autodetect
+    asr_device: str = "auto"           # auto | cpu | cuda
+    asr_compute_type: str = "auto"     # auto = int8 on CPU, float16 on CUDA
+
+    # Listening (Phase 10): pace, pauses, intelligibility, script adherence, captions.
+    listen_min_wpm: float = 110.0      # narration slower than this reads as dragging
+    listen_max_wpm: float = 190.0      # ... faster than this as rushed
+    listen_max_pause_s: float = 3.0    # a pause this long inside speech = dead air for a listener
+    listen_low_conf: float = 0.45      # word probability under this = hard to make out
+    listen_excerpt_s: float = 30.0     # audio excerpt length sent to an audio-capable model
+    listen_max_excerpts: int = 3       # beginning / middle / end
+    caption_max_cps: float = 20.0      # reading-rate ceiling (characters per second)
+    caption_max_drift_ms: int = 1000   # cue start vs heard speech beyond this = timing fault
 
     # Loudness / DSP grading
     loudness_target: LoudnessTarget = LoudnessTarget.PODCAST
@@ -142,6 +163,9 @@ class Settings(BaseSettings):
     # uses only the server's configured default (a remote caller can't redirect egress or pick a
     # paid model). Loopback/CLI is unaffected. Set e.g. ["local"] to permit explicit offline ASR.
     rest_enabled_backends: list[str] = Field(default_factory=list)
+    # listen(understand=True) over REST sends the transcript (and, for audio-capable models, audio
+    # excerpts) to the server's configured backend. Off by default: the operator decides egress.
+    rest_allow_understand: bool = False
 
     # Workspace
     cache_dir: Path = Field(default_factory=default_cache_dir)
