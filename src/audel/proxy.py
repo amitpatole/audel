@@ -121,16 +121,28 @@ class VettingProxy:
 
 
 async def _pipe(c_r, c_w, u_r, u_w, idle: float) -> None:
+    """Relay both directions. The idle timeout is on COMBINED activity: a direction that is quiet
+    (the client after sending its request) never cuts a connection whose other direction is still
+    flowing (a long response). Only when both sides are silent for ``idle`` is it closed."""
+    import time
+
+    last = {"t": time.monotonic()}
+
     async def copy(src, dst):
         try:
             while True:
-                # Idle timeout: drop a connection that goes silent (slowloris / hung upstream).
-                data = await asyncio.wait_for(src.read(65536), timeout=idle)
+                try:
+                    data = await asyncio.wait_for(src.read(65536), timeout=idle)
+                except TimeoutError:
+                    if time.monotonic() - last["t"] < idle:
+                        continue  # the other direction is active: keep the connection
+                    break  # both sides silent (slowloris / hung upstream)
                 if not data:
                     break
+                last["t"] = time.monotonic()
                 dst.write(data)
                 await dst.drain()
-        except Exception:  # noqa: BLE001 (incl. TimeoutError → close)
+        except Exception:  # noqa: BLE001 (connection errors -> close)
             pass
         finally:
             try:

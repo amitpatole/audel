@@ -647,30 +647,28 @@ def test_body_intake_slots_are_taken_only_when_a_body_is_read():
 
     async def app(scope, receive, send):
         if scope["path"] == "/read":
-            await receive()
-            active["now"] += 1
-            active["max"] = max(active["max"], active["now"])
-            await asyncio.sleep(0.05)
+            first = True
+            while True:
+                m = await receive()
+                if first:
+                    active["now"] += 1
+                    active["max"] = max(active["max"], active["now"])
+                    first = False
+                if m["type"] != "http.request" or not m.get("more_body"):
+                    break
             active["now"] -= 1
         await send({"type": "http.response.start", "status": 200, "headers": []})
         await send({"type": "http.response.body", "body": b""})
 
     mw = _BodyLimit(app, cap=1000, max_concurrent=2)
 
-    async def call(path):
-        async def receive():
-            return {"type": "http.request", "body": b"x", "more_body": False}
-
-        async def send(msg):
-            pass
-
-        await mw({"type": "http", "path": path}, receive, send)
-
     async def scenario():
         # many non-reading requests never touch the intake limit...
-        await asyncio.wait_for(asyncio.gather(*[call("/noread") for _ in range(50)]), 2)
-        # ...and body readers are capped at 2 at a time
-        await asyncio.gather(*[call("/read") for _ in range(8)])
+        await asyncio.wait_for(asyncio.gather(*[_asgi_call(mw, "/noread", [], tenant=f"t{i}")
+                                                for i in range(50)]), 2)
+        # ...and in-progress body reads are capped at 2 at a time (distinct tenants)
+        await asyncio.gather(*[_asgi_call(mw, "/read", [b"x", b"x", b"x"], tenant=f"r{i}",
+                                          delay=0.02) for i in range(8)])
 
     asyncio.run(scenario())
     assert active["max"] <= 2
@@ -939,3 +937,206 @@ def test_og_workflow_keeps_the_write_token_away_from_third_party_code():
     assert commit["permissions"] == {"contents": "write"}
     assert "pip" not in " ".join(str(s) for s in commit["steps"])
     assert "core.hooksPath=/dev/null" in " ".join(str(s) for s in commit["steps"])
+
+
+# ==== round 3, network surface ================================================================
+
+def _asgi_call(mw, path, chunks, tenant="t", delay=0.0):
+    from types import SimpleNamespace
+
+    async def run():
+        it = iter(chunks)
+        sent = {}
+
+        async def receive():
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                body = next(it)
+                return {"type": "http.request", "body": body, "more_body": True}
+            except StopIteration:
+                return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(msg):
+            if msg["type"] == "http.response.start":
+                sent["status"] = msg["status"]
+
+        await mw({"type": "http", "path": path,
+                  "state": {"principal": SimpleNamespace(tenant=tenant)}}, receive, send)
+        return sent.get("status")
+
+    return run()
+
+
+def test_slow_body_gets_408_and_releases_its_intake_slot():
+    from audel.adapters.rest import _BodyLimit
+
+    async def app(scope, receive, send):
+        while True:
+            m = await receive()
+            if m["type"] != "http.request" or not m.get("more_body"):
+                break
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    mw = _BodyLimit(app, cap=10_000_000, max_concurrent=2, read_timeout_s=0.3)
+
+    async def scenario():
+        slow = await _asgi_call(mw, "/check", [b"x"] * 1000, tenant="alice", delay=0.05)
+        assert slow == 408
+        assert mw._intake._value == 2  # slot given back
+        assert await _asgi_call(mw, "/check", [b"y"], tenant="bob") == 200
+
+    asyncio.run(scenario())
+
+
+def test_one_tenant_cannot_take_every_intake_slot():
+    from audel.adapters.rest import _BodyLimit
+
+    gate = asyncio.Event()
+
+    async def app(scope, receive, send):
+        m = await receive()      # first chunk read: slot taken...
+        if m["type"] == "http.disconnect":
+            return               # refused by the intake layer
+        await gate.wait()        # ...and the sender stalls mid-body
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    mw = _BodyLimit(app, cap=10_000_000, max_concurrent=4, read_timeout_s=30)
+
+    async def scenario():
+        alice = [asyncio.create_task(_asgi_call(mw, "/check", [b"x", b"x"], tenant="alice"))
+                 for _ in range(4)]
+        await asyncio.sleep(0.05)
+        refused = [t.result() for t in alice if t.done()]
+        assert refused == [429, 429]  # alice gets at most half the slots
+        bob = asyncio.create_task(_asgi_call(mw, "/check", [b"y", b"y"], tenant="bob"))
+        await asyncio.sleep(0.05)
+        assert mw._intake._value >= 0 and not bob.done()  # bob got a slot (blocked only by app)
+        gate.set()
+        assert await bob == 200
+        await asyncio.gather(*alice)
+
+    asyncio.run(scenario())
+
+
+def test_intake_slot_is_released_once_the_body_is_read():
+    from audel.adapters.rest import _BodyLimit
+
+    seen = {}
+
+    async def app(scope, receive, send):
+        await receive()                     # whole body arrives in one message
+        seen["free"] = mw._intake._value    # before the (long) grading work
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    mw = _BodyLimit(app, cap=1000, max_concurrent=1)
+
+    async def scenario():
+        await _asgi_call(mw, "/check", [], tenant="a")
+
+    asyncio.run(scenario())
+    assert seen["free"] == 1
+
+
+def test_proxy_keeps_a_flowing_response_alive_while_the_request_side_is_quiet():
+    import socket as _socket
+
+    from audel.proxy import VettingProxy
+
+    async def scenario():
+        async def origin(reader, writer):
+            await reader.readuntil(b"\r\n\r\n")
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\n")
+            for _ in range(12):           # 1 byte every 0.1 s: longer than the idle timeout
+                writer.write(b"z")
+                await writer.drain()
+                await asyncio.sleep(0.1)
+            writer.close()
+
+        srv = await asyncio.start_server(origin, "127.0.0.1", 0)
+        port = srv.sockets[0].getsockname()[1]
+        import audel.proxy as pm
+
+        real_vet, real_ports = pm.resolve_safe_ip, pm._ALLOWED_PORTS
+
+        async def allow(host, p):
+            return "127.0.0.1"
+
+        pm.resolve_safe_ip, pm._ALLOWED_PORTS = allow, frozenset({port})
+        p = VettingProxy(idle_timeout_s=0.4)
+        await p.start()
+        try:
+            r, w = await asyncio.open_connection("127.0.0.1", p.port)
+            w.write(f"GET http://127.0.0.1:{port}/a HTTP/1.1\r\nHost: x\r\n\r\n".encode())
+            await w.drain()
+            data = b""
+            while True:
+                chunk = await asyncio.wait_for(r.read(1024), 5)
+                if not chunk:
+                    break
+                data += chunk
+            return data
+        finally:
+            pm.resolve_safe_ip, pm._ALLOWED_PORTS = real_vet, real_ports
+            await p.stop()
+            srv.close()
+
+    assert asyncio.run(scenario()).endswith(b"z" * 12)
+    del _socket
+
+
+def test_incomplete_download_is_refused(tmp_path, monkeypatch):
+    import http.server
+    import threading
+
+    import audel.ingest as ing
+    import audel.proxy as pm
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            self.send_response(200)
+            self.send_header("Content-Length", "100")
+            self.end_headers()
+            self.wfile.write(b"x" * 40)  # then close early
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+    async def allow(host, p):
+        return "127.0.0.1"
+
+    monkeypatch.setattr(pm, "resolve_safe_ip", allow)
+    monkeypatch.setattr(pm, "_ALLOWED_PORTS", frozenset(range(1, 65536)))
+    monkeypatch.setattr(ing, "validate_ingest_url", lambda u, s: None)
+    try:
+        with pytest.raises(UnsafeSourceError):
+            asyncio.run(ing.fetch_to_file(f"http://127.0.0.1:{srv.server_address[1]}/a.wav",
+                                          tmp_path, Settings(allow_url_ingest=True)))
+        assert list(tmp_path.iterdir()) == []
+    finally:
+        srv.shutdown()
+
+
+@requires_ffmpeg
+def test_handoff_never_returns_the_server_path(tmp_path, media):
+    ws = tmp_path / "ws"
+    c = TestClient(build_app(settings=Settings(cache_dir=ws, allow_local_files=False)))
+    with open(media["good"], "rb") as fh:
+        r = c.post("/handoff", files={"file": ("a.wav", fh, "audio/wav")})
+    assert r.status_code == 200
+    assert str(ws) not in r.text and "upload_" not in r.text
+    assert len(r.json()["artifact"]) == 64  # the input's sha256 instead
+
+
+@pytest.mark.parametrize("lang", ["²=es", "١=es", "1234=es"])
+def test_unicode_digit_language_index_is_a_400_not_500(tmp_path, media, lang):
+    c = TestClient(build_app(settings=Settings(cache_dir=tmp_path, allow_local_files=False)))
+    with open(media["good"], "rb") as fh:
+        r = c.post("/listen", files={"file": ("a.wav", fh, "audio/wav")}, data={"language": lang})
+    assert r.status_code == 400

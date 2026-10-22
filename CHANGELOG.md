@@ -95,6 +95,19 @@ All notable changes to Audel are recorded here. The format follows
   - **Deploy.** Helm ingress defaults to the same namespace, DNS egress goes to kube-dns only,
     token, JWKS and TLS mounts are supported, and the default is one replica. The Dockerfile base
     is pinned by digest, and GitHub Actions are pinned to commit SHAs.
+- Red-team round 3 fixes (network and input surface), each pinned by a regression test:
+  - **Medium.** An authenticated slow sender could hold every body-intake slot and block uploads
+    for all tenants. The slot is now released as soon as the body is read. There is a body-read
+    deadline that returns 408 (`AUDEL_BODY_READ_TIMEOUT_S`), and each tenant may hold at most half
+    the intake slots.
+  - **Medium.** The vetting proxy's per-direction idle timeout cut long downloads, and the
+    truncated file was graded. Idleness is now judged on both directions together, and a download
+    shorter than its `Content-Length` is refused.
+  - **Low-Medium.** `/handoff` returned the server path of the upload. It now returns the input's
+    SHA-256.
+  - **Low.** A Unicode digit in a `language` index (`²=es`) caused a 500. It now returns 400.
+  - **Low.** Deleting a running job freed the tenant's share while its work kept running. Running
+    work now has a per-tenant share that is held until the work really ends.
 - Red-team round 3 fixes (auth surface), each pinned by a regression test:
   - **Medium.** Round 2's pre-authentication lockout let one unauthenticated client lock out valid
     users sharing its address. Credentials must now be generated: a shared token must match

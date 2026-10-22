@@ -165,7 +165,8 @@ def build_app(settings: Settings | None = None):
 
     app.add_middleware(_BodyLimit, cap=settings.max_request_bytes,
                        max_concurrent=settings.max_concurrent_uploads
-                       or 2 * settings.max_concurrent_jobs)
+                       or 2 * settings.max_concurrent_jobs,
+                       read_timeout_s=settings.body_read_timeout_s)
 
     def _admin_only(request: Request) -> None:
         """/doctor and /metrics expose server internals and cross-tenant totals: when auth is on,
@@ -179,8 +180,24 @@ def build_app(settings: Settings | None = None):
 
     _work_sem = asyncio.Semaphore(settings.max_concurrent_jobs)
 
-    async def _shielded(coro_factory, timeout: float):
-        return await run_shielded(_work_sem, coro_factory, timeout)
+    _tenant_work: dict[str, asyncio.Semaphore] = {}
+    _tenant_cap = max(1, settings.max_concurrent_jobs // 2)
+
+    async def _shielded(coro_factory, timeout: float, tenant: str | None = None):
+        """Global work slots plus a per-tenant share of them, both held until the work REALLY
+        ends (a cancelled or timed-out request cannot free its tenant's share early)."""
+        if tenant is None:
+            return await run_shielded(_work_sem, coro_factory, timeout)
+        sem = _tenant_work.setdefault(tenant, asyncio.Semaphore(_tenant_cap))
+
+        async def inner():
+            return await run_shielded(_work_sem, coro_factory, None)
+
+        try:
+            return await run_shielded(sem, inner, timeout)
+        finally:
+            if not sem.locked() and getattr(sem, "_value", 0) == _tenant_cap:
+                _tenant_work.pop(tenant, None)
 
     async def _job_slot():
         async with _job_sem:
@@ -229,7 +246,8 @@ def build_app(settings: Settings | None = None):
         langs: dict[int, str] = {}
         for item in items or []:
             idx, sep, code = item.partition("=")
-            if not sep or not idx.strip().isdigit() or len(langs) >= 32:
+            idx = idx.strip()
+            if not sep or not (idx.isascii() and idx.isdigit()) or len(idx) > 3 or len(langs) >= 32:
                 raise HTTPException(status_code=400, detail="language must be TRACK=CODE, e.g. 1=es")
             langs[int(idx)] = code.strip()
         return langs
@@ -313,9 +331,13 @@ def build_app(settings: Settings | None = None):
         status, verdict, n_issues, err = "ok", None, None, None
         try:
             report = await _shielded(lambda: _grade(kind, path, p, gs),
-                                     settings.request_timeout_s)
+                                     settings.request_timeout_s, principal.tenant)
             verdict, n_issues = report.verdict.value, len(report.issues)
-            return report.to_handoff().model_dump(mode="json") if as_handoff else _public(report)
+            if as_handoff:
+                hand = report.to_handoff().model_dump(mode="json")
+                hand["artifact"] = digest  # never the server-side temp path
+                return hand
+            return _public(report)
         except TimeoutError:
             status, err = "timeout", "timeout"
             raise UnsafeSourceError(f"grading exceeded {settings.request_timeout_s:.0f}s") from None
@@ -567,7 +589,7 @@ def build_app(settings: Settings | None = None):
     return app
 
 
-async def run_shielded(sem: asyncio.Semaphore, coro_factory, timeout: float):
+async def run_shielded(sem: asyncio.Semaphore, coro_factory, timeout: float | None):
     """Run grading so its concurrency slot is held until the work REALLY ends.
 
     A request timeout or a job cancel must not free the slot while ffmpeg/ASR threads keep
@@ -590,46 +612,92 @@ async def run_shielded(sem: asyncio.Semaphore, coro_factory, timeout: float):
 
 
 class _BodyLimit:
-    """Pure-ASGI request-body cap, enforced on the STREAM as it is read (chunked uploads
-    included) without buffering the whole body. Past the cap the app's response is replaced by
-    413. Body intake is also concurrency-limited: a request takes an intake slot only when it
-    first reads its body (i.e. after authentication), so total in-flight form memory is bounded
-    and unauthenticated clients cannot occupy slots."""
+    """Pure-ASGI request-body control, enforced on the STREAM as it is read (chunked uploads
+    included), never buffering a whole body:
 
-    def __init__(self, app, cap: int, max_concurrent: int = 8) -> None:
-        self.app, self.cap = app, cap
-        self._intake = asyncio.Semaphore(max(1, max_concurrent))
+    * size cap -> 413;
+    * intake concurrency: a request takes an intake slot only when it first reads its body
+      (i.e. after authentication) and gives it back as soon as the body is fully read, so a
+      request waiting for a grading slot does not hold intake;
+    * per-tenant intake share (at most half the slots) -> 429, so one tenant cannot occupy them all;
+    * body-read deadline -> 408, so a slow sender (slowloris) cannot hold a slot indefinitely.
+    """
+
+    def __init__(self, app, cap: int, max_concurrent: int = 8, read_timeout_s: float = 60.0) -> None:
+        self.app, self.cap, self.read_timeout_s = app, cap, read_timeout_s
+        self._slots = max(1, max_concurrent)
+        self._intake = asyncio.Semaphore(self._slots)
+        self._per_tenant = max(1, self._slots // 2)
+        self._tenant_use: dict[str, int] = {}
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
+        import time as _time
+
         total = 0
-        exceeded = False
+        refusal: tuple[int, bytes] | None = None
         sent_ours = False
         holding = False
+        finished = False
+        tenant: str | None = None
+        deadline = 0.0
+
+        def release() -> None:
+            nonlocal holding
+            if holding:
+                holding = False
+                self._intake.release()
+                if tenant is not None:
+                    left = self._tenant_use.get(tenant, 1) - 1
+                    if left <= 0:
+                        self._tenant_use.pop(tenant, None)
+                    else:
+                        self._tenant_use[tenant] = left
 
         async def recv():
-            nonlocal total, exceeded, holding
+            nonlocal total, refusal, holding, finished, tenant, deadline
+            if refusal is not None or finished:
+                return {"type": "http.disconnect"} if refusal is not None else await receive()
             if not holding:
+                principal = (scope.get("state") or {}).get("principal")
+                tenant = getattr(principal, "tenant", None)
+                if tenant is not None and self._tenant_use.get(tenant, 0) >= self._per_tenant:
+                    refusal = (429, b'{"detail":"Too many uploads in progress for this tenant."}')
+                    return {"type": "http.disconnect"}
                 await self._intake.acquire()
                 holding = True
-            msg = await receive()
+                if tenant is not None:
+                    self._tenant_use[tenant] = self._tenant_use.get(tenant, 0) + 1
+                deadline = _time.monotonic() + self.read_timeout_s
+            try:
+                msg = await asyncio.wait_for(receive(), max(0.01, deadline - _time.monotonic()))
+            except TimeoutError:
+                refusal = (408, b'{"detail":"Request body not received in time."}')
+                release()
+                return {"type": "http.disconnect"}
             if msg.get("type") == "http.request":
                 total += len(msg.get("body", b""))
                 if total > self.cap:
-                    exceeded = True
+                    refusal = (413, b'{"detail":"Request body too large."}')
+                    release()
                     return {"type": "http.disconnect"}
+                if not msg.get("more_body", False):
+                    finished = True
+                    release()  # body fully read: free the intake slot now
+            else:
+                release()
             return msg
 
         async def snd(msg):
             nonlocal sent_ours
-            if not exceeded:
+            if refusal is None:
                 return await send(msg)
             if sent_ours:
                 return None
             sent_ours = True
-            body = b'{"detail":"Request body too large."}'
-            await send({"type": "http.response.start", "status": 413,
+            status, body = refusal
+            await send({"type": "http.response.start", "status": status,
                         "headers": [(b"content-type", b"application/json"),
                                     (b"content-length", str(len(body)).encode())]})
             await send({"type": "http.response.body", "body": body})
@@ -637,12 +705,11 @@ class _BodyLimit:
         try:
             await self.app(scope, recv, snd)
         except Exception:
-            if not exceeded:
+            if refusal is None:
                 raise
         finally:
-            if holding:
-                self._intake.release()
-        if exceeded and not sent_ours:
+            release()
+        if refusal is not None and not sent_ours:
             await snd({"type": "http.response.start"})
 
 

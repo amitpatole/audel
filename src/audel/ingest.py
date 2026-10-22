@@ -117,6 +117,9 @@ def _download(url: str, dest: Path, proxy_url: str, settings: Settings,
                 fh.write(chunk)
     if total == 0:
         raise UnsafeSourceError("remote object is empty")
+    if declared and declared.isdigit() and total != int(declared):
+        # An early close (proxy, network, or a lying server) must not be graded as the file.
+        raise UnsafeSourceError(f"download incomplete: received {total} of {declared} bytes")
     return total
 
 

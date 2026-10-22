@@ -109,6 +109,7 @@ and defaults match the code. A test fails if it goes stale.
 | `AUDEL_REQUEST_TIMEOUT_S` | `180.0` |
 | `AUDEL_MAX_CONCURRENT_JOBS` | `4` |
 | `AUDEL_MAX_CONCURRENT_UPLOADS` | — |
+| `AUDEL_BODY_READ_TIMEOUT_S` | `60.0` |
 | `AUDEL_MAX_QUEUED_JOBS` | `64` |
 | `AUDEL_MAX_STORED_JOBS` | `1000` |
 | `AUDEL_MAX_QUEUED_JOBS_PER_TENANT` | — |
