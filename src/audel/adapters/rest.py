@@ -48,6 +48,8 @@ except ImportError:  # pragma: no cover - only without the [serve] extra
 log = get_logger("rest")
 _LOOPBACK = {"127.0.0.1", "::1", "localhost", "0:0:0:0:0:0:0:1"}
 _KINDS = ("check", "listen", "analyze")
+_HEAVY_ROUTES = frozenset({"/check", "/analyze", "/listen", "/render", "/handoff", "/jobs",
+                           "/watch"})
 _MAX_LIST_ITEMS = 200
 _MAX_ITEM_CHARS = 2000
 _REQUEST_ID_OK = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.")
@@ -125,6 +127,10 @@ def build_app(settings: Settings | None = None):
     app = FastAPI(title="Audel", version=__version__,
                   openapi_url=(None if auth.required else "/openapi.json"))
 
+    inflight: dict[str, int] = {}
+    cap_tenant = settings.max_inflight_per_tenant or max(2, settings.max_concurrent_jobs)
+    cap_total = settings.max_inflight_total or 4 * settings.max_concurrent_jobs
+
     @app.middleware("http")
     async def _gate(request: Request, call_next):
         rid = _request_id(request.headers.get("x-request-id"))
@@ -160,8 +166,23 @@ def build_app(settings: Settings | None = None):
         cl = request.headers.get("content-length")
         if cl and cl.isdigit() and int(cl) > settings.max_request_bytes:
             return reply(JSONResponse({"detail": "Request body too large."}, status_code=413))
-        # The streamed body is capped by _BodyLimit (no whole-body buffering in memory).
-        return reply(await call_next(request))
+        if request.method != "POST" or request.url.path not in _HEAVY_ROUTES:
+            return reply(await call_next(request))
+        # Admission BEFORE the body is read: in-flight grading requests are capped per tenant and
+        # overall, so queued uploads cannot pile up (memory / temp space) behind busy workers.
+        t = principal.tenant
+        if inflight.get(t, 0) >= cap_tenant or sum(inflight.values()) >= cap_total:
+            return reply(JSONResponse({"detail": "Too many requests in progress."},
+                                      status_code=429, headers={"Retry-After": "10"}))
+        inflight[t] = inflight.get(t, 0) + 1
+        try:
+            return reply(await call_next(request))
+        finally:
+            left = inflight.get(t, 1) - 1
+            if left <= 0:
+                inflight.pop(t, None)
+            else:
+                inflight[t] = left
 
     app.add_middleware(_BodyLimit, cap=settings.max_request_bytes,
                        max_concurrent=settings.max_concurrent_uploads
@@ -180,32 +201,51 @@ def build_app(settings: Settings | None = None):
 
     _work_sem = asyncio.Semaphore(settings.max_concurrent_jobs)
 
-    _tenant_work: dict[str, asyncio.Semaphore] = {}
-    _tenant_cap = max(1, settings.max_concurrent_jobs // 2)
+    _tenant_work = TenantSemaphores(max(1, settings.max_concurrent_jobs // 2))
+    _tenant_jobs = TenantSemaphores(max(1, settings.max_concurrent_jobs // 2))
 
     async def _shielded(coro_factory, timeout: float, tenant: str | None = None):
         """Global work slots plus a per-tenant share of them, both held until the work REALLY
         ends (a cancelled or timed-out request cannot free its tenant's share early)."""
         if tenant is None:
             return await run_shielded(_work_sem, coro_factory, timeout)
-        sem = _tenant_work.setdefault(tenant, asyncio.Semaphore(_tenant_cap))
+        sem = _tenant_work.get(tenant)
 
         async def inner():
             return await run_shielded(_work_sem, coro_factory, None)
 
-        try:
-            return await run_shielded(sem, inner, timeout)
-        finally:
-            if not sem.locked() and getattr(sem, "_value", 0) == _tenant_cap:
-                _tenant_work.pop(tenant, None)
+        task = asyncio.ensure_future(run_shielded(sem, inner, None))
+        task.add_done_callback(lambda _t: _tenant_work.done(tenant))  # cleanup when work ENDS
+        return await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
 
-    async def _job_slot():
-        async with _job_sem:
-            metrics.inflight += 1
+    async def _job_slot(request: Request):
+        """A grading slot: the tenant's share FIRST, then a global slot, each with a bounded wait
+        (429). Taking the global slot first would let one tenant's surplus requests hold global
+        slots while queued on their own share."""
+        tenant = _principal(request).tenant
+        tsem = _tenant_jobs.get(tenant)
+        try:
             try:
-                yield
+                await asyncio.wait_for(tsem.acquire(), timeout=settings.queue_wait_s)
+            except TimeoutError:
+                raise HTTPException(status_code=429, detail="Too many requests in progress.",
+                                    headers={"Retry-After": "30"}) from None
+            try:
+                try:
+                    await asyncio.wait_for(_job_sem.acquire(), timeout=settings.queue_wait_s)
+                except TimeoutError:
+                    raise HTTPException(status_code=429, detail="Server busy; retry later.",
+                                        headers={"Retry-After": "30"}) from None
+                metrics.inflight += 1
+                try:
+                    yield
+                finally:
+                    metrics.inflight -= 1
+                    _job_sem.release()
             finally:
-                metrics.inflight -= 1
+                tsem.release()
+        finally:
+            _tenant_jobs.done(tenant)
 
     def _http_error(e: Exception) -> HTTPException:
         if isinstance(e, (ConfigError, UnsafeSourceError)):
@@ -449,7 +489,7 @@ def build_app(settings: Settings | None = None):
             path, src, host = await _acquire(file, url)
             digest, size = await asyncio.to_thread(_sha256, path)
             rr = await _shielded(lambda: render(str(path), settings=grade_settings),
-                                 settings.request_timeout_s)
+                                 settings.request_timeout_s, _principal(request).tenant)
             return {"duration_ms": rr.duration_ms, "channels": rr.channels,
                     "sample_rate": rr.sample_rate, "codec": rr.codec, "has_audio": rr.has_audio,
                     "integrated_lufs": rr.integrated_lufs, "true_peak_dbtp": rr.true_peak_dbtp,
@@ -589,6 +629,30 @@ def build_app(settings: Settings | None = None):
     return app
 
 
+class TenantSemaphores:
+    """Per-tenant semaphores that remove themselves when idle (bounded by active tenants)."""
+
+    def __init__(self, cap: int) -> None:
+        self.cap = max(1, cap)
+        self._sems: dict[str, asyncio.Semaphore] = {}
+        self._users: dict[str, int] = {}
+
+    def get(self, tenant: str) -> asyncio.Semaphore:
+        self._users[tenant] = self._users.get(tenant, 0) + 1
+        return self._sems.setdefault(tenant, asyncio.Semaphore(self.cap))
+
+    def done(self, tenant: str) -> None:
+        left = self._users.get(tenant, 1) - 1
+        if left <= 0:
+            self._users.pop(tenant, None)
+            self._sems.pop(tenant, None)
+        else:
+            self._users[tenant] = left
+
+    def __len__(self) -> int:
+        return len(self._sems)
+
+
 async def run_shielded(sem: asyncio.Semaphore, coro_factory, timeout: float | None):
     """Run grading so its concurrency slot is held until the work REALLY ends.
 
@@ -648,7 +712,7 @@ class _BodyLimit:
             if holding:
                 holding = False
                 self._intake.release()
-                if tenant is not None:
+                if tenant is not None:  # the reservation taken before acquire
                     left = self._tenant_use.get(tenant, 1) - 1
                     if left <= 0:
                         self._tenant_use.pop(tenant, None)
@@ -665,11 +729,30 @@ class _BodyLimit:
                 if tenant is not None and self._tenant_use.get(tenant, 0) >= self._per_tenant:
                     refusal = (429, b'{"detail":"Too many uploads in progress for this tenant."}')
                     return {"type": "http.disconnect"}
-                await self._intake.acquire()
-                holding = True
+                # Reserve the tenant's share BEFORE waiting, so concurrent requests of one tenant
+                # cannot all pass the check while intake is momentarily full.
                 if tenant is not None:
                     self._tenant_use[tenant] = self._tenant_use.get(tenant, 0) + 1
                 deadline = _time.monotonic() + self.read_timeout_s
+                def unreserve() -> None:
+                    if tenant is not None:
+                        left = self._tenant_use.get(tenant, 1) - 1
+                        if left <= 0:
+                            self._tenant_use.pop(tenant, None)
+                        else:
+                            self._tenant_use[tenant] = left
+
+                try:
+                    await asyncio.wait_for(self._intake.acquire(),
+                                           max(0.01, deadline - _time.monotonic()))
+                except TimeoutError:
+                    unreserve()
+                    refusal = (408, b'{"detail":"Request body not received in time."}')
+                    return {"type": "http.disconnect"}
+                except BaseException:
+                    unreserve()
+                    raise
+                holding = True
             try:
                 msg = await asyncio.wait_for(receive(), max(0.01, deadline - _time.monotonic()))
             except TimeoutError:

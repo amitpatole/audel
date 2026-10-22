@@ -95,6 +95,21 @@ All notable changes to Audel are recorded here. The format follows
   - **Deploy.** Helm ingress defaults to the same namespace, DNS egress goes to kube-dns only,
     token, JWKS and TLS mounts are supported, and the default is one replica. The Dockerfile base
     is pinned by digest, and GitHub Actions are pinned to commit SHAs.
+- Red-team round 4 fixes (network and input surface), each pinned by a regression test:
+  - **Medium.** A trickling upstream defeated the ingest deadline and leaked download threads from
+    the shared executor, which stopped grading for every tenant. Each receive is now bounded by the
+    time remaining, the vetting proxy has an absolute connection lifetime and cancels live
+    connections on stop, and downloads run in their own small pool.
+  - **Medium.** The global grading slot was taken before the per-tenant share, so one tenant could
+    starve others. The tenant's share is now taken first, and each wait is bounded, returning 429
+    (`AUDEL_QUEUE_WAIT_S`).
+  - **Medium.** Requests waiting for a slot held their parsed uploads in temp storage without
+    limit. Grading requests are now admitted before their bodies are read, with caps per tenant and
+    overall (`AUDEL_MAX_INFLIGHT_PER_TENANT`, `AUDEL_MAX_INFLIGHT_TOTAL`).
+  - **Low-Medium.** `/render` skipped the per-tenant work share. It now applies.
+  - **Low-Medium.** The per-tenant intake check raced its semaphore. The share is now reserved
+    before waiting.
+  - **Low.** Per-tenant semaphore maps now clean themselves up when idle.
 - Red-team round 4 fixes (auth surface), each pinned by a regression test:
   - **Medium.** The shape-based token check accepted chosen secrets, such as sentences or a hash of
     "password", and tenant-file hashes could not be checked at all, so guessing was bounded only by

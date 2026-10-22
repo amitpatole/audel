@@ -1322,3 +1322,151 @@ def test_helm_mutual_tls_values_are_strict(value, ok):
         assert r.returncode == 0 and "AUDEL_TLS_CLIENT_CA" in r.stdout
     else:
         assert r.returncode != 0
+
+
+# ==== round 4, network surface ================================================================
+
+def test_trickling_upstream_cannot_outlive_the_ingest_deadline(tmp_path, monkeypatch):
+    import threading
+
+    import audel.ingest as ing
+    import audel.proxy as pm
+
+    stop_srv = threading.Event()
+
+    class H(__import__("http.server").server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            self.send_response(200)
+            self.send_header("Content-Length", "1000000")
+            self.end_headers()
+            while not stop_srv.is_set():
+                try:
+                    self.wfile.write(b"x")
+                    self.wfile.flush()
+                except OSError:
+                    return
+                time.sleep(0.3)   # one byte every 0.3 s: always "active", never finished
+
+        def log_message(self, *a):
+            pass
+
+    srv = __import__("http.server").server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+    async def allow(host, p):
+        return "127.0.0.1"
+
+    monkeypatch.setattr(pm, "resolve_safe_ip", allow)
+    monkeypatch.setattr(pm, "_ALLOWED_PORTS", frozenset(range(1, 65536)))
+    monkeypatch.setattr(ing, "validate_ingest_url", lambda u, s: None)
+    s = Settings(allow_url_ingest=True, ingest_timeout_s=2, proxy_idle_timeout_s=1)
+    t0 = time.monotonic()
+    try:
+        with pytest.raises(UnsafeSourceError):
+            asyncio.run(ing.fetch_to_file(f"http://127.0.0.1:{srv.server_address[1]}/a.wav",
+                                          tmp_path, s))
+        assert time.monotonic() - t0 < 12
+        time.sleep(1.0)
+        stuck = [t for t in threading.enumerate() if t.name.startswith("audel-ingest") and
+                 t.is_alive() and getattr(t, "_target", None) is not None]
+        assert list(tmp_path.iterdir()) == []
+        del stuck
+    finally:
+        stop_srv.set()
+        srv.shutdown()
+
+
+@requires_ffmpeg
+def test_one_tenant_cannot_starve_another_of_grading_slots(tmp_path, media, monkeypatch):
+    import threading
+
+    import audel.core as core_pkg
+
+    async def slow_check(path, **kw):
+        await asyncio.sleep(1.0)
+        from audel.models import Report, Verdict
+
+        return Report(verdict=Verdict.PASS, summary="ok")
+
+    monkeypatch.setattr(core_pkg, "check", slow_check)
+    a, b = A_TOK, SHARED
+    f = tmp_path / "t.json"
+    f.write_text(json.dumps({"tenants": {"alpha": {"sha256": token_hash(a)}}}))
+    s = Settings(cache_dir=tmp_path / "ws", allow_local_files=False, api_token=b,
+                 api_tokens_file=f, max_concurrent_jobs=4, max_inflight_per_tenant=20,
+                 max_inflight_total=40)
+    body = media["good"].read_bytes()
+    with TestClient(build_app(settings=s)) as c:
+        def hit(tok, out):
+            r = c.post("/check", headers={"authorization": f"Bearer {tok}"},
+                       files={"file": ("a.wav", body, "audio/wav")})
+            out.append(r.status_code)
+
+        alpha_out: list = []
+        alpha = [threading.Thread(target=hit, args=(a, alpha_out)) for _ in range(10)]
+        for t in alpha:
+            t.start()
+        time.sleep(0.3)
+        t0 = time.monotonic()
+        bravo_out: list = []
+        hit(b, bravo_out)
+        bravo_s = time.monotonic() - t0
+        for t in alpha:
+            t.join()
+    assert bravo_out == [200] and bravo_s < 3.0, bravo_s   # was ~5 s+ with global-first slots
+
+
+@requires_ffmpeg
+def test_grading_requests_are_admitted_before_their_bodies_are_read(tmp_path, media, monkeypatch):
+    import threading
+
+    import audel.core as core_pkg
+
+    async def slow_check(path, **kw):
+        await asyncio.sleep(1.0)
+        from audel.models import Report, Verdict
+
+        return Report(verdict=Verdict.PASS, summary="ok")
+
+    monkeypatch.setattr(core_pkg, "check", slow_check)
+    s = Settings(cache_dir=tmp_path, allow_local_files=False, max_inflight_per_tenant=1)
+    body = media["good"].read_bytes()
+    with TestClient(build_app(settings=s)) as c:
+        first: list = []
+        th = threading.Thread(target=lambda: first.append(c.post(
+            "/check", files={"file": ("a.wav", body, "audio/wav")}).status_code))
+        th.start()
+        time.sleep(0.3)
+        r = c.post("/check", files={"file": ("a.wav", body, "audio/wav")})
+        th.join()
+    assert first == [200] and r.status_code == 429
+
+
+def test_intake_reservation_is_taken_before_waiting():
+    from audel.adapters.rest import _BodyLimit
+
+    gate = asyncio.Event()
+
+    async def app(scope, receive, send):
+        m = await receive()
+        if m["type"] == "http.disconnect":
+            return
+        await gate.wait()
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    mw = _BodyLimit(app, cap=10_000, max_concurrent=4, read_timeout_s=5)
+
+    async def scenario():
+        others = [asyncio.create_task(_asgi_call(mw, "/check", [b"o", b"o"], tenant=f"o{i}"))
+                  for i in range(4)]   # intake momentarily full
+        await asyncio.sleep(0.05)
+        alpha = [asyncio.create_task(_asgi_call(mw, "/check", [b"a", b"a"], tenant="alpha"))
+                 for _ in range(6)]
+        await asyncio.sleep(0.05)
+        refused = [t.result() for t in alpha if t.done()]
+        assert refused.count(429) == 4   # only alpha's share (2 of 4) may queue
+        gate.set()
+        await asyncio.gather(*others, *alpha)
+
+    asyncio.run(scenario())

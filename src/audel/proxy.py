@@ -23,13 +23,15 @@ _ALLOWED_PORTS = frozenset({80, 443})  # web ports only: no tunnelling to arbitr
 
 class VettingProxy:
     def __init__(self, host: str = "127.0.0.1", *, max_connections: int = 64,
-                 idle_timeout_s: float = 30.0):
+                 idle_timeout_s: float = 30.0, max_lifetime_s: float = 600.0):
         self._host = host
         self._server: asyncio.AbstractServer | None = None
         self.port: int = 0
         self._max_conn = max_connections
         self._idle = idle_timeout_s
+        self._lifetime = max_lifetime_s  # absolute cap per connection, however active it is
         self._active = 0  # in-flight connections (single-threaded asyncio → no lock needed)
+        self._tasks: set[asyncio.Task] = set()
 
     async def start(self) -> None:
         self._server = await asyncio.start_server(self._handle, self._host, 0)
@@ -38,18 +40,30 @@ class VettingProxy:
     async def stop(self) -> None:
         if self._server is not None:
             self._server.close()
+            # Live connections are cancelled, not waited on: a trickling upstream must not be
+            # able to hold the proxy (and its caller) open past the caller's own deadline.
+            for t in list(self._tasks):
+                t.cancel()
             try:
-                await self._server.wait_closed()
+                await asyncio.wait_for(self._server.wait_closed(), timeout=2)
             except Exception:  # noqa: BLE001
                 pass
             self._server = None
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         self._active += 1
+        task = asyncio.current_task()
+        if task is not None:
+            self._tasks.add(task)
         try:
-            await self._dispatch(reader, writer)
+            await asyncio.wait_for(self._dispatch(reader, writer), timeout=self._lifetime)
+        except (TimeoutError, asyncio.CancelledError):
+            pass
         finally:
             self._active -= 1
+            if task is not None:
+                self._tasks.discard(task)
+            await _close(writer)
 
     async def _dispatch(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:

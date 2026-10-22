@@ -88,6 +88,25 @@ class _SafeRedirect(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
+def open_private(dest: Path):
+    fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    return os.fdopen(fd, "wb")
+
+
+# Downloads get their OWN small pool: a stuck fetch can never occupy the default executor that
+# decoding, hashing and ASR use for every tenant.
+_DOWNLOAD_POOL = None
+
+
+def _pool():
+    global _DOWNLOAD_POOL
+    if _DOWNLOAD_POOL is None:
+        from concurrent.futures import ThreadPoolExecutor
+
+        _DOWNLOAD_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="audel-ingest")
+    return _DOWNLOAD_POOL
+
+
 def _download(url: str, dest: Path, proxy_url: str, settings: Settings,
               stop: threading.Event | None = None) -> int:
     opener = urllib.request.build_opener(
@@ -101,14 +120,28 @@ def _download(url: str, dest: Path, proxy_url: str, settings: Settings,
         declared = resp.headers.get("Content-Length")
         if declared and declared.isdigit() and int(declared) > cap:
             raise UnsafeSourceError(f"remote object is {declared} bytes, over the {cap}-byte cap")
-        fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
-        with os.fdopen(fd, "wb") as fh:
+        sock = getattr(getattr(resp.fp, "raw", None), "_sock", None)
+        with open_private(dest) as fh:
             while True:
-                if time.monotonic() > deadline:
+                left = deadline - time.monotonic()
+                if left <= 0:
                     raise UnsafeSourceError("download exceeded the ingest time limit")
                 if stop is not None and stop.is_set():
                     raise UnsafeSourceError("download cancelled")
-                chunk = resp.read(_CHUNK)
+                if resp.isclosed():
+                    break  # the whole declared body has been read
+                if sock is not None:
+                    # Each receive is bounded by the TIME REMAINING, not reset per byte, and
+                    # read1 returns whatever arrived, so a trickling server cannot stall the
+                    # deadline check inside one large read.
+                    try:
+                        sock.settimeout(min(30.0, max(0.05, left)))
+                    except OSError:
+                        pass
+                try:
+                    chunk = resp.read1(_CHUNK)
+                except TimeoutError:
+                    continue
                 if not chunk:
                     break
                 total += len(chunk)
@@ -131,13 +164,15 @@ async def fetch_to_file(url: str, tmp_dir: Path, settings: Settings) -> Path:
     suffix = media_suffix(urlsplit(url).path)
     dest = Path(tmp_dir) / f"ingest_{uuid.uuid4().hex[:16]}{suffix}"
     proxy = VettingProxy(max_connections=settings.proxy_max_connections,
-                         idle_timeout_s=settings.proxy_idle_timeout_s)
+                         idle_timeout_s=settings.proxy_idle_timeout_s,
+                         max_lifetime_s=settings.ingest_timeout_s + 5)
     await proxy.start()
     stop = threading.Event()
     try:
+        loop = asyncio.get_running_loop()
         await asyncio.wait_for(
-            asyncio.to_thread(_download, url, dest, f"http://127.0.0.1:{proxy.port}", settings,
-                              stop),
+            loop.run_in_executor(_pool(), _download, url, dest,
+                                 f"http://127.0.0.1:{proxy.port}", settings, stop),
             timeout=settings.ingest_timeout_s + 5)
     except UnsafeSourceError:
         dest.unlink(missing_ok=True)
