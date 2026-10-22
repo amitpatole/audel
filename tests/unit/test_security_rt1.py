@@ -1140,3 +1140,122 @@ def test_unicode_digit_language_index_is_a_400_not_500(tmp_path, media, lang):
     with open(media["good"], "rb") as fh:
         r = c.post("/listen", files={"file": ("a.wav", fh, "audio/wav")}, data={"language": lang})
     assert r.status_code == 400
+
+
+# ==== round 3, decode surface =================================================================
+
+def _ff(*args):
+    subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-y", *map(str, args)], check=True)
+
+
+@requires_ffmpeg
+def test_mid_stream_format_switch_is_refused_not_resampled(tmp_path):
+    from audel import check
+
+    a, b, out = tmp_path / "a.mp3", tmp_path / "b.mp3", tmp_path / "switch.mp3"
+    _ff("-f", "lavfi", "-i", "sine=f=1000:d=6:r=8000", "-ac", "1", "-ar", "8000", a)
+    _ff("-f", "lavfi", "-i", "aevalsrc=0.3*sin(2*PI*1000*t)+0.95*sin(2*PI*12000*t)|0:d=20:s=48000", b)
+    out.write_bytes(a.read_bytes() + b.read_bytes())
+    alone = asyncio.run(check(str(b)))
+    switched = asyncio.run(check(str(out)))
+    assert alone.verdict.value == "fail"
+    assert switched.verdict.value == "fail"  # never graded as the first segment's format
+
+
+@requires_ffmpeg
+def test_non_default_layouts_keep_their_channel_order(tmp_path):
+    from audel import check
+
+    ok, dead = tmp_path / "quad_ok.wav", tmp_path / "quad_dead_br.wav"
+    ch = "|".join(f"0.2*sin(2*PI*{300 + 100 * i}*t)" for i in range(4))
+    _ff("-f", "lavfi", "-i", f"aevalsrc={ch}:c=quad:d=6:s=48000", ok)
+    ch_dead = "|".join([f"0.2*sin(2*PI*{300 + 100 * i}*t)" for i in range(3)] + ["0"])
+    _ff("-f", "lavfi", "-i", f"aevalsrc={ch_dead}:c=quad:d=6:s=48000", dead)
+    r_ok, r_dead = asyncio.run(check(str(ok))), asyncio.run(check(str(dead)))
+    assert not [i for i in r_ok.issues if i.detail.get("check") == "dead_channel"]
+    dead_ch = [i.detail.get("channel") for i in r_dead.issues
+               if i.detail.get("check") == "dead_channel"]
+    assert dead_ch == ["BR"]
+
+
+@requires_ffmpeg
+def test_unordered_many_channel_audio_is_graded_not_aborted(tmp_path):
+    from audel import check
+
+    f = tmp_path / "c9.wav"
+    _ff("-f", "lavfi", "-i", "aevalsrc=" + "|".join(["0.2*sin(2*PI*700*t)"] * 9) + ":d=4:s=48000", f)
+    r = asyncio.run(check(str(f)))
+    assert r.tracks and r.tracks[0].channels == 9
+    assert "decode_error" not in {i.detail.get("check") for i in r.issues}
+
+
+def test_layout_argument_rules():
+    from audel.mediaguard import channel_layout_arg
+
+    assert channel_layout_arg("quad", 4) == "quad"
+    assert channel_layout_arg("7.1(wide)", 8) == "7.1(wide)"
+    assert channel_layout_arg("unknown", 9).startswith("USR0+") and \
+        channel_layout_arg("unknown", 9).count("+") == 8
+    assert channel_layout_arg("", 2) == "stereo"
+    assert channel_layout_arg("stereo", 6) != "stereo"          # count mismatch is not trusted
+    assert channel_layout_arg("x;rm -rf", 2) == "stereo"         # odd strings never pass through
+
+
+def _lying_mp3(tmp_path, real_s=30):
+    head, tail, out = tmp_path / "h.mp3", tmp_path / "t.mp3", tmp_path / "lie.mp3"
+    _ff("-f", "lavfi", "-i", "sine=f=440:d=2:r=22050", "-ac", "1", "-ar", "22050",
+        "-b:a", "128k", "-write_xing", "0", head)
+    _ff("-f", "lavfi", "-i", f"anoisesrc=d={real_s}:a=0.3:r=22050", "-ac", "1", "-ar", "22050",
+        "-b:a", "8k", "-write_xing", "0", tail)
+    out.write_bytes(head.read_bytes() + tail.read_bytes())
+    return out
+
+
+@requires_ffmpeg
+def test_duration_lie_is_graded_on_the_decoded_audio(tmp_path):
+    from audel import check
+
+    f = _lying_mp3(tmp_path)
+    r = asyncio.run(check(str(f)))
+    mism = [i for i in r.issues if i.detail.get("check") == "duration_mismatch"]
+    assert mism and mism[0].detail["decoded_s"] > 25
+    assert r.duration_ms and r.duration_ms > 25_000
+
+
+@requires_ffmpeg
+def test_audio_reaching_the_duration_cap_fails_closed(tmp_path):
+    from audel import check
+
+    f = _lying_mp3(tmp_path, real_s=30)
+    r = asyncio.run(check(str(f), settings=Settings(max_duration_s=20)))
+    assert r.verdict.value == "fail" and r.issues[0].kind.value == "decode_error"
+
+
+@requires_ffmpeg
+def test_unknown_duration_counts_as_the_maximum_for_budgets(tmp_path):
+    a = tmp_path / "a.wav"
+    _ff("-f", "lavfi", "-i", "sine=d=3", a)
+    mkv = tmp_path / "nodur.mkv"
+    with open(mkv, "wb") as fh:
+        subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-i", str(a), "-i", str(a),
+                        "-map", "0:a", "-map", "1:a", "-c:a", "flac", "-f", "matroska", "-"],
+                       stdout=fh, check=True)
+    s = Settings(max_duration_s=60, max_total_audio_s=100)
+    info_dur = None
+    try:
+        info_dur = probe(validate_source(mkv, Settings()), Settings()).duration_s
+    except UnsafeSourceError:
+        pass
+    if info_dur and info_dur > 0:
+        pytest.skip("this ffmpeg recovered a duration from the piped file")
+    with pytest.raises(UnsafeSourceError, match="budget"):
+        probe(validate_source(mkv, s), s)
+
+
+@requires_ffmpeg
+def test_one_deadline_bounds_the_whole_file(tmp_path, media):
+    from audel import check
+
+    r = asyncio.run(check(str(media["good"]), settings=Settings(
+        decode_timeout_s=0.5, decode_timeout_per_audio_s=0.0)))
+    assert r.verdict.value == "fail"  # budget exhausted -> refused, never unbounded

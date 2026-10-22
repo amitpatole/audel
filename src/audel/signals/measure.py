@@ -20,7 +20,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from ..config import Settings
-from ..errors import AudelError
+from ..errors import AudelError, UnsafeSourceError
 from ..mediaguard import MediaInfo, StreamInfo, _tool, pass_timeout, pcm_pipeline
 from ..signals._parse import (
     parse_astats,
@@ -64,6 +64,7 @@ class TrackMeasurements:
     series_total: list[float] = field(default_factory=list)
     series_50: list[float] = field(default_factory=list)
     series_60: list[float] = field(default_factory=list)
+    decoded_s: float = 0.0                   # audio actually decoded (last loudness frame)
     dialogue_lufs: float | None = None       # speech-gated integrated loudness, when computed
     dialogue_coverage: float | None = None   # fraction of the programme that is speech
 
@@ -83,6 +84,7 @@ class Measurements:
     tail_rms_dbfs: float | None = None
     silences: list[tuple[float, float]] = field(default_factory=list)  # (start_s, end_s)
     tracks: list[TrackMeasurements] = field(default_factory=list)
+    declared_s: float | None = None          # set when the container's duration was wrong
 
 
 def _rate(st: StreamInfo) -> int:
@@ -90,15 +92,23 @@ def _rate(st: StreamInfo) -> int:
 
 
 def _pipe(path, st: StreamInfo, settings: Settings, analysis: list[str], dur_s: float, *,
-          pre_input: list[str] | None = None, verbose: bool = False) -> str:
+          pre_input: list[str] | None = None, verbose: bool = False,
+          deadline: float | None = None) -> str:
+    import time
+
+    timeout = pass_timeout(settings, dur_s)
+    if deadline is not None:
+        left = deadline - time.monotonic()
+        if left <= 1:
+            raise UnsafeSourceError("analysis exceeded the per-file time budget")
+        timeout = min(timeout, left)
     return pcm_pipeline(path, settings, stream=st.index, channels=st.channels or 1,
                         sample_rate=_rate(st), layout=st.layout, analysis=analysis,
-                        timeout_s=pass_timeout(settings, dur_s), pre_input=pre_input,
-                        verbose=verbose)
+                        timeout_s=timeout, pre_input=pre_input, verbose=verbose)
 
 
 def _main_pass(ffmpeg: str, path, idx: int, st: StreamInfo, settings: Settings,
-               dur_s: float = 0.0) -> TrackMeasurements:
+               dur_s: float = 0.0, deadline: float | None = None) -> TrackMeasurements:
     af = (
         "ebur128=peak=true:framelog=verbose,"
         "astats=metadata=0:measure_perchannel=Peak_level+RMS_level+DC_offset"
@@ -107,12 +117,18 @@ def _main_pass(ffmpeg: str, path, idx: int, st: StreamInfo, settings: Settings,
     )
     # The untrusted file is decoded in a separate process; this analysis sees raw PCM only, so
     # container metadata can never appear in the text parsed below.
-    err = _pipe(path, st, settings, ["-af", af, "-f", "null", "-"], dur_s, verbose=True)
+    err = _pipe(path, st, settings, ["-af", af, "-f", "null", "-"], dur_s, verbose=True,
+                deadline=deadline)
 
     tm = TrackMeasurements(stream=st)
     eb = parse_ebur128(err)
     tm.integrated_lufs, tm.lra, tm.true_peak_dbtp = eb.get("I"), eb.get("LRA"), eb.get("true_peak")
     tm.frames = parse_frames(err)
+    tm.decoded_s = max((f[0] for f in tm.frames), default=0.0)
+    if tm.decoded_s >= settings.max_duration_s - 0.5:
+        # Decoding reached the cap: audio beyond it would go unmeasured. Fail closed.
+        raise UnsafeSourceError(
+            f"audio decodes to at least {settings.max_duration_s:.0f}s, the maximum duration")
     sections = parse_astats_sections(err)
     if sections:
         sec = sections[min(sections)]
@@ -133,7 +149,7 @@ def _main_pass(ffmpeg: str, path, idx: int, st: StreamInfo, settings: Settings,
 
 
 def _spectral_pass(ffmpeg: str, path, idx: int, tm: TrackMeasurements, settings: Settings,
-                   dur_s: float = 0.0) -> None:
+                   dur_s: float = 0.0, deadline: float | None = None) -> None:
     n = _SERIES_RATE // SERIES_HZ
     series = ("astats=metadata=1:reset=1:measure_perchannel=none:measure_overall=RMS_level,"
               "ametadata=mode=print:key=lavfi.astats.Overall.RMS_level")
@@ -156,7 +172,9 @@ def _spectral_pass(ffmpeg: str, path, idx: int, tm: TrackMeasurements, settings:
     for o in outs:
         analysis += ["-map", o, "-f", "null", "-"]
     try:
-        err = _pipe(path, tm.stream, settings, analysis, dur_s)
+        err = _pipe(path, tm.stream, settings, analysis, dur_s, deadline=deadline)
+    except UnsafeSourceError:
+        raise
     except AudelError:
         return  # best-effort: the main pass already graded the essentials
     ser = parse_metadata_series(err)
@@ -171,24 +189,30 @@ def _spectral_pass(ffmpeg: str, path, idx: int, tm: TrackMeasurements, settings:
                 tm.mid_rms_dbfs, tm.side_rms_dbfs = chans[0].get("rms"), chans[1].get("rms")
 
 
-def _tail_pass(ffmpeg: str, path, idx: int, tm: TrackMeasurements, settings: Settings) -> None:
-    # Truncation cue: RMS of the final 250 ms. A clip that ends loud (no trailing decay/silence)
-    # is a likely mid-word cut. Bounded pass via -sseof on the decoding side.
+def _tail_pass(ffmpeg: str, path, idx: int, tm: TrackMeasurements, settings: Settings,
+               deadline: float | None = None) -> None:
+    # Truncation cue: RMS of the final 250 ms of the DECODED audio (not the container's claimed
+    # end, which a file can misstate). A clip that ends loud is a likely mid-word cut.
+    seek = (["-ss", f"{max(0.0, tm.decoded_s - 0.25):.3f}"] if tm.decoded_s > 0
+            else ["-sseof", "-0.25"])
     try:
         err = _pipe(path, tm.stream, settings,
                     ["-af", "astats=metadata=0:measure_overall=RMS_level:measure_perchannel=none",
-                     "-f", "null", "-"], 1.0, pre_input=["-sseof", "-0.25"])
+                     "-f", "null", "-"], 1.0, pre_input=seek, deadline=deadline)
+    except UnsafeSourceError:
+        raise
     except AudelError:
         return
     tm.tail_rms_dbfs = parse_astats(err).get("rms")
 
 
-def measure_track(path, st: StreamInfo, settings: Settings, dur_s: float = 0.0) -> TrackMeasurements:
+def measure_track(path, st: StreamInfo, settings: Settings, dur_s: float = 0.0,
+                  deadline: float | None = None) -> TrackMeasurements:
     ffmpeg = _tool("ffmpeg", settings.ffmpeg_path)
-    tm = _main_pass(ffmpeg, path, st.index, st, settings, dur_s)
+    tm = _main_pass(ffmpeg, path, st.index, st, settings, dur_s, deadline)
     if settings.hum_detection or st.channels >= 2:
-        _spectral_pass(ffmpeg, path, st.index, tm, settings, dur_s)
-    _tail_pass(ffmpeg, path, st.index, tm, settings)
+        _spectral_pass(ffmpeg, path, st.index, tm, settings, max(dur_s, tm.decoded_s), deadline)
+    _tail_pass(ffmpeg, path, st.index, tm, settings, deadline)
     return tm
 
 
@@ -202,7 +226,22 @@ def measure(path, info: MediaInfo, settings: Settings) -> Measurements:
                                                 channels=info.channels)]
     if not settings.analyze_all_tracks:
         streams = streams[:1]
-    m.tracks = [measure_track(path, st, settings, info.duration_s) for st in streams]
+    import dataclasses
+    import time
+
+    # One deadline for the whole file (all tracks, all passes), sized by declared work; a missing
+    # duration counts as the maximum.
+    dur = info.duration_s if info.duration_s > 0 else settings.max_duration_s
+    channel_s = sum(max(1, s.channels) for s in streams) * dur
+    deadline = time.monotonic() + settings.decode_timeout_s + \
+        channel_s * settings.decode_timeout_per_audio_s
+    m.tracks = [measure_track(path, st, settings, info.duration_s, deadline) for st in streams]
+    decoded = max((t.decoded_s for t in m.tracks), default=0.0)
+    declared = info.duration_s
+    if decoded > 0 and (declared <= 0 or abs(decoded - declared) > 0.1 * max(declared, 1.0)):
+        # The container misstated its length: grade the audio that is actually there.
+        m.declared_s = declared
+        m.info = dataclasses.replace(info, duration_s=decoded)
     p = m.tracks[0]
     m.integrated_lufs, m.lra, m.true_peak_dbtp = p.integrated_lufs, p.lra, p.true_peak_dbtp
     m.peak_dbfs, m.rms_dbfs, m.dc_offset, m.flat_factor = p.peak_dbfs, p.rms_dbfs, p.dc_offset, p.flat_factor

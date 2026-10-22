@@ -86,7 +86,7 @@ def _render_sync(source, settings: Settings, spec: DeliverySpec | str | None = N
     return RenderResult(
         source=str(source), has_audio=info.has_audio, path=str(path), codec=info.codec,
         sample_rate=info.sample_rate or None, channels=info.channels or None,
-        duration_ms=int(info.duration_s * 1000) if info.duration_s else None,
+        duration_ms=int(m.info.duration_s * 1000) if m.info.duration_s else None,
         integrated_lufs=m.integrated_lufs, lra=m.lra, true_peak_dbtp=m.true_peak_dbtp,
         peak_dbfs=m.peak_dbfs, rms_dbfs=m.rms_dbfs, silences=m.silences, measurements=m,
         spec=sp.name, tracks=[summarize_track(t) for t in m.tracks],

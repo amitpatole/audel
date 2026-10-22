@@ -95,6 +95,23 @@ All notable changes to Audel are recorded here. The format follows
   - **Deploy.** Helm ingress defaults to the same namespace, DNS egress goes to kube-dns only,
     token, JWKS and TLS mounts are supported, and the default is one replica. The Dockerfile base
     is pinned by digest, and GitHub Actions are pinned to commit SHAs.
+- Red-team round 3 fixes (decode and measurement surface), each pinned by a regression test:
+  - **High.** A stream that changed sample rate or channel count mid-file was silently resampled
+    and downmixed to its first frame's format, which hid most of the audio, so a defective file
+    could PASS. Decoding now refuses mid-stream format changes (`-reinit_filter 0`).
+  - **Medium.** Round 2's `-ac N` remixed non-default channel layouts, causing false dead-channel
+    findings and hiding the real dead channel. Channel layouts are now kept as-is. Unordered layouts
+    pass through untouched, and more standard layouts are labelled.
+  - **Medium.** Cheap uploads (high sample rate, many channels, no declared duration) could tie up a
+    worker for about an hour. Analysis runs at no more than 48 kHz, an unknown duration counts as the
+    maximum, there is a channel-second budget (`AUDEL_MAX_TOTAL_CHANNEL_S`), and one deadline covers
+    the whole file.
+  - **Low-Medium.** Audio beyond the duration cap went unmeasured when the container understated its
+    length. Reaching the cap now fails closed, and a declared duration that disagrees with the
+    decoded audio is reported, with grading done on the decoded audio.
+  - **Low.** A duration lie could hide truncation. The tail is now read from the decoded end.
+  - **Low.** Unordered many-channel audio aborted the grade. It is now graded.
+  - **Fixed.** Silent loudness frames (`-nan`) were dropped by the frame parser.
 - Red-team round 3 fixes (network and input surface), each pinned by a regression test:
   - **Medium.** An authenticated slow sender could hold every body-intake slot and block uploads
     for all tenants. The slot is now released as soon as the body is read. There is a body-read

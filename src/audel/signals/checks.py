@@ -279,6 +279,13 @@ def evaluate(m: Measurements, settings: Settings, spec: DeliverySpec | str | Non
     sp = effective_spec(settings, spec)
     content = effective_content(settings, sp)
     multi = len(m.tracks) > 1
+    if m.declared_s is not None:
+        issues.append(Issue.make(
+            IssueKind.DURATION, Severity.WARNING,
+            f"the container declares {m.declared_s:.1f}s but the audio decodes to {dur:.1f}s; "
+            "graded on the decoded audio", span=_full_span(dur), source=IssueSource.DSP,
+            detail={"check": "duration_mismatch", "declared_s": round(m.declared_s, 3),
+                    "decoded_s": round(dur, 3)}))
     for tm in m.tracks:
         label = _track_label(tm, multi)
         if not tm.frames and (tm.rms_dbfs is None or not math.isfinite(tm.rms_dbfs)):

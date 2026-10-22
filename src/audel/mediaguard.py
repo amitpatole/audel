@@ -53,6 +53,20 @@ CHANNEL_LABELS: dict[str, list[str]] = {
     "5.1": ["FL", "FR", "FC", "LFE", "BL", "BR"],
     "5.1(side)": ["FL", "FR", "FC", "LFE", "SL", "SR"],
     "7.1": ["FL", "FR", "FC", "LFE", "BL", "BR", "SL", "SR"],
+    "downmix": ["DL", "DR"],
+    "3.1": ["FL", "FR", "FC", "LFE"],
+    "quad(side)": ["FL", "FR", "SL", "SR"],
+    "4.1": ["FL", "FR", "FC", "LFE", "BC"],
+    "6.0": ["FL", "FR", "FC", "BC", "SL", "SR"],
+    "6.0(front)": ["FL", "FR", "FLC", "FRC", "SL", "SR"],
+    "hexagonal": ["FL", "FR", "FC", "BL", "BR", "BC"],
+    "6.1": ["FL", "FR", "FC", "LFE", "BC", "SL", "SR"],
+    "6.1(back)": ["FL", "FR", "FC", "LFE", "BL", "BR", "BC"],
+    "7.0": ["FL", "FR", "FC", "BL", "BR", "SL", "SR"],
+    "7.0(front)": ["FL", "FR", "FC", "FLC", "FRC", "SL", "SR"],
+    "7.1(wide)": ["FL", "FR", "FC", "LFE", "BL", "BR", "FLC", "FRC"],
+    "7.1(wide-side)": ["FL", "FR", "FC", "LFE", "FLC", "FRC", "SL", "SR"],
+    "octagonal": ["FL", "FR", "FC", "BL", "BR", "BC", "SL", "SR"],
 }
 
 
@@ -224,14 +238,22 @@ def pcm_pipeline(path: Path, settings: Settings, *, stream: int, channels: int,
 
     ffmpeg = _tool("ffmpeg", settings.ffmpeg_path)
     ch = max(1, int(channels))
-    sr = max(1, int(sample_rate))
+    # Loudness/true-peak meters oversample internally; analysing above 48 kHz only multiplies
+    # the cost an upload can impose, so the analysis rate is capped.
+    sr = max(1, min(int(sample_rate), ANALYSIS_MAX_RATE))
+    lay = channel_layout_arg(layout, ch)
+    # -reinit_filter 0: a stream that changes sample rate / channel count mid-file is REFUSED
+    # rather than silently resampled to its first frame's format (which hid most of the audio).
+    # -ch_layout keeps the stream's own channel order (an -ac N remix would relabel channels).
     decode = [ffmpeg, "-nostdin", "-hide_banner", "-v", "error", "-threads", "1",
-              *(pre_input or []), *safe_input(path), "-map", f"0:a:{int(stream)}",
-              "-t", str(settings.max_duration_s), "-vn", "-sn", "-dn", "-map_metadata", "-1",
-              "-ac", str(ch), "-ar", str(sr), "-f", "f32le", "-acodec", "pcm_f32le", "pipe:1"]
-    lay = ["-ch_layout", layout] if layout in CHANNEL_LABELS else []
+              "-reinit_filter", "0", *(pre_input or []), *safe_input(path),
+              "-map", f"0:a:{int(stream)}", "-t", str(settings.max_duration_s),
+              "-vn", "-sn", "-dn", "-map_metadata", "-1",
+              # a named layout is kept as-is; an unordered one passes through untouched
+              *([] if lay.startswith("USR") else ["-ch_layout", lay]), "-ar", str(sr),
+              "-f", "f32le", "-acodec", "pcm_f32le", "pipe:1"]
     analyse = [ffmpeg, "-nostdin", "-hide_banner", "-v", "verbose" if verbose else "info",
-               "-threads", "1", "-f", "f32le", "-ar", str(sr), "-ac", str(ch), *lay,
+               "-threads", "1", "-f", "f32le", "-ar", str(sr), "-ch_layout", lay,
                "-i", "pipe:0", *analysis]
     pre = _rlimit_setter(int(timeout_s) + _RLIMIT_CPU_PAD_S) if os.name == "posix" else None
     p1 = subprocess.Popen(decode, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -267,13 +289,38 @@ def pcm_pipeline(path: Path, settings: Settings, *, stream: int, channels: int,
         raise
     tail1 = err1.join(5).decode("utf-8", "replace")
     out2 = err2.join(5).decode("utf-8", "replace")
-    if p1.returncode not in (0, None) and not out2:
-        raise DecodeError(f"could not decode audio: {tail1[-200:]}")
+    for pipe in (p1.stderr, p2.stderr):
+        try:
+            pipe.close()
+        except OSError:
+            pass
     if p2.returncode != 0:
         raise DecodeError(f"analysis failed (rc={p2.returncode})")
-    if p1.returncode not in (0, None) and p1.returncode != -13:  # -13 = SIGPIPE after p2 ended
+    # A decoder stopped by a closed pipe (analysis finished early) exits 224 / -13: not an error.
+    if p1.returncode not in (0, None, 224, -13):
         raise DecodeError(f"could not decode audio: {tail1[-200:]}")
     return out2
+
+
+ANALYSIS_MAX_RATE = 48000
+
+
+def channel_layout_arg(layout: str, channels: int) -> str:
+    """The -ch_layout to decode and analyse with: the stream's own layout name when ffmpeg knows
+    it (probe output, charset-filtered), else a custom layout of N named channels (ffmpeg's
+    loudness meter rejects 'unknown' layouts; a remix to a default layout would mislabel)."""
+    import re
+
+    n = max(1, int(channels))
+    if layout and layout != "unknown" and re.fullmatch(r"[A-Za-z0-9.()+_-]{1,40}", layout):
+        known = CHANNEL_LABELS.get(layout)
+        if known is None or len(known) == n:
+            return layout
+    if n == 1:
+        return "mono"
+    if n == 2:
+        return "stereo"
+    return "+".join(f"USR{i}" for i in range(n))
 
 
 def validate_source(source: str | os.PathLike, settings: Settings, *, allow_local_files: bool | None = None) -> Path:
@@ -357,10 +404,17 @@ def probe(path: Path, settings: Settings) -> MediaInfo:
         )
     if sample_rate > settings.max_sample_rate:
         raise UnsafeSourceError(f"sample rate {sample_rate} exceeds the {settings.max_sample_rate} cap")
-    if duration_s * max(1, len(astreams)) > settings.max_total_audio_s:
+    # A missing / zero declared duration counts as the maximum: it cannot dodge the budgets.
+    budget_dur = duration_s if duration_s > 0 else settings.max_duration_s
+    if budget_dur * max(1, len(astreams)) > settings.max_total_audio_s:
         raise UnsafeSourceError(
-            f"{len(astreams)} audio stream(s) x {duration_s:.0f}s exceeds the "
+            f"{len(astreams)} audio stream(s) x {budget_dur:.0f}s exceeds the "
             f"{settings.max_total_audio_s:.0f}s total-audio budget")
+    total_channels = sum(max(1, _int(st.get("channels"))) for st in astreams)
+    if budget_dur * total_channels > settings.max_total_channel_s:
+        raise UnsafeSourceError(
+            f"{total_channels} channel(s) x {budget_dur:.0f}s exceeds the "
+            f"{settings.max_total_channel_s:.0f} channel-second budget")
     if len(astreams) > settings.max_audio_streams:
         raise UnsafeSourceError(
             f"{len(astreams)} audio streams exceeds the {settings.max_audio_streams}-stream cap")
@@ -435,7 +489,8 @@ def decode_to_wav(path: Path, settings: Settings, *, sample_rate: int = 16000,
     fd, name = tempfile.mkstemp(suffix=".wav", prefix="audel-asr-", dir=_tmp_dir(settings))
     os.close(fd)
     out = Path(name)
-    argv = [ffmpeg, "-nostdin", "-hide_banner", "-threads", "1", *safe_input(path),
+    argv = [ffmpeg, "-nostdin", "-hide_banner", "-threads", "1", "-reinit_filter", "0",
+            *safe_input(path),
             "-map", f"0:a:{int(stream)}?", "-t", str(settings.max_duration_s),
             "-ar", str(sample_rate), "-ac", "1", "-f", "wav", "-y", str(out)]
     try:
@@ -458,8 +513,8 @@ def excerpt_wav(path: Path, settings: Settings, *, start_s: float, dur_s: float,
     fd, name = tempfile.mkstemp(suffix=".wav", prefix="audel-excerpt-", dir=_tmp_dir(settings))
     os.close(fd)
     out = Path(name)
-    argv = [ffmpeg, "-nostdin", "-hide_banner", "-threads", "1", "-ss", f"{max(0.0, start_s):.3f}",
-            *safe_input(path), "-map", f"0:a:{int(stream)}?", "-t", f"{dur:.3f}",
+    argv = [ffmpeg, "-nostdin", "-hide_banner", "-threads", "1", "-reinit_filter", "0",
+            "-ss", f"{max(0.0, start_s):.3f}", *safe_input(path), "-map", f"0:a:{int(stream)}?", "-t", f"{dur:.3f}",
             "-ar", str(sample_rate), "-ac", "1", "-f", "wav", "-y", str(out)]
     try:
         proc = run(argv, timeout_s=min(60.0, settings.decode_timeout_s))

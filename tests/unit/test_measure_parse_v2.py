@@ -61,3 +61,10 @@ def test_merge_regions_bounds_the_select_expression():
     assert len(merged) == 200
     assert merged[0][0] == 0.0 and merged[-1][1] == 999.5
     assert merge_regions([(2.0, 1.0), (0.0, 1.0), (0.5, 1.5)], 10) == [(0.0, 1.5)]
+
+
+def test_parse_frames_keeps_silent_frames_with_negative_nan():
+    text = ("[Parsed_ebur128_0 @ 0x1] t: 11.299955  TARGET:-23 LUFS    M:  -nan S:  -nan     "
+            "I: -20.1 LUFS       LRA:   7.1 LU  FTPK:  -inf dBFS  TPK:  -1.7 dBFS\n")
+    f = parse_frames(text)
+    assert len(f) == 1 and abs(f[0][0] - 11.3) < 1e-3 and f[0][1] is None and f[0][2] is None

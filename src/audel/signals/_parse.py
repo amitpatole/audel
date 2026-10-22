@@ -24,6 +24,8 @@ def _f(s: str | None) -> float | None:
     if s is None:
         return None
     low = s.strip().lower()
+    if low in ("-nan", "+nan"):
+        return None
     if low in ("-inf", "inf", "nan"):
         return -math.inf if low == "-inf" else (math.inf if low == "inf" else None)
     try:
@@ -76,9 +78,9 @@ def parse_silences(text: str) -> list[tuple[float, float]]:
 
 # --- Phase 9: per-frame loudness, per-channel stats, windowed metadata series -----------------
 
-_NUM = r"(-?[\d.]+|-?inf|nan)"
+_NUM = r"(-?[\d.]+|-?inf|-?nan)"
 _RE_FRAME = re.compile(r"\bt:\s*([\d.]+)\s+TARGET:.*?\bM:\s*" + _NUM + r"\s+S:\s*" + _NUM)
-_RE_FTPK = re.compile(r"\bFTPK:\s*((?:(?:-?[\d.]+|-?inf|nan)\s+)+)dBFS")
+_RE_FTPK = re.compile(r"\bFTPK:\s*((?:(?:-?[\d.]+|-?inf|-?nan)\s+)+)dBFS")
 _RE_INSTANCE = re.compile(r"\[Parsed_(\w+?)_(\d+) @")
 _RE_META_RMS = re.compile(r"lavfi\.astats\.Overall\.RMS_level=" + _NUM)
 _MAX_FRAMES = 200_000  # 3h at 10 Hz is 108k; anything beyond is ignored (memory bound)

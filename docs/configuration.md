@@ -104,6 +104,7 @@ and defaults match the code. A test fails if it goes stale.
 | `AUDEL_MAX_CHANNELS` | `64` |
 | `AUDEL_MAX_AUDIO_STREAMS` | `32` |
 | `AUDEL_MAX_TOTAL_AUDIO_S` | `14400` |
+| `AUDEL_MAX_TOTAL_CHANNEL_S` | `172800` |
 | `AUDEL_DECODE_TIMEOUT_S` | `120.0` |
 | `AUDEL_DECODE_TIMEOUT_PER_AUDIO_S` | `0.5` |
 | `AUDEL_REQUEST_TIMEOUT_S` | `180.0` |
