@@ -95,6 +95,21 @@ All notable changes to Audel are recorded here. The format follows
   - **Deploy.** Helm ingress defaults to the same namespace, DNS egress goes to kube-dns only,
     token, JWKS and TLS mounts are supported, and the default is one replica. The Dockerfile base
     is pinned by digest, and GitHub Actions are pinned to commit SHAs.
+- Red-team round 4 fixes (decode and measurement surface), each pinned by a regression test:
+  - **High.** A forward timestamp jump larger than the duration cap ended decoding early, because
+    `-t` counts timestamps, so the audio after it was never measured and a clipping file could PASS.
+    Decoding now restamps by sample count before the cap.
+  - **Medium.** A truncated secondary track passed. Each track is now compared with the programme
+    (`short_track`) and graded on its own decoded length.
+  - **Medium.** Decoder errors were ignored when ffmpeg still exited 0, so corrupt or dropped
+    packets could PASS. They are now counted and reported as `decode_errors`, and the
+    duration-mismatch tolerance is tightened to 1 s or 2%.
+  - **Medium.** Immersive and custom layouts (5.1.2, 5.1.4, 7.1.4, 22.2, `FL+FR+LFE+...`) lost their
+    LFE label, giving false dead-channel FAILs. Channel names now come from FFmpeg's own layout
+    table, and every LFE channel is recognised.
+  - **Low.** Worker time per upload is tighter. The default channel-second budget is now 3 h of 7.1,
+    and the per-file deadline is based on channel-seconds (`AUDEL_DECODE_TIMEOUT_PER_CHANNEL_S`).
+  - **Info.** The frame-log cap follows the configured maximum duration.
 - Red-team round 4 fixes (network and input surface), each pinned by a regression test:
   - **Medium.** A trickling upstream defeated the ingest deadline and leaked download threads from
     the shared executor, which stopped grading for every tenant. Each receive is now bounded by the

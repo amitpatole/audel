@@ -19,6 +19,10 @@ consumers of the contract key on. It also has a precise rule name in `detail.che
 | `true_peak_ceiling` | `clipping` | true peak is above the spec ceiling but below full scale | error |
 | `clipping` | `clipping` | true peak is at or above 0 dBTP | error |
 | `truncation` | `truncation` | the track ends at programme level with no decay | warning (low confidence) |
+| `short_track` | `truncation` | one audio track ends well before the programme | error |
+| `decode_errors` | `dropout` | the decoder reported corrupt or missing data | warning, error at 10 or more |
+| `duration_mismatch` | `duration` | the container's declared length differs from the decoded audio | warning |
+| `empty_stream` | `silence` | an audio stream contains no samples | critical |
 | `dead_channel` | `channel_issue` | one channel is silent while the track is live (LFE excluded) | error |
 | `polarity_inversion` | `channel_issue` | left and right cancel to silence in a mono fold-down | error |
 | `phase` | `channel_issue` | left and right are largely anti-correlated | warning |

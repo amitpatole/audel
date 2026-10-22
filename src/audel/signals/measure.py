@@ -65,6 +65,7 @@ class TrackMeasurements:
     series_50: list[float] = field(default_factory=list)
     series_60: list[float] = field(default_factory=list)
     decoded_s: float = 0.0                   # audio actually decoded (last loudness frame)
+    decode_errors: int = 0                   # problems the decoder reported (corrupt data)
     dialogue_lufs: float | None = None       # speech-gated integrated loudness, when computed
     dialogue_coverage: float | None = None   # fraction of the programme that is speech
 
@@ -93,7 +94,7 @@ def _rate(st: StreamInfo) -> int:
 
 def _pipe(path, st: StreamInfo, settings: Settings, analysis: list[str], dur_s: float, *,
           pre_input: list[str] | None = None, verbose: bool = False,
-          deadline: float | None = None) -> str:
+          deadline: float | None = None, stats: dict | None = None) -> str:
     import time
 
     timeout = pass_timeout(settings, dur_s)
@@ -104,7 +105,7 @@ def _pipe(path, st: StreamInfo, settings: Settings, analysis: list[str], dur_s: 
         timeout = min(timeout, left)
     return pcm_pipeline(path, settings, stream=st.index, channels=st.channels or 1,
                         sample_rate=_rate(st), layout=st.layout, analysis=analysis,
-                        timeout_s=timeout, pre_input=pre_input, verbose=verbose)
+                        timeout_s=timeout, pre_input=pre_input, verbose=verbose, stats=stats)
 
 
 def _main_pass(ffmpeg: str, path, idx: int, st: StreamInfo, settings: Settings,
@@ -117,13 +118,15 @@ def _main_pass(ffmpeg: str, path, idx: int, st: StreamInfo, settings: Settings,
     )
     # The untrusted file is decoded in a separate process; this analysis sees raw PCM only, so
     # container metadata can never appear in the text parsed below.
+    stats: dict = {}
     err = _pipe(path, st, settings, ["-af", af, "-f", "null", "-"], dur_s, verbose=True,
-                deadline=deadline)
+                deadline=deadline, stats=stats)
 
     tm = TrackMeasurements(stream=st)
     eb = parse_ebur128(err)
     tm.integrated_lufs, tm.lra, tm.true_peak_dbtp = eb.get("I"), eb.get("LRA"), eb.get("true_peak")
-    tm.frames = parse_frames(err)
+    tm.frames = parse_frames(err, max_frames=int(settings.max_duration_s * 10) + 1000)
+    tm.decode_errors = int(stats.get("decode_errors", 0))
     tm.decoded_s = max((f[0] for f in tm.frames), default=0.0)
     if tm.decoded_s >= settings.max_duration_s - 0.5:
         # Decoding reached the cap: audio beyond it would go unmeasured. Fail closed.
@@ -234,11 +237,11 @@ def measure(path, info: MediaInfo, settings: Settings) -> Measurements:
     dur = info.duration_s if info.duration_s > 0 else settings.max_duration_s
     channel_s = sum(max(1, s.channels) for s in streams) * dur
     deadline = time.monotonic() + settings.decode_timeout_s + \
-        channel_s * settings.decode_timeout_per_audio_s
+        channel_s * settings.decode_timeout_per_channel_s
     m.tracks = [measure_track(path, st, settings, info.duration_s, deadline) for st in streams]
     decoded = max((t.decoded_s for t in m.tracks), default=0.0)
     declared = info.duration_s
-    if decoded > 0 and (declared <= 0 or abs(decoded - declared) > 0.1 * max(declared, 1.0)):
+    if decoded > 0 and (declared <= 0 or abs(decoded - declared) > max(1.0, 0.02 * declared)):
         # The container misstated its length: grade the audio that is actually there.
         m.declared_s = declared
         m.info = dataclasses.replace(info, duration_s=decoded)

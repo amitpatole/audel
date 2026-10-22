@@ -70,6 +70,44 @@ CHANNEL_LABELS: dict[str, list[str]] = {
 }
 
 
+def _ffmpeg_layout_table() -> dict[str, list[str]]:
+    """FFmpeg's own standard-layout table (``ffmpeg -layouts``), parsed once; falls back to the
+    built-in table. Using FFmpeg's table keeps labels in FFmpeg's channel order for every layout
+    it knows (immersive 5.1.4 / 7.1.4 / 22.2 ...), so an LFE is always recognised as one."""
+    global _LAYOUT_CACHE
+    if _LAYOUT_CACHE is not None:
+        return _LAYOUT_CACHE
+    table = dict(CHANNEL_LABELS)
+    try:
+        path = shutil.which("ffmpeg")
+        if path:
+            out = subprocess.run([path, "-hide_banner", "-layouts"], capture_output=True,
+                                 text=True, timeout=10, check=False).stdout
+            section = out.split("Standard channel layouts:", 1)[-1]
+            for line in section.splitlines():
+                parts = line.split()
+                if len(parts) == 2 and parts[0] != "NAME" and "+" in parts[1] or (
+                        len(parts) == 2 and parts[0] == "mono"):
+                    table[parts[0]] = parts[1].split("+")
+    except (OSError, subprocess.SubprocessError):
+        pass
+    _LAYOUT_CACHE = table
+    return table
+
+
+_LAYOUT_CACHE: dict[str, list[str]] | None = None
+
+
+def layout_channels(layout: str) -> list[str] | None:
+    """Channel names of a layout: FFmpeg's table, or a ``FL+FR+LFE+...`` custom layout."""
+    if not layout:
+        return None
+    if "+" in layout:
+        names = [n for n in layout.split("+") if n]
+        return names if all(n.isalnum() for n in names) else None
+    return _ffmpeg_layout_table().get(layout)
+
+
 # FFmpeg's default layout per channel count (used when the container carries no channel mask).
 _DEFAULT_LAYOUT = {1: "mono", 2: "stereo", 3: "2.1", 6: "5.1", 8: "7.1"}
 
@@ -88,7 +126,7 @@ class StreamInfo:
 
     def channel_labels(self) -> list[str]:
         layout = self.layout or _DEFAULT_LAYOUT.get(self.channels, "")
-        labels = CHANNEL_LABELS.get(layout)
+        labels = layout_channels(layout)
         if labels and len(labels) == self.channels:
             return list(labels)
         return [f"ch{i + 1}" for i in range(self.channels)]
@@ -190,6 +228,7 @@ class _BoundedReader:
         self._pipe, self._cap, self._tail = pipe, cap, tail
         self.data = bytearray()
         self.truncated = False
+        self.lines = 0
         self._t = threading.Thread(target=self._run, daemon=True)
         self._t.start()
 
@@ -199,6 +238,7 @@ class _BoundedReader:
                 chunk = self._pipe.read(65536)
                 if not chunk:
                     break
+                self.lines += chunk.count(b"\n")
                 if self._tail:
                     self.data += chunk
                     if len(self.data) > self._cap:
@@ -225,7 +265,8 @@ def pass_timeout(settings: Settings, duration_s: float) -> float:
 def pcm_pipeline(path: Path, settings: Settings, *, stream: int, channels: int,
                  sample_rate: int, analysis: list[str], timeout_s: float,
                  pre_input: list[str] | None = None, layout: str = "",
-                 verbose: bool = False, max_stderr: int = 128 * 1024 * 1024) -> str:
+                 verbose: bool = False, max_stderr: int = 128 * 1024 * 1024,
+                 stats: dict | None = None) -> str:
     """Decode the untrusted file to raw float PCM in one process and ANALYSE it in another.
 
     The analysing ffmpeg only ever sees a raw PCM stream (no container, no metadata, no tags), so
@@ -247,7 +288,10 @@ def pcm_pipeline(path: Path, settings: Settings, *, stream: int, channels: int,
     # -ch_layout keeps the stream's own channel order (an -ac N remix would relabel channels).
     decode = [ffmpeg, "-nostdin", "-hide_banner", "-v", "error", "-threads", "1",
               "-reinit_filter", "0", *(pre_input or []), *safe_input(path),
-              "-map", f"0:a:{int(stream)}", "-t", str(settings.max_duration_s),
+              "-map", f"0:a:{int(stream)}",
+              # Restamp by SAMPLE COUNT before the -t cap: a forward timestamp jump must not end
+              # decoding early (and leave the audio after it unmeasured).
+              "-af", "asetpts=N/SR/TB", "-t", str(settings.max_duration_s),
               "-vn", "-sn", "-dn", "-map_metadata", "-1",
               # a named layout is kept as-is; an unordered one passes through untouched
               *([] if lay.startswith("USR") else ["-ch_layout", lay]), "-ar", str(sr),
@@ -289,6 +333,10 @@ def pcm_pipeline(path: Path, settings: Settings, *, stream: int, channels: int,
         raise
     tail1 = err1.join(5).decode("utf-8", "replace")
     out2 = err2.join(5).decode("utf-8", "replace")
+    if stats is not None:
+        # The decoder runs at -v error: every line it printed is a decoding problem (corrupt or
+        # missing data), even when it still exits 0.
+        stats["decode_errors"] = err1.lines
     for pipe in (p1.stderr, p2.stderr):
         try:
             pipe.close()
@@ -312,8 +360,8 @@ def channel_layout_arg(layout: str, channels: int) -> str:
     import re
 
     n = max(1, int(channels))
-    if layout and layout != "unknown" and re.fullmatch(r"[A-Za-z0-9.()+_-]{1,40}", layout):
-        known = CHANNEL_LABELS.get(layout)
+    if layout and layout != "unknown" and re.fullmatch(r"[A-Za-z0-9.()+_-]{1,200}", layout):
+        known = layout_channels(layout)
         if known is None or len(known) == n:
             return layout
     if n == 1:
@@ -491,7 +539,8 @@ def decode_to_wav(path: Path, settings: Settings, *, sample_rate: int = 16000,
     out = Path(name)
     argv = [ffmpeg, "-nostdin", "-hide_banner", "-threads", "1", "-reinit_filter", "0",
             *safe_input(path),
-            "-map", f"0:a:{int(stream)}?", "-t", str(settings.max_duration_s),
+            "-map", f"0:a:{int(stream)}?", "-af", "asetpts=N/SR/TB",
+            "-t", str(settings.max_duration_s),
             "-ar", str(sample_rate), "-ac", "1", "-f", "wav", "-y", str(out)]
     try:
         proc = run(argv, timeout_s=pass_timeout(settings, settings.max_duration_s))

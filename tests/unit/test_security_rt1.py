@@ -1470,3 +1470,78 @@ def test_intake_reservation_is_taken_before_waiting():
         await asyncio.gather(*others, *alpha)
 
     asyncio.run(scenario())
+
+
+# ==== round 4, decode surface =================================================================
+
+@requires_ffmpeg
+def test_timestamp_gap_cannot_hide_audio_past_it(tmp_path):
+    from audel import check
+
+    clean = tmp_path / "c.wav"
+    hot = tmp_path / "h.wav"
+    _ff("-f", "lavfi", "-i", "sine=f=440:d=20:r=48000", "-af", "volume=0.3,afade=t=out:st=18:d=2", clean)
+    _ff("-f", "lavfi", "-i", "aevalsrc=if(lt(mod(t\\,0.002)\\,0.001)\\,1\\,-1):d=5:s=48000", hot)
+    both = tmp_path / "both.wav"
+    _ff("-i", clean, "-i", hot, "-filter_complex", "[0][1]concat=n=2:v=0:a=1", both)
+    gap = tmp_path / "gap.mkv"
+    with open(gap, "wb") as fh:
+        subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-i", str(both), "-af",
+                        "asetpts='if(gte(N,960000),N+200*SR,N)/SR/TB'", "-c:a", "pcm_s16le",
+                        "-f", "matroska", "-"], stdout=fh, check=True)
+    s = Settings(max_duration_s=120)   # the jump (200 s) exceeds the cap
+    r = asyncio.run(check(str(gap), settings=s))
+    checks = {i.detail.get("check") for i in r.issues}
+    assert r.verdict.value == "fail" and ({"clipping", "true_peak_ceiling"} & checks)
+
+
+@requires_ffmpeg
+def test_short_secondary_track_is_reported(tmp_path):
+    from audel import check
+
+    long_, short = tmp_path / "l.wav", tmp_path / "s.wav"
+    _ff("-f", "lavfi", "-i", "sine=f=440:d=30", "-af", "afade=t=out:st=28:d=2", long_)
+    _ff("-f", "lavfi", "-i", "sine=f=660:d=4", "-af", "afade=t=out:st=2:d=2", short)
+    mt = tmp_path / "mt.mkv"
+    _ff("-i", long_, "-i", short, "-map", "0:a", "-map", "1:a", "-c:a", "pcm_s16le", mt)
+    r = asyncio.run(check(str(mt)))
+    assert "short_track" in {i.detail.get("check") for i in r.issues}
+
+
+@requires_ffmpeg
+def test_corrupt_packets_are_reported_even_when_ffmpeg_exits_zero(tmp_path):
+    import random
+
+    from audel import check
+
+    mp3 = tmp_path / "c.mp3"
+    _ff("-f", "lavfi", "-i", "sine=f=440:d=30", "-b:a", "128k", mp3)
+    data = bytearray(mp3.read_bytes())
+    rnd = random.Random(7)
+    for k in range(20):
+        pos = 5000 + k * (len(data) // 22)
+        data[pos:pos + 1500] = bytes(rnd.randrange(256) for _ in range(1500))
+    mp3.write_bytes(bytes(data))
+    r = asyncio.run(check(str(mp3)))
+    assert "decode_errors" in {i.detail.get("check") for i in r.issues}
+
+
+@requires_ffmpeg
+@pytest.mark.parametrize("layout,n", [("5.1.4", 10), ("7.1.4", 12), ("5.1.2", 8)])
+def test_immersive_layouts_keep_their_lfe(tmp_path, layout, n):
+    from audel import check
+
+    f = tmp_path / f"{layout}.wav"
+    chans = [f"0.1*sin(2*PI*{200 + 50 * i}*t)" for i in range(n)]
+    chans[3] = "0"  # LFE (index 3 in all three layouts) silent, as in a dialogue mix
+    _ff("-f", "lavfi", "-i", f"aevalsrc={'|'.join(chans)}:c={layout}:d=5:s=48000", f)
+    r = asyncio.run(check(str(f)))
+    assert "dead_channel" not in {i.detail.get("check") for i in r.issues}
+
+
+def test_frame_cap_follows_the_configured_duration():
+    from audel.signals._parse import parse_frames
+
+    line = "[Parsed_ebur128_0 @ 0x1] t: {t}   TARGET:-23 LUFS    M: -20.0 S: -20.0\n"
+    text = "".join(line.format(t=i / 10) for i in range(50))
+    assert len(parse_frames(text, max_frames=10)) == 10 and len(parse_frames(text)) == 50

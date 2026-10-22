@@ -86,7 +86,8 @@ _RE_META_RMS = re.compile(r"lavfi\.astats\.Overall\.RMS_level=" + _NUM)
 _MAX_FRAMES = 200_000  # 3h at 10 Hz is 108k; anything beyond is ignored (memory bound)
 
 
-def parse_frames(text: str) -> list[tuple[float, float | None, float | None, float | None]]:
+def parse_frames(text: str, max_frames: int = _MAX_FRAMES
+                 ) -> list[tuple[float, float | None, float | None, float | None]]:
     """ebur128 ``framelog=verbose`` lines → ``(t_s, momentary, short_term, max frame true peak)``.
 
     Per-channel FTPK values are reduced to their max (the deliverable's frame peak).
@@ -108,7 +109,7 @@ def parse_frames(text: str) -> list[tuple[float, float | None, float | None, flo
         except ValueError:
             continue
         out.append((t, _f(m.group(2)), _f(m.group(3)), tp))
-        if len(out) >= _MAX_FRAMES:
+        if len(out) >= max_frames:
             break
     return out
 

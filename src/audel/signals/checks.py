@@ -186,8 +186,8 @@ def _channels(tm, dur, settings, label) -> list[Issue]:
     live = tm.rms_dbfs is not None and tm.rms_dbfs != -math.inf and tm.rms_dbfs > settings.silence_dbfs
     if live and len(tm.channels) >= 2:
         for ch in tm.channels:
-            if ch.label == "LFE":
-                continue  # an empty LFE is normal for dialogue-led mixes
+            if ch.label.startswith("LFE"):
+                continue  # an empty LFE / LFE2 is normal for dialogue-led mixes
             dead = ch.rms_dbfs is None or ch.rms_dbfs == -math.inf or \
                 ch.rms_dbfs <= settings.silence_dbfs - _DEAD_CHANNEL_MARGIN_DB
             if dead:
@@ -286,8 +286,21 @@ def evaluate(m: Measurements, settings: Settings, spec: DeliverySpec | str | Non
             "graded on the decoded audio", span=_full_span(dur), source=IssueSource.DSP,
             detail={"check": "duration_mismatch", "declared_s": round(m.declared_s, 3),
                     "decoded_s": round(dur, 3)}))
+    longest = max((t.decoded_s for t in m.tracks), default=0.0)
     for tm in m.tracks:
         label = _track_label(tm, multi)
+        if tm.decode_errors:
+            issues.append(_issue(
+                IssueKind.DROPOUT, Severity.ERROR if tm.decode_errors >= 10 else Severity.WARNING,
+                f"{label}the decoder reported {tm.decode_errors} problem(s) with the data "
+                "(corrupt or missing packets); audio may be missing", _full_span(dur),
+                "decode_errors", tm, conf=Confidence.MEDIUM, errors=tm.decode_errors))
+        if multi and longest > 0 and tm.decoded_s > 0 and tm.decoded_s < longest - max(1.0, 0.02 * longest):
+            issues.append(_issue(
+                IssueKind.TRUNCATION, Severity.ERROR,
+                f"{label}track is {tm.decoded_s:.1f}s long but the programme runs {longest:.1f}s",
+                Span(start_ms=_ms(tm.decoded_s), end_ms=_ms(longest)), "short_track", tm,
+                decoded_s=round(tm.decoded_s, 3), programme_s=round(longest, 3)))
         if not tm.frames and (tm.rms_dbfs is None or not math.isfinite(tm.rms_dbfs)):
             # No samples were measured at all: report it once instead of trusting the meters'
             # placeholder values (an empty stream otherwise reads as 0 dBTP "clipping").
@@ -295,15 +308,16 @@ def evaluate(m: Measurements, settings: Settings, spec: DeliverySpec | str | Non
                                  f"{label}the audio stream contains no samples", _full_span(dur),
                                  "empty_stream", tm))
             continue
-        found, dead = _silence(tm, dur, settings, label)
+        tdur = tm.decoded_s if tm.decoded_s > 0 else dur  # each track on its own decoded length
+        found, dead = _silence(tm, tdur, settings, label)
         issues.extend(found)
         if dead:
             continue  # nothing else is meaningful on a dead track
-        issues.extend(_peaks(tm, dur, sp, label))
-        issues.extend(_loudness(tm, dur, sp, label))
-        issues.extend(_truncation(tm, dur, label))
-        issues.extend(_channels(tm, dur, settings, label))
-        hum = _hum(tm, dur, settings, content, label)
+        issues.extend(_peaks(tm, tdur, sp, label))
+        issues.extend(_loudness(tm, tdur, sp, label))
+        issues.extend(_truncation(tm, tdur, label))
+        issues.extend(_channels(tm, tdur, settings, label))
+        hum = _hum(tm, tdur, settings, content, label)
         issues.extend(hum)
-        issues.extend(_noise_floor(tm, dur, settings, content, label, hum_found=bool(hum)))
+        issues.extend(_noise_floor(tm, tdur, settings, content, label, hum_found=bool(hum)))
     return issues

@@ -149,7 +149,8 @@ class Settings(BaseSettings):
     decode_timeout_s: float = 120.0          # base timeout per ffmpeg pass ...
     decode_timeout_per_audio_s: float = 0.5  # ... plus this many seconds per second of audio
     max_total_audio_s: float = 4 * 3600      # streams x duration budget per file (amplification)
-    max_total_channel_s: float = 6 * 3600 * 8  # channels x duration budget (6 h of 7.1 audio)
+    max_total_channel_s: float = 3 * 3600 * 8  # channels x duration budget (3 h of 7.1 audio)
+    decode_timeout_per_channel_s: float = 0.05  # per-file deadline: base + this x channel-seconds
     ffmpeg_path: str | None = None           # explicit ffmpeg binary; else auto-detected
 
     # watch() temporal bounds (Phase 4)

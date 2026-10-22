@@ -34,7 +34,7 @@ GROUPS = [
     ("Limits", ["max_request_bytes", "max_media_bytes", "max_duration_s", "max_sample_rate",
                 "max_channels", "max_audio_streams", "max_total_audio_s", "max_total_channel_s",
                 "decode_timeout_s",
-                "decode_timeout_per_audio_s", "request_timeout_s",
+                "decode_timeout_per_audio_s", "decode_timeout_per_channel_s", "request_timeout_s",
                 "max_concurrent_jobs", "max_concurrent_uploads", "body_read_timeout_s", "queue_wait_s",
                 "max_inflight_per_tenant", "max_inflight_total", "max_queued_jobs",
                 "max_stored_jobs",
