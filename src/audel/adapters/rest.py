@@ -106,7 +106,9 @@ def build_app(settings: Settings | None = None):
     audit = AuditLog(settings.audit_log)
     _job_sem = asyncio.Semaphore(settings.max_concurrent_jobs)
     jobs = JobStore(max_queued=settings.max_queued_jobs, max_stored=settings.max_stored_jobs,
-                    ttl_s=settings.job_result_ttl_s, semaphore=_job_sem)
+                    ttl_s=settings.job_result_ttl_s, semaphore=_job_sem,
+                    max_queued_per_owner=settings.max_queued_jobs_per_tenant,
+                    max_stored_per_owner=settings.max_stored_jobs_per_tenant)
     _ws_marker = str(settings.cache_dir)  # redacted from error detail (no temp-path leak)
 
     def _principal(request: Request) -> Principal:
@@ -136,12 +138,16 @@ def build_app(settings: Settings | None = None):
             # Liveness never reads the body (unauthenticated: must not buffer anything).
             return reply(JSONResponse({"status": "ok", "version": __version__}))
         client = client_key(request.client.host if request.client else None)
+        # A client address that has spent its failed-auth budget is refused WITHOUT evaluating
+        # the credential, so guessing cannot continue. (Behind a proxy, AUDEL_FORWARDED_ALLOW_IPS
+        # gives every real client its own budget.)
+        if auth.required and fail_limiter.blocked(client):
+            return reply(JSONResponse({"detail": "Too many failed attempts."}, status_code=429,
+                                      headers={"Retry-After": "60"}))
         # Authenticate BEFORE the body is read: an unauthenticated caller must not be able to
         # make the server read up to max_request_bytes (DoS amplification).
         principal = auth.authenticate(request.headers.get("authorization"))
         if principal is None:
-            # Failures are throttled per client address; a VALID credential is never blocked by
-            # someone else's failures (shared NAT / load-balancer addresses).
             ok_fail, retry_fail = fail_limiter.allow(client)
             if not ok_fail:
                 return reply(JSONResponse({"detail": "Too many failed attempts."},
@@ -484,7 +490,9 @@ def build_app(settings: Settings | None = None):
             "understand": understand})
         if (file is None) == (not url):
             raise HTTPException(status_code=400, detail="send exactly one of: a 'file' upload or a 'url'")
-        if jobs.pending() >= settings.max_queued_jobs:
+        if jobs.pending() >= settings.max_queued_jobs or \
+                jobs.pending(principal.tenant) >= (settings.max_queued_jobs_per_tenant
+                                                  or max(1, settings.max_queued_jobs // 4)):
             raise HTTPException(status_code=429, detail="job queue is full; retry later",
                                 headers={"Retry-After": "30"})
         spooled: Path | None = None

@@ -86,13 +86,13 @@ def test_per_tenant_rate_limit(tmp_path, tokens_file):
     assert c.get("/specs", headers=_h(A_TOK)).status_code == 200  # other tenant unaffected
 
 
-def test_failed_auth_is_throttled_but_never_locks_out_valid_credentials(tmp_path, tokens_file):
+def test_failed_auth_throttle_stops_guessing(tmp_path, tokens_file):
     s = Settings(cache_dir=tmp_path, api_tokens_file=tokens_file, auth_fail_per_min=4)
     c = TestClient(build_app(settings=s))
     codes = [c.get("/specs", headers=_h(f"guess-{i}")).status_code for i in range(6)]
     assert codes[0] == 401 and codes[-1] == 429
-    # A valid credential from the same (possibly shared NAT/LB) address still gets through.
-    assert c.get("/specs", headers=_h(A_TOK)).status_code == 200
+    # The throttle is real: the right token from the throttled address learns nothing either.
+    assert c.get("/specs", headers=_h(A_TOK)).status_code == 429
 
 
 def test_rate_limiter_memory_is_bounded():
@@ -322,7 +322,7 @@ def test_mutual_tls_requires_a_client_certificate(tmp_path, monkeypatch):
 def test_serve_refuses_half_configured_tls(monkeypatch, tmp_path):
     from audel.adapters.rest import serve
 
-    monkeypatch.setenv("AUDEL_API_TOKEN", "x" * 40)
+    monkeypatch.setenv("AUDEL_API_TOKEN", "Zq8vT2mR7xKp4nW9cLbY3hJf6sDg1aEu0oQiVtXz")
     monkeypatch.setenv("AUDEL_TLS_CERTFILE", str(tmp_path / "a.crt"))
     with pytest.raises(SystemExit):
         serve("127.0.0.1", 0)

@@ -49,7 +49,10 @@ class OllamaBackend:
         u = urlsplit(url)
         if u.scheme != "https":
             raise UnsafeSourceError("the Ollama cloud key is only ever sent over https")
-        if (u.hostname or "").lower() in {h.lower() for h in self._settings.trusted_backend_hosts}:
+        from ..netguard import canonical_host
+
+        if canonical_host(u.hostname) in {canonical_host(h)
+                                          for h in self._settings.trusted_backend_hosts}:
             raise UnsafeSourceError("the Ollama cloud key is never sent to an on-prem host; "
                                     "use the keyless ollama-local backend for LAN servers")
         assert_backend_url(url, self._settings.trusted_backend_hosts, self._settings)  # SSRF: vet the endpoint

@@ -68,6 +68,10 @@ local = "audel.backends.local:LocalBackend"
 [tool.hatch.build.targets.wheel]
 packages = ["src/audel"]
 
+[tool.hatch.build.targets.sdist]
+include = ["/src/audel", "/tests", "/scripts", "/README.md", "/LICENSE", "/CHANGELOG.md", "/SECURITY.md",
+           "/CITATION.cff", "/pyproject.toml"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"

@@ -194,6 +194,8 @@ class Settings(BaseSettings):
     # Async jobs + operations (Phase 11)
     max_queued_jobs: int = 64          # submissions beyond this get 429 (backpressure)
     max_stored_jobs: int = 1000        # finished results kept (oldest evicted first)
+    max_queued_jobs_per_tenant: int | None = None  # default: a quarter of max_queued_jobs
+    max_stored_jobs_per_tenant: int | None = None  # default: a quarter of max_stored_jobs
     job_result_ttl_s: float = 3600.0   # finished results are purged after this
     audit_log: Path | None = None      # JSON-lines audit file (hashes + outcomes, never content)
     metrics_enabled: bool = True

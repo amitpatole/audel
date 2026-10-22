@@ -56,6 +56,12 @@ class _SecretScrubber(logging.Filter):
         if scrubbed != msg:
             record.msg = scrubbed
             record.args = ()
+        if record.exc_info:
+            # Tracebacks can carry secrets too (exception text, locals in messages).
+            import traceback
+
+            record.exc_text = scrub_text("".join(traceback.format_exception(*record.exc_info)))
+            record.exc_info = None
         return True
 
 

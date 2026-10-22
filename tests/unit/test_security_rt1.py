@@ -85,7 +85,7 @@ import time  # noqa: E402
 from audel.auth import Authenticator, client_key, load_tenants, token_hash  # noqa: E402
 from audel.errors import ConfigError, UnsafeSourceError  # noqa: E402
 
-SHARED = "shared-token-0123456789-0123456789-abcdef"
+SHARED = "Zq8vT2mR7xKp4nW9cLbY3hJf6sDg1aEu0oQiVtXz"  # random-looking, >= 128 bits
 A_TOK = "tenant-a-token-xxxxxxxxxxxxxxxx"
 
 
@@ -162,11 +162,14 @@ def test_jwt_alg_key_type_mismatch_is_a_401_and_is_rate_limited(tmp_path, idp):
     assert 500 not in codes and codes[0] == 401 and codes[-1] == 429
 
 
-def test_valid_credentials_pass_while_others_fail_from_the_same_address(tmp_path):
+def test_throttled_address_is_refused_without_evaluating_credentials(tmp_path):
+    # Round 2 refinement: once an address spends its failure budget, even a correct guess is
+    # refused (429), so guessing cannot continue. Per-client budgets behind a proxy come from
+    # AUDEL_FORWARDED_ALLOW_IPS (see test_forwarded_headers_untrusted_by_default).
     c = TestClient(build_app(settings=_s(tmp_path, auth_fail_per_min=4)))
     for i in range(20):
         c.get("/specs", headers={"authorization": f"Bearer wrong-{i}"})
-    assert c.get("/specs", headers={"authorization": f"Bearer {SHARED}"}).status_code == 200
+    assert c.get("/specs", headers={"authorization": f"Bearer {SHARED}"}).status_code == 429
 
 
 def test_short_shared_token_refused(tmp_path):
@@ -377,3 +380,127 @@ def test_ipv6_transition_forms_cannot_smuggle_internal_ipv4(addr):
     from audel.netguard import ip_is_blocked
 
     assert ip_is_blocked(addr)
+
+
+# ==== round 2, auth surface ===================================================================
+
+@pytest.mark.parametrize("weak", ["a" * 40, "correct-horse-battery-staple-0001", "abcabcabcabcabcabcabcabcabcabcabcabc"])
+def test_low_entropy_shared_tokens_refused(weak):
+    with pytest.raises(ConfigError):
+        Authenticator(Settings(api_token=weak))
+
+
+def test_strong_shared_token_accepted():
+    import secrets
+
+    assert Authenticator(Settings(api_token=secrets.token_hex(32))).required
+
+
+def test_duplicate_token_hashes_rejected(tmp_path):
+    f = tmp_path / "t.json"
+    f.write_text(json.dumps({"tenants": {"alice": {"sha256": token_hash(A_TOK)},
+                                         "bob": {"sha256": token_hash(A_TOK)}}}))
+    with pytest.raises(ConfigError):
+        load_tenants(f)
+
+
+def test_jwks_key_whose_key_ops_exclude_verify_is_not_used(tmp_path):
+    jwt = pytest.importorskip("jwt")
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    pub = jwt.algorithms.ECAlgorithm.to_jwk(key.public_key(), as_dict=True)
+    pub.update(kid="k", key_ops=["encrypt"])
+    jwks = tmp_path / "j.json"
+    jwks.write_text(json.dumps({"keys": [pub]}))
+    now = int(time.time())
+    tok = jwt.encode({"iss": "https://idp", "aud": "audel", "iat": now, "exp": now + 60,
+                      "tenant": "x"}, key, algorithm="ES256", headers={"kid": "k"})
+    a = Authenticator(Settings(jwt_jwks_file=jwks, jwt_issuer="https://idp", jwt_audience="audel",
+                               jwt_algorithms=["ES256"]))
+    assert a.authenticate(f"Bearer {tok}") is None
+
+
+def test_one_tenant_cannot_starve_or_evict_another():
+    from audel.jobs import JobStore, QueueFull
+
+    async def scenario():
+        store = JobStore(max_queued=8, max_stored=8, ttl_s=600, semaphore=asyncio.Semaphore(1))
+        gate = asyncio.Event()
+
+        async def slow():
+            await gate.wait()
+            return {}
+
+        async def fast():
+            return {}
+
+        bob_done = store.submit("bob", "check", fast)
+        await asyncio.sleep(0.01)
+        assert bob_done.status == "done"
+        for _ in range(2):  # alice's fair share of the queue is 8 // 4 = 2
+            store.submit("alice", "check", slow)
+        with pytest.raises(QueueFull):
+            store.submit("alice", "check", slow)
+        store.submit("bob", "check", fast)  # bob can still submit
+        gate.set()
+        for _ in range(10):  # alice churns finished results
+            await asyncio.sleep(0.01)
+            try:
+                store.submit("alice", "check", fast)
+            except QueueFull:
+                pass
+        await asyncio.sleep(0.05)
+        assert store.get("bob", bob_done.id) is not None  # bob's result survived alice's churn
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("spelling", ["[::ffff:8.8.8.8]", "134744072", "0x08080808", "8.8.8.8."])
+def test_trusted_host_comparison_is_canonical(spelling):
+    from audel.backends.ollama import OllamaBackend
+
+    be = OllamaBackend(Settings(ollama_base_url=f"https://{spelling}/v1", ollama_api_key="k",
+                                trusted_backend_hosts=["8.8.8.8"]))
+    with pytest.raises(UnsafeSourceError, match="on-prem"):
+        asyncio.run(be.complete_text("s", "u"))
+
+
+def test_tracebacks_are_scrubbed_of_secrets():
+    import logging
+
+    from audel.logging import get_logger, register_secret
+
+    register_secret("sekret-value-123456789")
+    log = get_logger("t")
+    rec = logging.LogRecord("audel.t", logging.ERROR, __file__, 1, "boom", (), None)
+    try:
+        raise RuntimeError("leaked sekret-value-123456789")
+    except RuntimeError:
+        import sys
+
+        rec.exc_info = sys.exc_info()
+    for f in log.filters + logging.getLogger("audel").filters + [
+            f for h in logging.getLogger("audel").handlers for f in h.filters]:
+        f.filter(rec)
+    assert rec.exc_text and "sekret-value-123456789" not in rec.exc_text
+
+
+def test_docs_build_excludes_the_residuals_ledger():
+    from pathlib import Path
+
+    cfg = (Path(__file__).resolve().parents[2] / "mkdocs.yml").read_text()
+    assert "exclude_docs" in cfg and "SECURITY_RESIDUALS.md" in cfg
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="helm not installed")
+@pytest.mark.parametrize("args", [["--set", "tls.mutual=true"],
+                                  ["--set", "service.type=LoadBalancer"],
+                                  ["--set", "service.type=NodePort"]])
+def test_helm_refuses_insecure_renders(args):
+    from pathlib import Path
+
+    chart = Path(__file__).resolve().parents[2] / "deploy" / "helm" / "audel"
+    r = subprocess.run(["helm", "template", "t", str(chart), "--set", "auth.existingSecret=s", *args],
+                       capture_output=True, text=True)
+    assert r.returncode != 0 and "TLS" in (r.stderr + r.stdout).upper()

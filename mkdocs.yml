@@ -7,6 +7,9 @@ repo_url: https://github.com/amitpatole/audel
 repo_name: amitpatole/audel
 copyright: MIT © Amit Patole
 docs_dir: docs
+# Never build the local-only residuals ledger into a site.
+exclude_docs: |
+  SECURITY_RESIDUALS.md
 
 theme:
   name: material
@@ -74,4 +77,5 @@ nav:
   - Security: security.md
   - Reference:
       - CLI: cli.md
+      - Configuration: configuration.md
       - Python API: api.md

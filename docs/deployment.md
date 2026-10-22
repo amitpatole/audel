@@ -40,8 +40,12 @@ export AUDEL_ADMIN_TENANTS='["ops"]'         # who may read /doctor and /metrics
 
 A shared `AUDEL_API_TOKEN` must be at least 32 characters. For OIDC, set `AUDEL_JWT_JWKS_FILE`,
 `AUDEL_JWT_ISSUER` and `AUDEL_JWT_AUDIENCE`, and keep the JWKS file synced from your identity
-provider. JWT tenants appear as `jwt:<claim>`. Behind a reverse proxy, list it in
-`AUDEL_FORWARDED_ALLOW_IPS` so per-address throttling sees real client addresses.
+provider. JWT tenants appear as `jwt:<claim>`.
+
+!!! warning "Behind a reverse proxy or load balancer"
+    List the proxy in `AUDEL_FORWARDED_ALLOW_IPS`. Failed authentication is throttled per client
+    address, and once an address is throttled even valid tokens from it get 429 until it cools
+    down. Without the setting, every client shares the proxy's address and its budget.
 
 ## Async jobs
 
@@ -55,8 +59,8 @@ curl -H "Authorization: Bearer $AUDEL_API_TOKEN" http://audel:8000/jobs/5f0c…
 # {"status": "done", "result": { …the Report… }}
 ```
 
-The queue is bounded. Past `AUDEL_MAX_QUEUED_JOBS` (default 64) a submission gets `429` with a
-`Retry-After` header. Finished results are kept for `AUDEL_JOB_RESULT_TTL_S` (default 1 hour) and
+The queue is bounded overall (`AUDEL_MAX_QUEUED_JOBS`, default 64) and per tenant (a quarter of
+that by default). Past either bound a submission gets `429` with a `Retry-After` header. Finished results are kept for `AUDEL_JOB_RESULT_TTL_S` (default 1 hour) and
 then purged.
 
 !!! note "Scaling out"
@@ -148,7 +152,9 @@ helm install qc deploy/helm/audel --set auth.existingSecret=audel-auth \
   --set env.AUDEL_DELIVERY_SPEC=ebu_r128
 ```
 
-The chart refuses to render without an auth source. That can be `auth.existingSecret`, the shared
+The chart refuses to render without an auth source. It also refuses `tls.mutual` without
+`tls.secretName`, and a `LoadBalancer` or `NodePort` service without TLS unless
+`service.allowPlaintext=true`. That can be `auth.existingSecret`, the shared
 token; `auth.tokensSecret`, a Secret holding `tokens.json`; or `auth.jwt.jwksConfigMap` with
 `issuer` and `audience`. `tls.secretName` serves TLS, and `tls.mutual: true` adds mutual TLS.
 `replicaCount` defaults to 1 because async jobs live in each pod's memory. Ingress defaults to

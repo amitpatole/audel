@@ -22,7 +22,9 @@ Credential sources, tried in this order:
 
 Rate limits are token buckets per tenant (``AUDEL_RATE_LIMIT_PER_MIN``, per-tenant override in
 the tokens file) and, for failed authentication, per client address
-(``AUDEL_AUTH_FAIL_PER_MIN``), so a token cannot be brute-forced at line rate.
+(``AUDEL_AUTH_FAIL_PER_MIN``). Once an address spends its failure budget its requests are
+refused with 429 WITHOUT evaluating the credential, so guessing cannot continue at line rate.
+Behind a reverse proxy set ``AUDEL_FORWARDED_ALLOW_IPS`` so each real client has its own budget.
 """
 
 from __future__ import annotations
@@ -68,6 +70,19 @@ def valid_tenant(name: str) -> bool:
     return bool(_TENANT_RE.match(name or ""))
 
 
+def strong_token(token: str) -> bool:
+    """Length AND estimated entropy (Shannon bits/char x length >= 128): rejects "a"*32 and
+    dictionary passphrases padded to length."""
+    import math
+    from collections import Counter
+
+    if len(token) < _MIN_SHARED_TOKEN:
+        return False
+    counts = Counter(token)
+    bits_per_char = -sum(c / len(token) * math.log2(c / len(token)) for c in counts.values())
+    return bits_per_char * len(token) >= 128 and len(counts) >= 12
+
+
 def token_hash(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
@@ -85,6 +100,7 @@ def load_tenants(path: Path) -> dict[str, tuple[bytes, int | None]]:
     if not isinstance(tenants, dict) or not tenants or len(tenants) > _MAX_TENANTS:
         raise ConfigError("tokens file needs a non-empty 'tenants' object")
     out: dict[str, tuple[bytes, int | None]] = {}
+    seen: set[bytes] = set()
     for name, entry in tenants.items():
         if not valid_tenant(str(name)) or not isinstance(entry, dict):
             raise ConfigError(f"invalid tenant entry {str(name)[:64]!r}")
@@ -97,7 +113,11 @@ def load_tenants(path: Path) -> dict[str, tuple[bytes, int | None]]:
         if rate is not None and (not isinstance(rate, int) or isinstance(rate, bool)
                                  or rate < 1 or rate > 1_000_000):
             raise ConfigError(f"tenant {name!r}: rate_per_min must be an integer from 1")
-        out[str(name)] = (bytes.fromhex(h), rate)
+        digest = bytes.fromhex(h)
+        if digest in seen:
+            raise ConfigError(f"tenant {name!r}: the same token hash is assigned to two tenants")
+        seen.add(digest)
+        out[str(name)] = (digest, rate)
     return out
 
 
@@ -105,8 +125,10 @@ def _jwk_fits(k, kty: str | None, alg: str) -> bool:
     """A JWKS key may verify this token only if its type matches the alg family and its own
     declared alg/use (when present) agree. Prevents cross-type key use and type-confusion crashes."""
     data = getattr(k, "_jwk_data", None) or {}
+    ops = data.get("key_ops")
     return (data.get("kty") == kty and data.get("alg") in (None, alg)
-            and data.get("use") in (None, "sig"))
+            and data.get("use") in (None, "sig")
+            and (ops is None or (isinstance(ops, list) and "verify" in ops)))
 
 
 class _JWTVerifier:
@@ -168,9 +190,9 @@ class _JWTVerifier:
 class Authenticator:
     def __init__(self, settings: Settings) -> None:
         self._s = settings
-        if settings.api_token is not None and len(settings.api_token) < _MIN_SHARED_TOKEN:
-            raise ConfigError(f"AUDEL_API_TOKEN must be at least {_MIN_SHARED_TOKEN} characters "
-                              "(generate one with: openssl rand -hex 32)")
+        if settings.api_token is not None and not strong_token(settings.api_token):
+            raise ConfigError(f"AUDEL_API_TOKEN must be at least {_MIN_SHARED_TOKEN} characters of "
+                              "random data (about 128 bits); generate one with: openssl rand -hex 32")
         self._tenants = load_tenants(settings.api_tokens_file) if settings.api_tokens_file else {}
         self._jwt = _JWTVerifier(settings) if settings.jwt_jwks_file else None
 

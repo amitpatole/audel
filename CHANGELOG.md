@@ -95,6 +95,22 @@ All notable changes to Audel are recorded here. The format follows
   - **Deploy.** Helm ingress defaults to the same namespace, DNS egress goes to kube-dns only,
     token, JWKS and TLS mounts are supported, and the default is one replica. The Dockerfile base
     is pinned by digest, and GitHub Actions are pinned to commit SHAs.
+- Red-team round 2 fixes (auth surface), each pinned by a regression test:
+  - **Medium.** A throttled address still had every guess evaluated, so the right token got 200.
+    A throttled address is now refused (429) before its credential is evaluated. Shared tokens
+    also need about 128 bits of estimated entropy, not just 32 characters.
+  - **Medium.** One tenant could fill the global job queue and evict other tenants' results. The
+    queue and the result store now have per-tenant fair shares, and a tenant's own oldest result is
+    evicted first.
+  - **Medium.** Helm rendered a plaintext deployment for `tls.mutual` without a certificate. It now
+    refuses that, and refuses LoadBalancer or NodePort without TLS unless explicitly allowed.
+  - **Low.** Trusted-host comparison is canonical (IPv4-mapped, decimal or hex IPv4, trailing dot).
+  - **Low.** JWKS keys whose `key_ops` exclude `verify` are no longer used.
+  - **Low.** Duplicate token hashes across tenants are rejected.
+  - **Low.** Logged tracebacks are scrubbed of secrets.
+  - **Low.** The docs build excludes local-only files.
+  - **Low.** The OG-image workflow no longer holds a write token while it installs third-party
+    packages, and its docs and OG dependencies are pinned.
 - **Per-tenant tokens.** `AUDEL_API_TOKENS_FILE` holds SHA-256 hashes only, and
   `audel token new` mints a token. All tenant hashes are compared in constant time on every
   request.

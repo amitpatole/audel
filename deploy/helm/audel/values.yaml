@@ -41,6 +41,7 @@ cacheSizeLimit: 2Gi
 service:
   type: ClusterIP
   port: 8000
+  allowPlaintext: false   # LoadBalancer/NodePort without tls.secretName fails unless set
 
 networkPolicy:
   enabled: true

@@ -46,27 +46,47 @@ class QueueFull(AudelError):
 
 class JobStore:
     def __init__(self, *, max_queued: int, max_stored: int, ttl_s: float,
-                 semaphore: asyncio.Semaphore) -> None:
+                 semaphore: asyncio.Semaphore, max_queued_per_owner: int | None = None,
+                 max_stored_per_owner: int | None = None) -> None:
         self._jobs: dict[str, Job] = {}
         self._max_queued, self._max_stored, self._ttl = max_queued, max_stored, ttl_s
+        # Fair share: one tenant cannot fill the global queue or evict others' results.
+        self._q_owner = max_queued_per_owner or max(1, max_queued // 4)
+        self._s_owner = max_stored_per_owner or max(1, max_stored // 4)
         self._sem = semaphore
 
-    def _purge(self) -> None:
+    def _purge(self, owner: str | None = None) -> None:
         now = time.time()
         for jid in [j.id for j in self._jobs.values()
                     if j.finished is not None and now - j.finished > self._ttl]:
             del self._jobs[jid]
-        finished = sorted((j for j in self._jobs.values() if j.finished is not None),
-                          key=lambda j: j.finished or 0)
-        while len(self._jobs) > self._max_stored and finished:
-            del self._jobs[finished.pop(0).id]
+        # A tenant's own oldest finished results go first (never another tenant's)...
+        if owner is not None:
+            own = sorted((j for j in self._jobs.values() if j.owner == owner and j.finished),
+                         key=lambda j: j.finished or 0)
+            while len(own) >= self._s_owner:
+                del self._jobs[own.pop(0).id]
+        # ...then the global bound, taken from whoever holds the most finished results.
+        while len(self._jobs) > self._max_stored:
+            finished = [j for j in self._jobs.values() if j.finished is not None]
+            if not finished:
+                break
+            counts: dict[str, int] = {}
+            for j in finished:
+                counts[j.owner] = counts.get(j.owner, 0) + 1
+            heavy = max(counts, key=lambda o: counts[o])
+            victim = min((j for j in finished if j.owner == heavy), key=lambda j: j.finished or 0)
+            del self._jobs[victim.id]
 
-    def pending(self) -> int:
-        return sum(1 for j in self._jobs.values() if j.status in ("queued", "running"))
+    def pending(self, owner: str | None = None) -> int:
+        return sum(1 for j in self._jobs.values() if j.status in ("queued", "running")
+                   and (owner is None or j.owner == owner))
 
     def submit(self, owner: str, kind: str, work: Callable[[], Awaitable[dict]],
                on_done: Callable[[Job], None] | None = None) -> Job:
-        self._purge()
+        self._purge(owner)
+        if self.pending(owner) >= self._q_owner:
+            raise QueueFull("your job queue is full; retry later")
         if self.pending() >= self._max_queued:
             raise QueueFull("job queue is full; retry later")
         job = Job(id=uuid.uuid4().hex, owner=owner, kind=kind)

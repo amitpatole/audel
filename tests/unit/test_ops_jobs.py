@@ -44,7 +44,8 @@ def _wait(c, jid, timeout=60):
 def test_job_store_scopes_by_owner_and_bounds_the_queue():
     async def scenario():
         sem = asyncio.Semaphore(1)
-        store = JobStore(max_queued=2, max_stored=10, ttl_s=60, semaphore=sem)
+        store = JobStore(max_queued=2, max_stored=10, ttl_s=60, semaphore=sem,
+                         max_queued_per_owner=2)
         gate = asyncio.Event()
 
         async def slow():

@@ -153,6 +153,24 @@ def _always_blocked(addr: str) -> bool:
     return bool(ip.is_link_local or ip.is_multicast or ip.is_unspecified or ip.is_reserved)
 
 
+def canonical_host(host: str | None) -> str:
+    """One spelling per host: lower-case, no trailing dot, IPs normalized (IPv4-mapped IPv6,
+    decimal / octal / hex IPv4 forms) so allow/deny lists can't be dodged by re-spelling."""
+    h = (host or "").strip().lower().rstrip(".").strip("[]")
+    try:
+        ip = _normalize(ipaddress.ip_address(h))
+        return str(ip)
+    except ValueError:
+        pass
+    try:
+        packed = socket.inet_aton(h)  # accepts 134744072, 0x08080808, 010.010.010.010 ...
+        if h and not any(c.isalpha() for c in h.replace("0x", "")):
+            return str(ipaddress.IPv4Address(packed))
+    except OSError:
+        pass
+    return h
+
+
 def assert_backend_url(url: str, trusted_hosts: list[str] | tuple[str, ...] = (),
                        settings=None) -> None:
     """Vet a backend endpoint. Public hosts pass the normal SSRF check. A host the OPERATOR listed
@@ -161,10 +179,10 @@ def assert_backend_url(url: str, trusted_hosts: list[str] | tuple[str, ...] = ()
     parsed = urlparse(url)
     if parsed.scheme not in ALLOWED_SCHEMES:
         raise UnsafeSourceError(f"backend URL scheme {parsed.scheme!r} not allowed (http/https only)")
-    host = (parsed.hostname or "").lower()
+    host = canonical_host(parsed.hostname)
     if parsed.username or parsed.password:
         raise UnsafeSourceError("backend URL may not embed credentials")
-    trusted = {h.strip().lower() for h in trusted_hosts if h and h.strip()}
+    trusted = {canonical_host(h) for h in trusted_hosts if h and h.strip()}
     if settings is not None:
         from .egress import require
 
