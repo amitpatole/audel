@@ -66,11 +66,19 @@ def merge_regions(regions: list[tuple[float, float]], limit: int) -> list[tuple[
             merged[-1][1] = max(merged[-1][1], b)
         else:
             merged.append([a, b])
-    while len(merged) > limit:
-        gaps = [merged[i + 1][0] - merged[i][1] for i in range(len(merged) - 1)]
-        i = int(np.argmin(gaps))
-        merged[i][1] = merged[i + 1][1]
-        del merged[i + 1]
+    excess = len(merged) - limit
+    if excess > 0:
+        # Merging across one gap leaves every other gap unchanged, so closing the ``excess``
+        # smallest gaps in one pass equals merging them one at a time: O(n log n), not O(n^2).
+        order = sorted(range(len(merged) - 1), key=lambda i: merged[i + 1][0] - merged[i][1])
+        close = set(order[:excess])
+        out = [merged[0]]
+        for i in range(1, len(merged)):
+            if i - 1 in close:
+                out[-1][1] = merged[i][1]
+            else:
+                out.append(merged[i])
+        merged = out
     return [(a, b) for a, b in merged]
 
 

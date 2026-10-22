@@ -121,6 +121,20 @@ All notable changes to Audel are recorded here. The format follows
     at most 2 fetches, in a pool of 8.
   - **Low-Medium.** Work abandoned while waiting on its tenant share still ran later. Abandonment now
     propagates through both waits.
+- Red-team round 10 fixes (network surface), each pinned by a regression test. An attacker can't
+  make their own file look like a busy host; every busy signal is host-level.
+  - **Medium.** A crafted MPEG-TS with more than 2,000 splices overflowed the splice list, which
+    marked the scan incomplete and turned a FAIL (half the audio missing) into a WARN. Folding is
+    still exact past the cap, so the scan stays complete and the timeline checks still run.
+  - **Low-Medium.** A busy host during the packet scan is now retried (429), not graded as an
+    incomplete scan.
+  - **Low.** If a pipe-reader thread can't start, the child is killed and reaped and the request
+    is retried, instead of a 500 and zombie processes.
+  - **Low.** With a dialogue-gated spec (such as `netflix`), one undecodable track no longer
+    discards the whole grade; it is reported by name and the others are graded. The speech gate
+    uses the same per-stream cap, and decode refusals report the decoder's reason.
+  - **Low.** Merging speech regions was quadratic; it is now O(n log n).
+  - **Info.** A path made of one long run is no longer blanked from the access log.
 - Red-team round 10 fixes (auth surface), each pinned by a regression test:
   - **Medium.** A flood of tiny runs (`%!%!...`) made each byte of an unauthenticated request line
     costly to scrub, cutting throughput about twelvefold. Only runs long enough to hold a

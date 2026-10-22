@@ -233,8 +233,13 @@ def run(argv: list[str], *, timeout_s: float, max_stdout_bytes: int | None = Non
     p = _popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                stderr=subprocess.PIPE, preexec_fn=pre)
     assert p.stdout is not None and p.stderr is not None
-    out = _BoundedReader(p.stdout, max_stdout_bytes or 16 * 1024 * 1024)
-    err = _BoundedReader(p.stderr, 1024 * 1024, tail=True)  # bounded: a flood can't grow memory
+    try:
+        out = _BoundedReader(p.stdout, max_stdout_bytes or 16 * 1024 * 1024)
+        err = _BoundedReader(p.stderr, 1024 * 1024, tail=True)  # bounded: a flood can't grow memory
+    except RuntimeError:  # no thread to drain the pipes: never leave an unread, unwaited child
+        p.kill()
+        p.wait()
+        raise BusyError("could not start the decoder: the host is at capacity; retry later") from None
     try:
         p.wait(timeout=timeout_s)
     except subprocess.TimeoutExpired as e:
@@ -345,8 +350,14 @@ def pcm_pipeline(path: Path, settings: Settings, *, stream: int, channels: int,
         raise
     assert p1.stdout is not None and p1.stderr is not None and p2.stderr is not None
     p1.stdout.close()  # p2 owns the read end now (so p1 gets SIGPIPE if p2 exits)
-    err1 = _BoundedReader(p1.stderr, 64 * 1024, tail=True)
-    err2 = _BoundedReader(p2.stderr, max_stderr)
+    try:
+        err1 = _BoundedReader(p1.stderr, 64 * 1024, tail=True)
+        err2 = _BoundedReader(p2.stderr, max_stderr)
+    except RuntimeError:  # no thread to drain the pipes: never leave unread, unwaited children
+        for proc in (p1, p2):
+            proc.kill()
+            proc.wait()
+        raise BusyError("could not start the decoder: the host is at capacity; retry later") from None
     deadline = time.monotonic() + timeout_s
     try:
         for proc in (p2, p1):
@@ -544,7 +555,10 @@ class _GapScanner:
                 if len(self.scan.segments) < self.limit:
                     self.scan.segments.append((pts, self._offset))
                 else:
-                    self.overflow = True  # too many jumps to place reliably: incomplete
+                    # Folding is still exact past the cap; only placing OTHER tracks on this
+                    # clock (shared_clock) loses precision. The scan stays complete, so the
+                    # timeline checks still run (an overflow must not turn a FAIL into a WARN).
+                    self.overflow = True
             elif delta > self.min_gap:
                 self._arm("gap")  # a stray packet AHEAD of the clock also looks like a gap
                 self._gap(self._prev_end, c)
@@ -626,7 +640,7 @@ def scan_packets(path: Path, settings: Settings, abs_index: int, *, min_gap_s: f
         proc = _popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                       stderr=subprocess.DEVNULL, preexec_fn=pre)
     except BusyError:
-        return PacketScan(complete=False)  # reported as an incomplete scan, the grade goes on
+        raise  # the host, not the media: retry (429); an incomplete scan would downgrade a FAIL
     assert proc.stdout is not None
     expired = threading.Event()
     done = threading.Event()
@@ -647,7 +661,7 @@ def scan_packets(path: Path, settings: Settings, abs_index: int, *, min_gap_s: f
         proc.kill()
         proc.wait()
         proc.stdout.close()
-        return PacketScan(complete=False)
+        raise BusyError("could not start analysis: the host is at capacity; retry later") from None
     sc = _GapScanner(min_gap_s, limit, fold=fold, max_gap_s=settings.max_duration_s)
     try:
         for line in iter(lambda: proc.stdout.readline(256), b""):  # type: ignore[union-attr]
@@ -664,7 +678,7 @@ def scan_packets(path: Path, settings: Settings, abs_index: int, *, min_gap_s: f
             proc.kill()
         proc.wait()
         proc.stdout.close()
-    result.complete = not expired.is_set() and proc.returncode == 0 and not sc.overflow
+    result.complete = not expired.is_set() and proc.returncode == 0
     return result
 
 
@@ -1105,7 +1119,7 @@ def decode_to_wav(path: Path, settings: Settings, *, sample_rate: int = 16000,
         raise
     if proc.returncode != 0 or out.stat().st_size == 0:
         out.unlink(missing_ok=True)
-        raise DecodeError(f"could not decode audio for ASR: {proc.stderr.decode('utf-8', 'replace')[-200:]}")
+        raise DecodeError(f"could not decode audio for ASR: {_cause(proc.stderr.decode('utf-8', 'replace'))}")
     return out
 
 

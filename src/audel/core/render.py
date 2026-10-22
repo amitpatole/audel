@@ -62,16 +62,26 @@ def summarize_track(tm: TrackMeasurements) -> TrackSummary:
 
 def _dialogue_gate(path, m: Measurements, settings: Settings) -> None:
     """Speech-gated loudness for every track (VAD approximation of dialogue gating)."""
+    from ..errors import AudelError, BusyError
     from ..signals.vad import speech_gated_lufs, speech_regions
 
+    if 0 < m.info.decode_cap_s < settings.max_duration_s:  # the same per-stream cap as measure()
+        settings = settings.model_copy(update={"max_duration_s": m.info.decode_cap_s})
     dur = m.info.duration_s or 0.0
     for tm in m.tracks:
-        regions = speech_regions(path, settings, stream=tm.stream.index)
-        if regions is None:
-            return  # no VAD installed: graders fall back to programme loudness (LOW confidence)
-        speech_s = sum(b - a for a, b in regions)
-        tm.dialogue_coverage = (speech_s / dur) if dur > 0 else None
-        tm.dialogue_lufs = speech_gated_lufs(path, settings, regions, stream=tm.stream.index)
+        if tm.failed:
+            continue  # already reported as track_decode_error; the others are still graded
+        try:
+            regions = speech_regions(path, settings, stream=tm.stream.index)
+            if regions is None:
+                return  # no VAD installed: graders fall back to programme loudness
+            speech_s = sum(b - a for a, b in regions)
+            tm.dialogue_coverage = (speech_s / dur) if dur > 0 else None
+            tm.dialogue_lufs = speech_gated_lufs(path, settings, regions, stream=tm.stream.index)
+        except BusyError:
+            raise
+        except AudelError:
+            continue  # this track falls back to programme loudness; the grade is kept
 
 
 def _render_sync(source, settings: Settings, spec: DeliverySpec | str | None = None) -> RenderResult:

@@ -2882,8 +2882,10 @@ def test_scan_without_a_watchdog_thread_never_runs_unwatched(media, monkeypatch)
         return real(self)
 
     monkeypatch.setattr(threading.Thread, "start", start)
-    res = scan_packets(media["good"], Settings(), 0, timeout_s=10)
-    assert res is not None and not res.complete
+    from audel.errors import BusyError
+
+    with pytest.raises(BusyError):  # round 10: retried (429), never an incomplete-scan WARN
+        scan_packets(media["good"], Settings(), 0, timeout_s=10)
 
 
 @requires_ffmpeg
@@ -2977,3 +2979,110 @@ def test_real_jwts_still_redacted_in_every_header_form():
                 b'{"x5t#S256":"abc","alg":"RS256"}'):
         jwt = f"{b64(hdr)}.{b64(_json.dumps({'tenant': 'a'}).encode())}.c2lnbmF0dXJlLWJ5dGVz"
         assert jwt[:20] not in scrub_text(f"GET /x?jwt={jwt}")
+
+
+# ==== round 10, network surface ===============================================================
+
+def test_splice_list_overflow_keeps_the_timeline_checks():
+    from audel.mediaguard import _GapScanner
+
+    sc = _GapScanner(0.1, 50, fold=True)
+    t = 0.0
+    for n in range(30_000):
+        sc.add(t, 0.024)
+        t += 0.048 + (61.0 if n % 10 == 9 else 0.0)   # 50% missing + a splice every 10
+    res = sc.finish()
+    assert sc.overflow and res.complete              # still graded, not "incomplete"
+    decoded = 30_000 * 0.024
+    assert res.extent_s - decoded - res.gap_total_s > 0.4 * res.extent_s
+
+
+def test_a_busy_host_during_the_packet_scan_is_retried_not_downgraded(media, monkeypatch):
+    from audel.errors import BusyError
+    from audel.mediaguard import scan_packets
+
+    _busy_spawn(monkeypatch, lambda argv: "ffprobe" in str(argv[0]) and "-show_entries" in argv
+                and "packet=pts_time,duration_time" in argv)
+    with pytest.raises(BusyError):
+        scan_packets(media["good"], Settings(), 0, timeout_s=10)
+
+
+def test_pipe_reader_thread_failure_is_busy_and_reaps_the_child(media, monkeypatch):
+    import threading
+
+    import audel.mediaguard as mg
+    from audel.errors import BusyError
+
+    real = threading.Thread.start
+
+    def start(self):
+        if getattr(self, "_target", None) is not None and \
+                getattr(self._target, "__name__", "") == "_run":
+            raise RuntimeError("can't start new thread")
+        return real(self)
+
+    monkeypatch.setattr(threading.Thread, "start", start)
+    ffprobe = mg._tool("ffprobe", None)
+    with pytest.raises(BusyError):
+        mg.run([ffprobe, "-v", "error", "-version"], timeout_s=10)
+
+
+def test_dialogue_gate_skips_failed_tracks_and_keeps_the_grade(monkeypatch):
+    import audel.signals.vad as vad
+    from audel.core.render import _dialogue_gate
+    from audel.errors import DecodeError
+    from audel.mediaguard import MediaInfo, StreamInfo
+    from audel.signals.measure import Measurements, TrackMeasurements
+
+    st = [StreamInfo(index=i, codec="flac", sample_rate=48000, channels=2) for i in range(3)]
+    m = Measurements(info=MediaInfo(duration_s=10, sample_rate=48000, channels=2, codec="flac",
+                                    has_audio=True, streams=tuple(st)))
+    m.tracks = [TrackMeasurements(stream=st[0]), TrackMeasurements(stream=st[1], failed="x"),
+                TrackMeasurements(stream=st[2])]
+
+    def regions(path, settings, stream=0):
+        if stream == 1:
+            raise AssertionError("failed track must be skipped")
+        if stream == 2:
+            raise DecodeError("could not decode audio for ASR")
+        return [(0.0, 5.0)]
+
+    monkeypatch.setattr(vad, "speech_regions", regions)
+    monkeypatch.setattr(vad, "speech_gated_lufs", lambda *a, **k: -23.0)
+    _dialogue_gate("x", m, Settings())
+    assert m.tracks[0].dialogue_lufs == -23.0 and m.tracks[2].dialogue_lufs is None
+
+
+def test_region_merge_is_fast_and_matches_greedy():
+    import random
+
+    from audel.signals.vad import merge_regions
+
+    rng = random.Random(7)
+    t, regs = 0.0, []
+    for _ in range(20_000):
+        a = t + rng.random()
+        regs.append((a, a + rng.random()))
+        t = a + 1.5
+    t0 = time.perf_counter()
+    out = merge_regions(regs, 200)
+    assert time.perf_counter() - t0 < 2.0 and len(out) == 200   # was ~8.5 s for 10k
+
+    def greedy(rs, limit):
+        m = [list(r) for r in sorted(rs)]
+        while len(m) > limit:
+            gaps = [m[i + 1][0] - m[i][1] for i in range(len(m) - 1)]
+            i = gaps.index(min(gaps))
+            m[i][1] = m[i + 1][1]
+            del m[i + 1]
+        return [tuple(x) for x in m]
+
+    small = regs[:300]
+    assert merge_regions(small, 40) == greedy(small, 40)
+
+
+def test_a_single_run_field_is_not_blanked_from_the_log():
+    from audel.logging import _clip
+
+    out = _clip("/x/" + "%2541/" * 2000)
+    assert out.startswith("/x/%2541") and "truncated" in out

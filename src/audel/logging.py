@@ -162,6 +162,12 @@ def _clip(text: str) -> str:
     cut = _MAX_LOG_TEXT
     while cut > 0 and _RUN_CH.fullmatch(text[cut - 1]):
         cut -= 1
+    if cut < 64:
+        # One run fills the whole window: keep its scrubbed opening so the field isn't blanked
+        # (a credential inside the window is redacted whole; one starting this early and running
+        # past 8 KB isn't a real credential shape).
+        head = _scrub_shapes(text[:_MAX_LOG_TEXT])
+        return head[:64] + f"...[{len(text) - 64} chars truncated]"
     return text[:cut] + f"...[{len(text) - cut} chars truncated]"
 
 
