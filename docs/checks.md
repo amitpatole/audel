@@ -26,6 +26,7 @@ consumers of the contract key on. It also has a precise rule name in `detail.che
 | `packet_gap` | `dropout` | audio packets are missing from the stream's timeline, including a hole stored as one long sample | warning, error above 10% of the track |
 | `timeline_shortfall` | `dropout` | the packet timeline runs longer than the audio that decodes plus the reported gaps (missing audio spread through the track) | warning, error above 10% |
 | `dialogue_unmeasured` | `loudness` | a dialogue-gated spec, but no dialogue was detected or the speech-gated measurement failed; graded on programme loudness | warning (low confidence) |
+| `spectral_unavailable` | `other` | the hum, noise-floor and phase checks could not run on a track | warning (low confidence) |
 | `timeline_excess` | `duration` | more audio decodes than the packet timeline holds (duplicated or mis-timed packets) | warning |
 | `timestamp_jump` | `other` | packet timestamps jump by more than any file may run (a corrupt timeline) | error |
 | `packet_gap_total` | `dropout` | more missing-packet gaps than are listed; reports the total | warning |

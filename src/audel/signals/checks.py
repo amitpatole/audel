@@ -354,6 +354,12 @@ def evaluate(m: Measurements, settings: Settings, spec: DeliverySpec | str | Non
                 f"{label}{b - a:.2f}s of audio packets missing (timeline gap)",
                 Span(start_ms=_ms(a), end_ms=_ms(b)), "packet_gap", tm, conf=Confidence.MEDIUM,
                 programme=True, gap_s=round(b - a, 3)))
+        if tm.spectral_failed:
+            issues.append(_issue(
+                IssueKind.OTHER, Severity.WARNING,
+                f"{label}the hum, noise-floor and phase checks could not run on this track",
+                _track_span(tm, dur), "spectral_unavailable", tm, conf=Confidence.LOW,
+                programme=True))
         if tm.timestamp_jumps:
             issues.append(_issue(
                 IssueKind.OTHER, Severity.ERROR,

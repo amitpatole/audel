@@ -78,6 +78,7 @@ class TrackMeasurements:
     extent_s: float = 0.0                    # how long the packet timeline says the track runs
     overlap_s: float = 0.0                   # decoded audio laid over earlier packets (duplicates)
     timestamp_jumps: int = 0                 # impossible timestamp jumps (a corrupt timeline)
+    spectral_failed: bool = False            # hum / noise floor / phase checks couldn't run
 
     @property
     def end_s(self) -> float:
@@ -189,9 +190,13 @@ def _spectral_pass(ffmpeg: str, path, idx: int, tm: TrackMeasurements, settings:
     def band(f: int) -> str:  # two cascaded high-Q band-passes isolate the mains fundamental
         return f"bandpass=f={f}:width_type=q:w=15,bandpass=f={f}:width_type=q:w=15"
 
+    from ..mediaguard import mono_pan
+
     stereo = tm.stream.channels >= 2
+    # Mono by channel index (any layout: ffmpeg's layout-based downmix rejects plain-channel
+    # layouts, which silently skipped hum / phase / polarity on unlabelled files).
     graph = ["[0:a:0]asplit=2[r1][r2]" if stereo else "[0:a:0]anull[r1]",
-             f"[r1]aresample={_SERIES_RATE},aformat=channel_layouts=mono,"
+             f"[r1]{mono_pan(tm.stream.channel_labels())},aresample={_SERIES_RATE},"
              f"asetnsamples=n={n}:p=0,asplit=3[t][a][b]",
              f"[t]{series}[ot]", f"[a]{band(50)},{series}[o50]", f"[b]{band(60)},{series}[o60]"]
     outs = ["[ot]", "[o50]", "[o60]"]
@@ -208,7 +213,8 @@ def _spectral_pass(ffmpeg: str, path, idx: int, tm: TrackMeasurements, settings:
     except (UnsafeSourceError, BusyError):
         raise  # a busy host must not silently drop checks (it is retried, not graded partially)
     except AudelError:
-        return  # best-effort: the main pass already graded the essentials
+        tm.spectral_failed = True  # reported: hum / noise / phase checks could not run
+        return
     ser = parse_metadata_series(err)
     keys = sorted(ser)  # instance numbers follow graph order: total, 50 Hz, 60 Hz
     if len(keys) >= 3:

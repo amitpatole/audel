@@ -121,6 +121,22 @@ All notable changes to Audel are recorded here. The format follows
     at most 2 fetches, in a pool of 8.
   - **Low-Medium.** Work abandoned while waiting on its tenant share still ran later. Abandonment now
     propagates through both waits.
+- Red-team round 15 fixes (multichannel), each pinned by a regression test. A 94-file legitimate
+  multichannel corpus (every standard layout up to 22.2, unlabelled 3-24 channel WAVs, FLAC,
+  Opus, AAC, AC-3, E-AC-3, custom-order MOV/CAF) matches ffmpeg's own loudness on the true layout
+  within 0.1 LU, with speech detection and the meter agreeing on every channel.
+  - **Medium.** "Ambisonic 1+stereo" Opus (YouTube spatial audio) was refused as undecodable: a
+    named layout Audel couldn't use was forced to 5.1. Default layouts now apply only to truly
+    unlabelled streams; anything else is metered as plain channels.
+  - **Medium.** On unlabelled, custom-order and ambisonic layouts the hum, noise-floor, phase and
+    polarity checks were silently skipped (zeroing a WAV's channel mask turned a FAIL into a
+    WARN). Their mono mix is now built by channel index, which works for any layout, and a
+    spectral pass that can't run is reported (`spectral_unavailable`).
+  - **Low-Medium.** Transcription and listening excerpts used ffmpeg's mono downmix, which drops
+    an unlabelled LCR centre and refuses custom layouts. They now average every non-LFE channel
+    by index.
+  - **Low.** 6.1 and 7.1 AAC with a custom channel configuration probe as "unknown"; they now use
+    the decoder's fixed order, so the LFE isn't metered.
 - Red-team round 15 fixes (auth surface), each pinned by a regression test. No bypass,
   escalation or leak was found, and an origin can't set the proxy's busy flag.
   - **Low-Medium.** A Turkish dotted capital I (`İ`) anywhere before a credential shifted every

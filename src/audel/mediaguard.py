@@ -725,8 +725,11 @@ def channel_layout_arg(layout: str, channels: int) -> str:
         known = layout_channels(layout)
         if known is None or len(known) == n:
             return layout
-    if n in _DEFAULT_LAYOUT:
-        return _DEFAULT_LAYOUT[n]
+    if n in _DEFAULT_LAYOUT and (not layout or layout == "unknown"):
+        return _DEFAULT_LAYOUT[n]  # truly unlabelled: the conventional layout for the count
+    if n <= 2:
+        return "mono" if n == 1 else "stereo"
+    # A layout ffmpeg names but Audel can't use as given (ambisonic, odd forms): plain channels.
     # N plain channels. ffmpeg reads USRk as channel id k, so USR0..USRn would make index 3 an
     # LFE (weight 0) and others surrounds; ids from 768 (AV_CHAN_UNKNOWN) are weighted 1.0 each.
     return "+".join(f"USR{768 + i}" for i in range(n))
@@ -879,7 +882,9 @@ def probe(path: Path, settings: Settings) -> MediaInfo:
         streams.append(StreamInfo(
             declared_end_s=(start + sdur) if sdur is not None and start == start else None,
             index=i, codec=_tag(st.get("codec_name")), sample_rate=sr, channels=ch,
-            layout=_tag(st.get("channel_layout")), language=_tag(tags.get("language")) or None,
+            layout=_fixed_order_layout(_tag(st.get("codec_name")), _tag(st.get("channel_layout")),
+                                       ch),
+            language=_tag(tags.get("language")) or None,
             title=_tag(tags.get("title")) or None, abs_index=_int(st.get("index", -1)),
             start_s=start if start == start else 0.0))
     if channels > settings.max_channels:
@@ -1204,6 +1209,29 @@ def stream_pcm16(path: Path, settings: Settings, *, stream: int, channels: int,
         raise DecodeError(f"could not decode audio: {_cause(err.join(5).decode('utf-8', 'replace'))}")
 
 
+def _fixed_order_layout(codec: str, layout: str, channels: int) -> str:
+    """AAC with a program config element probes as "unknown", but its decoder always outputs
+    ffmpeg's default order for the count (6.1, 7.1): use that rather than plain channels, so the
+    LFE isn't metered and surrounds are weighted as BS.1770 says."""
+    if codec == "aac" and layout in ("", "unknown") and channels in (7, 8):
+        return {7: "6.1", 8: "7.1"}[channels]
+    return layout
+
+
+def mono_pan(labels: list[str]) -> str:
+    """A mono mix by channel INDEX: the mean of every non-LFE channel. Works for any layout
+    (ffmpeg's layout-based downmix rejects plain-channel layouts and guesses unlabelled ones,
+    e.g. dropping an LCR centre as "LFE")."""
+    use = [i for i, lab in enumerate(labels) if not lab.upper().startswith("LFE")] or [0]
+    w = 1.0 / len(use)
+    return "pan=mono|c0=" + "+".join(f"{w:.6f}*c{i}" for i in use)
+
+
+def _stream_info(path: Path, settings: Settings, stream: int) -> StreamInfo | None:
+    info = probe(path, settings)
+    return next((x for x in info.streams if x.index == int(stream)), None)
+
+
 def _keep_layout(layout: str, n: int) -> list[str]:
     """Output exactly the source channels in their order, as the main pass meters them. ``-ac n``
     would remix any layout that isn't ffmpeg's default for n (quad, 3.0, Atmos beds...)."""
@@ -1226,17 +1254,18 @@ def decode_to_wav(path: Path, settings: Settings, *, sample_rate: int = 16000,
     process more than ``max_duration_s`` of audio even if the container lies about its length.
     """
     ffmpeg = _tool("ffmpeg", settings.ffmpeg_path)
+    # What ASR hears: the mean of every non-LFE channel, by index (see mono_pan). Probed BEFORE
+    # the temp file exists, so a probe failure can't leave one behind.
+    st = _stream_info(path, settings, stream)
+    pan = mono_pan(st.channel_labels()) if st is not None else "pan=mono|c0=c0"
     fd, name = _mkstemp("audel-asr-", settings)
     os.close(fd)
     out = Path(name)
-    # mono: ffmpeg's downmix (what ASR hears). all: every channel kept, so speech detection can
-    # hear each one (a downmix drops some immersive channels and cancels antiphase content).
-    channels = [] if mix == "all" else ["-ac", "1"]
     argv = [ffmpeg, "-nostdin", "-hide_banner", "-threads", "1", "-reinit_filter", "0",
             *safe_input(path),
-            "-map", f"0:a:{int(stream)}?", "-af", "asetpts=N/SR/TB",
+            "-map", f"0:a:{int(stream)}?", "-af", f"{pan},asetpts=N/SR/TB",
             "-t", str(settings.max_duration_s),
-            "-ar", str(sample_rate), *channels, "-c:a", "pcm_s16le", "-f", "wav", "-y", str(out)]
+            "-ar", str(sample_rate), "-c:a", "pcm_s16le", "-f", "wav", "-y", str(out)]
     limit = pass_timeout(settings, settings.max_duration_s)
     try:
         proc = run(argv, timeout_s=min(limit, timeout_s) if timeout_s else limit)
@@ -1255,12 +1284,14 @@ def excerpt_wav(path: Path, settings: Settings, *, start_s: float, dur_s: float,
     hears. Duration is clamped to 60 s whatever the caller asks for."""
     ffmpeg = _tool("ffmpeg", settings.ffmpeg_path)
     dur = max(0.5, min(60.0, float(dur_s)))
+    st = _stream_info(path, settings, stream)
+    pan = mono_pan(st.channel_labels()) if st is not None else "pan=mono|c0=c0"
     fd, name = _mkstemp("audel-excerpt-", settings)
     os.close(fd)
     out = Path(name)
     argv = [ffmpeg, "-nostdin", "-hide_banner", "-threads", "1", "-reinit_filter", "0",
-            "-ss", f"{max(0.0, start_s):.3f}", *safe_input(path), "-map", f"0:a:{int(stream)}?", "-t", f"{dur:.3f}",
-            "-ar", str(sample_rate), "-ac", "1", "-f", "wav", "-y", str(out)]
+            "-ss", f"{max(0.0, start_s):.3f}", *safe_input(path), "-map", f"0:a:{int(stream)}?",
+            "-t", f"{dur:.3f}", "-af", pan, "-ar", str(sample_rate), "-f", "wav", "-y", str(out)]
     try:
         proc = run(argv, timeout_s=min(60.0, settings.decode_timeout_s))
     except BaseException:

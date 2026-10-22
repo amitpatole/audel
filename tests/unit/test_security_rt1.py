@@ -807,7 +807,8 @@ def test_decode_timeout_never_leaks_a_temp_wav(tmp_path, media):
     s = Settings(cache_dir=ws, decode_timeout_s=0.001, decode_timeout_per_audio_s=0.0)
     with pytest.raises(AudelError):
         decode_to_wav(validate_source(media["good"], s), s)
-    assert [f for f in (ws / "tmp").iterdir()] == []
+    tmp = ws / "tmp"
+    assert not tmp.exists() or list(tmp.iterdir()) == []
 
 
 def test_alignment_is_bounded_on_repetitive_input():
@@ -3891,3 +3892,69 @@ def test_turkish_text_does_not_desync_redaction_in_workspace_state(tmp_path):
     payload = _json.dumps({"summary": "İzmir promo spot", "notes": "client_secret=hunter2XYZ"})
     assert "hunter2XYZ" not in scrub_text(payload)
     del sess
+
+
+# ==== round 15, decode surface (multichannel) =================================================
+
+def test_named_but_unusable_layouts_get_plain_channels_not_a_guess():
+    from audel.mediaguard import channel_layout_arg
+
+    assert channel_layout_arg("ambisonic 1+stereo", 6).startswith("USR768")
+    assert channel_layout_arg("", 6) == "5.1" and channel_layout_arg("unknown", 6) == "5.1"
+
+
+def test_mono_pan_averages_every_non_lfe_channel_by_index():
+    from audel.mediaguard import mono_pan
+
+    assert mono_pan(["FL", "FR", "FC"]) == "pan=mono|c0=0.333333*c0+0.333333*c1+0.333333*c2"
+    assert "c3" not in mono_pan(["FL", "FR", "FC", "LFE", "BL", "BR"])
+
+
+def test_aac_with_a_program_config_uses_the_decoders_order():
+    from audel.mediaguard import _fixed_order_layout
+
+    assert _fixed_order_layout("aac", "unknown", 7) == "6.1"
+    assert _fixed_order_layout("aac", "", 8) == "7.1"
+    assert _fixed_order_layout("flac", "unknown", 7) == "unknown"
+
+
+@requires_ffmpeg
+def test_zeroing_a_channel_mask_cannot_hide_hum_or_polarity(tmp_path):
+    from audel import check
+
+    lab = tmp_path / "lab.wav"
+    _ff("-f", "lavfi", "-i", "sine=f=440:d=10", "-f", "lavfi", "-i", "sine=f=50:d=10",
+        "-filter_complex", "[0]volume=0.3[s];[1]volume=0.02[h];[s][h]amerge=inputs=2,"
+        "pan=3.0|FL=c0+c1|FR=-1*c0+c1|FC=c1[out]", "-map", "[out]", lab)
+    m0 = tmp_path / "m0.wav"
+    data = bytearray(lab.read_bytes())
+    data[40:44] = b"\0\0\0\0"                       # zero the WAVE_FORMAT_EXTENSIBLE mask
+    m0.write_bytes(bytes(data))
+    a = {i.detail.get("check") for i in asyncio.run(check(str(lab))).issues}
+    b = {i.detail.get("check") for i in asyncio.run(check(str(m0))).issues}
+    assert "polarity_inversion" in a and {"polarity_inversion", "hum"} & a <= b, (a, b)
+
+
+@requires_ffmpeg
+def test_asr_decode_keeps_an_unlabelled_lcr_centre(tmp_path):
+    import wave
+
+    import numpy as np
+
+    from audel.mediaguard import decode_to_wav
+
+    lab = tmp_path / "lcr.wav"
+    _ff("-f", "lavfi", "-i", "sine=f=440:d=4", "-af", "volume=0.3,pan=3.0|FC=c0", lab)
+    m0 = tmp_path / "lcr_m0.wav"
+    data = bytearray(lab.read_bytes())
+    data[40:44] = b"\0\0\0\0"                      # zero the channel mask
+    m0.write_bytes(bytes(data))
+
+    def level(f):
+        w = decode_to_wav(f, Settings(), stream=0)
+        with wave.open(str(w)) as x:
+            a = np.frombuffer(x.readframes(x.getnframes()), "<i2").astype(float)
+        w.unlink()
+        return 20 * np.log10(np.sqrt(np.mean(a ** 2)) / 32768 + 1e-12)
+
+    assert abs(level(m0) - level(lab)) < 1.0        # the centre isn't dropped as "LFE"
