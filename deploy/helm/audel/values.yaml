@@ -30,6 +30,9 @@ env:
   AUDEL_MAX_CONCURRENT_JOBS: "2"
   AUDEL_MAX_REQUEST_BYTES: "200000000"
   AUDEL_MAX_MEDIA_BYTES: "200000000"
+  # Queued uploads held on the cache volume at once; keep it below cacheSizeLimit (2Gi) with
+  # room for in-flight decodes, or a full queue gets the pod evicted.
+  AUDEL_MAX_SPOOL_BYTES: "1200000000"
   AUDEL_REQUEST_TIMEOUT_S: "600"
   AUDEL_ALLOW_URL_INGEST: "false"
   AUDEL_REST_ALLOW_UNDERSTAND: "false"

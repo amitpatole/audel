@@ -4306,3 +4306,77 @@ def test_decoder_probe_timeout_is_busy_not_a_bad_file(monkeypatch):
     with pytest.raises(BusyError):
         mediaguard.decoder_args("speex", 0, Settings())
     assert mediaguard._LIBSPEEX == {}  # nothing cached from a failed probe
+
+
+# ==== round 18b, REST availability + redaction ================================================
+
+def test_disabled_watch_is_refused_before_its_body_is_read(tmp_path, monkeypatch):
+    from starlette.requests import Request
+
+    reads = []
+    orig = Request.body
+
+    async def spy(self):
+        reads.append(1)
+        return await orig(self)
+
+    monkeypatch.setattr(Request, "body", spy)
+    c = TestClient(build_app(settings=_s(tmp_path)))
+    h = {"Authorization": f"Bearer {SHARED}", "Content-Type": "application/json"}
+    r = c.post("/watch", content=b'{"source": "' + b"x" * 2_000_000 + b'"}', headers=h)
+    assert r.status_code == 403 and not reads
+
+
+def test_enabled_watch_takes_only_a_small_declared_body(tmp_path):
+    c = TestClient(build_app(settings=_s(tmp_path, rest_allow_watch=True)))
+    h = {"Authorization": f"Bearer {SHARED}", "Content-Type": "application/json"}
+    assert c.post("/watch", content=b'{"source": "' + b"x" * 70_000 + b'"}',
+                  headers=h).status_code == 413
+    assert c.post("/watch", content=b"[1, 2]", headers=h).status_code == 400
+
+
+def test_queued_upload_bytes_are_bounded_per_tenant(tmp_path):
+    from audel.adapters.rest import SpoolQuota
+
+    q = SpoolQuota(total=1000, per_tenant=400)
+    assert q.reserve("a", 300) and not q.reserve("a", 200)   # tenant bound
+    assert q.reserve("b", 400) and q.reserve("c", 300) and not q.reserve("d", 1)  # overall
+    q.release("a", 300)
+    assert q.reserve("d", 300) and q.held.get("a") is None
+
+    c = TestClient(build_app(settings=_s(tmp_path, max_spool_bytes=10_000,
+                                         max_spool_bytes_per_tenant=5_000)))
+    h = {"Authorization": f"Bearer {SHARED}"}
+    r = c.post("/jobs", files={"file": ("a.wav", b"\0" * 6_000, "audio/wav")}, headers=h)
+    assert r.status_code == 429
+
+
+@pytest.mark.parametrize("text", [
+    "key " * 70 + ' {\\"password\\": \\"zQ7hunterZ\\"}', "token=1 " * 100 + " password2=zQ7hunterZ",
+    "token2=zQ7hunterZ", "TOKEN_V2=zQ7hunterZ", '"access_token2": "zQ7hunterZ"',
+    '"{\\"DB_PASSWORD_PROD\\": \\"zQ7hunterZ\\"}"', "psql --password zQ7hunterZ -h db",
+    "('_sig', 'zQ7hunterZ')", "('v2sig', 'zQ7hunterZ')"])
+def test_round18b_redaction_gaps_are_closed(text):
+    from audel.logging import scrub_text
+
+    assert "zQ7hunterZ" not in scrub_text(text)
+
+
+@pytest.mark.parametrize("text", ["--verbose --pass-through x", "run --token-file /x",
+                                  "('compass', 'north')", "tokens=512"])
+def test_argv_and_pair_rules_keep_ordinary_text(text):
+    from audel.logging import scrub_text
+
+    assert scrub_text(text) == text
+
+
+def test_escaped_quote_floods_stay_bounded():
+    from audel.logging import scrub_text
+
+    text = 'sig=\\\\\\"' * (7900 // 8)
+    best = 9.0
+    for _ in range(5):
+        t0 = time.process_time()
+        scrub_text(text)
+        best = min(best, time.process_time() - t0)
+    assert best < 0.008, best

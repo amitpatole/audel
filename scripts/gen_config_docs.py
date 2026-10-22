@@ -38,7 +38,7 @@ GROUPS = [
                 "max_concurrent_jobs", "max_concurrent_uploads", "body_read_timeout_s", "queue_wait_s",
                 "max_inflight_per_tenant", "max_inflight_total", "max_queued_jobs",
                 "max_stored_jobs",
-                "max_queued_jobs_per_tenant",
+                "max_queued_jobs_per_tenant", "max_spool_bytes", "max_spool_bytes_per_tenant",
                 "max_stored_jobs_per_tenant", "job_result_ttl_s"]),
     ("Operations", ["audit_log", "metrics_enabled", "cache_dir", "session_ttl_s", "ffmpeg_path"]),
     ("Streaming, watch and capture", ["stream_window_s", "max_stream_chunk_s", "max_stream_spans",

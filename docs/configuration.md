@@ -118,6 +118,8 @@ and defaults match the code. A test fails if it goes stale.
 | `AUDEL_MAX_QUEUED_JOBS` | `64` |
 | `AUDEL_MAX_STORED_JOBS` | `1000` |
 | `AUDEL_MAX_QUEUED_JOBS_PER_TENANT` | — |
+| `AUDEL_MAX_SPOOL_BYTES` | `2000000000` |
+| `AUDEL_MAX_SPOOL_BYTES_PER_TENANT` | — |
 | `AUDEL_MAX_STORED_JOBS_PER_TENANT` | — |
 | `AUDEL_JOB_RESULT_TTL_S` | `3600.0` |
 

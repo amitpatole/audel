@@ -21,7 +21,7 @@ audel serve --host 0.0.0.0 --port 8000
 | `POST /analyze` | Signals, ASR and backend critique of brief claims. |
 | `POST /render` | Signals only, per track. |
 | `POST /handoff` | The distilled ears-to-brain handoff. |
-| `POST /watch` | Temporal grade of an http(s) page. Off unless `AUDEL_REST_ALLOW_WATCH=true`. |
+| `POST /watch` | Temporal grade of an http(s) page. Off unless `AUDEL_REST_ALLOW_WATCH=true` (refused before the body is read when off). Takes a JSON body of at most 64 KB with a `Content-Length`. |
 | `POST /jobs` | Queue `check`, `listen` or `analyze`. Returns `202` and a `job_id`. |
 | `GET /jobs`, `GET /jobs/{id}`, `DELETE /jobs/{id}` | Your tenant's jobs. Another tenant's job is a 404. |
 | `GET /metrics` | Prometheus metrics. Admin only. |
@@ -62,7 +62,11 @@ curl -H "Authorization: Bearer $AUDEL_API_TOKEN" http://audel:8000/jobs/5f0c…
 ```
 
 The queue is bounded overall (`AUDEL_MAX_QUEUED_JOBS`, default 64) and per tenant (a quarter of
-that by default). Past either bound a submission gets `429` with a `Retry-After` header. Finished results are kept for `AUDEL_JOB_RESULT_TTL_S` (default 1 hour) and
+that by default). The uploads those queued jobs hold on disk are bounded too, overall
+(`AUDEL_MAX_SPOOL_BYTES`, default 2 GB) and per tenant (a quarter of that by default), counted
+from the declared request size before the body is read. Keep the overall bound below the cache
+volume (the Helm chart sets 1.2 GB against its 2Gi `cacheSizeLimit`). Past any bound a
+submission gets `429` with a `Retry-After` header. Finished results are kept for `AUDEL_JOB_RESULT_TTL_S` (default 1 hour) and
 then purged.
 
 !!! note "Scaling out"

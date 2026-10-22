@@ -208,6 +208,10 @@ class Settings(BaseSettings):
     max_queued_jobs: int = 64          # submissions beyond this get 429 (backpressure)
     max_stored_jobs: int = 1000        # finished results kept (oldest evicted first)
     max_queued_jobs_per_tenant: int | None = None  # default: a quarter of max_queued_jobs
+    # Bytes of queued uploads held on disk at once, overall and per tenant (default: a quarter,
+    # at least one max-size request), so a full queue can't fill the cache volume.
+    max_spool_bytes: int = 2_000_000_000
+    max_spool_bytes_per_tenant: int | None = None
     max_stored_jobs_per_tenant: int | None = None  # default: a quarter of max_stored_jobs
     job_result_ttl_s: float = 3600.0   # finished results are purged after this
     audit_log: Path | None = None      # JSON-lines audit file (hashes + outcomes, never content)

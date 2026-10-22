@@ -53,6 +53,7 @@ _KINDS = ("check", "listen", "analyze")
 _HEAVY_ROUTES = frozenset({"/check", "/analyze", "/listen", "/render", "/handoff", "/jobs",
                            "/watch"})
 _MAX_LIST_ITEMS = 200
+_MAX_WATCH_BODY = 64 * 1024
 _MAX_ITEM_CHARS = 2000
 _REQUEST_ID_OK = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.")
 
@@ -139,6 +140,9 @@ def build_app(settings: Settings | None = None):
                   openapi_url=(None if auth.required else "/openapi.json"))
 
     inflight: dict[str, int] = {}
+    total_spool = settings.max_spool_bytes
+    spool = SpoolQuota(total_spool, settings.max_spool_bytes_per_tenant
+                       or min(total_spool, max(total_spool // 4, settings.max_request_bytes)))
     cap_tenant = settings.max_inflight_per_tenant or max(2, settings.max_concurrent_jobs)
     cap_total = settings.max_inflight_total or 4 * settings.max_concurrent_jobs
 
@@ -177,6 +181,16 @@ def build_app(settings: Settings | None = None):
         cl = request.headers.get("content-length")
         if cl and cl.isdigit() and int(cl) > settings.max_request_bytes:
             return reply(JSONResponse({"detail": "Request body too large."}, status_code=413))
+        if request.url.path == "/watch" and request.method == "POST":
+            # Refused BEFORE the body is read or parsed (it would be held while waiting for a
+            # slot); an enabled /watch takes only a small JSON body with a declared length.
+            if not settings.rest_allow_watch:
+                return reply(JSONResponse({"detail": "watch is disabled on this server."},
+                                          status_code=403))
+            if not (cl and cl.isdigit()):
+                return reply(JSONResponse({"detail": "Content-Length required."}, status_code=411))
+            if int(cl) > _MAX_WATCH_BODY:
+                return reply(JSONResponse({"detail": "Request body too large."}, status_code=413))
         if request.method != "POST" or request.url.path not in _HEAVY_ROUTES:
             return reply(await call_next(request))
         # Admission BEFORE the body is read: in-flight grading requests are capped per tenant and
@@ -185,10 +199,22 @@ def build_app(settings: Settings | None = None):
         if inflight.get(t, 0) >= cap_tenant or sum(inflight.values()) >= cap_total:
             return reply(JSONResponse({"detail": "Too many requests in progress."},
                                       status_code=429, headers={"Retry-After": "10"}))
+        reserved = 0
+        if request.url.path == "/jobs":
+            # A queued job keeps its spooled upload on disk until it runs: reserve the declared
+            # size (or the cap, undeclared) against the per-tenant and overall spool budgets.
+            reserved = int(cl) if cl and cl.isdigit() else settings.max_request_bytes
+            if not spool.reserve(t, reserved):
+                return reply(JSONResponse({"detail": "Too much queued upload data; retry later."},
+                                          status_code=429, headers={"Retry-After": "30"}))
+            request.state.spool = [t, reserved]  # submit_job takes it over for a queued job
         inflight[t] = inflight.get(t, 0) + 1
         try:
             return reply(await call_next(request))
         finally:
+            held = getattr(request.state, "spool", None)
+            if held is not None and held[1]:
+                spool.release(held[0], held[1])  # not handed to a queued job
             left = inflight.get(t, 1) - 1
             if left <= 0:
                 inflight.pop(t, None)
@@ -630,12 +656,21 @@ def build_app(settings: Settings | None = None):
                 path.unlink(missing_ok=True)
 
     @app.post("/watch")
-    async def watch_ep(body: dict, _slot=Depends(_job_slot)):
+    async def watch_ep(request: Request, _slot=Depends(_job_slot)):
         """Temporal grade of an http(s) URL (does the audio play THROUGH?). SSRF-guarded."""
+        import json as _json
+
         from ..core import watch
 
         if not settings.rest_allow_watch:
             raise HTTPException(status_code=403, detail="watch is disabled on this server.")
+        raw = await request.body()  # _gate capped it at _MAX_WATCH_BODY
+        try:
+            body = _json.loads(raw) if len(raw) <= _MAX_WATCH_BODY else None
+        except ValueError:
+            body = None
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="watch requires a JSON {\"source\": url}.")
         source = body.get("source")
         if not isinstance(source, str) or not source:
             raise HTTPException(status_code=400, detail="watch requires a JSON {\"source\": url}.")
@@ -706,8 +741,21 @@ def build_app(settings: Settings | None = None):
             for f in ([spooled] if spooled is not None else []) + fetched:
                 f.unlink(missing_ok=True)
 
+        held = getattr(request.state, "spool", None)
+        owner, owned = (str(held[0]), int(held[1])) if held is not None else (principal.tenant, 0)
+        released = [False]
+
+        def cleanup_and_release() -> None:
+            cleanup()
+            if owned and not released[0]:
+                released[0] = True
+                spool.release(owner, owned)
+
         try:
-            job = jobs.submit(principal.tenant, kind, work, cleanup=cleanup, prepare=prepare)
+            job = jobs.submit(principal.tenant, kind, work, cleanup=cleanup_and_release,
+                              prepare=prepare)
+            if held is not None:
+                held[1] = 0  # the queued job owns the reservation now; released by its cleanup
         except QueueFull as e:
             if spooled is not None:
                 spooled.unlink(missing_ok=True)
@@ -734,6 +782,34 @@ def build_app(settings: Settings | None = None):
         return {"job_id": job_id, "status": "deleted"}
 
     return app
+
+
+class SpoolQuota:
+    """Bytes of queued uploads on disk, per tenant and overall. Reserved at admission (before
+    the body is read) and released when the job's spooled file is removed."""
+
+    def __init__(self, total: int, per_tenant: int):
+        import threading
+
+        self.total, self.per_tenant = total, per_tenant
+        self.held: dict[str, int] = {}
+        self._lock = threading.Lock()
+
+    def reserve(self, tenant: str, n: int) -> bool:
+        with self._lock:
+            mine = self.held.get(tenant, 0)
+            if mine + n > self.per_tenant or sum(self.held.values()) + n > self.total:
+                return False
+            self.held[tenant] = mine + n
+            return True
+
+    def release(self, tenant: str, n: int) -> None:
+        with self._lock:
+            left = self.held.get(tenant, 0) - n
+            if left > 0:
+                self.held[tenant] = left
+            else:
+                self.held.pop(tenant, None)
 
 
 class TenantSemaphores:

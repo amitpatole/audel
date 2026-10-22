@@ -121,6 +121,25 @@ All notable changes to Audel are recorded here. The format follows
     at most 2 fetches, in a pool of 8.
   - **Low-Medium.** Work abandoned while waiting on its tenant share still ran later. Abandonment now
     propagates through both waits.
+- Red-team round 18b fixes (REST availability and log redaction), each pinned by a regression
+  test. A full review of authentication, tenant isolation, JWT / token / mTLS handling, the Helm
+  chart, the container and CI found no bypass, escalation or tenant crossing.
+  - **Medium.** `POST /watch` read and parsed the whole JSON body (up to the request cap, about
+    26 times its size in memory) before checking that watch is enabled, then held it while
+    waiting for a slot. It is now refused before the body is read when disabled, and takes only
+    a declared body of at most 64 KB when enabled.
+  - **Medium.** Queued jobs kept their uploads on disk with no byte bound, so one tenant could
+    fill the cache volume (on the Helm defaults, enough to get the pod evicted). Queued upload
+    bytes are now bounded overall (`AUDEL_MAX_SPOOL_BYTES`) and per tenant
+    (`AUDEL_MAX_SPOOL_BYTES_PER_TENANT`), checked before the body is read; the chart sets the
+    overall bound below its cache size limit.
+  - **Medium.** Double-encoded JSON matching in log redaction could still cost about 10 times
+    more than before on escape-heavy lines. Attempts are now budgeted per field, with a
+    fail-closed fallback past the budget.
+  - **Low.** Redaction now also covers double-encoded JSON and digit-suffixed keys past the
+    keyword budget, weak keys with a numeric or version suffix (`token2`, `TOKEN_V2`),
+    suffixed keys inside double-encoded JSON, plain command-line flags
+    (`psql --password X`), and prefixed short keys in pairs (`('_sig', X)`).
 - Red-team round 18 fixes (decode surface), each pinned by a regression test. The 473-file battery
   shows no regressions.
   - **Low-Medium.** The round-17 dialogue-first mono mix ran in the source's own sample format, so

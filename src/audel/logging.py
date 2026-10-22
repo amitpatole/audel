@@ -42,8 +42,8 @@ _WEAK_KEYS = r"token|signature|credentials?"
 _KEYS = "(?:" + _STRONG_KEYS + "|" + _WEAK_KEYS + ")"
 # A strong key may carry a suffix that starts with ``_`` / ``-`` / a digit (``DB_PASSWORD_PROD``,
 # ``password2``, ``API_KEY_V2``); weak keys may not (``tokens=512`` is a count).
-_KEYS_SFX = ("(?:(?:" + _STRONG_KEYS + r")(?:[_\-0-9][A-Za-z0-9_\-]{0,23}+)?+|" + _WEAK_KEYS
-             + ")")
+_KEYS_SFX = ("(?:(?:" + _STRONG_KEYS + r")(?:[_\-0-9][A-Za-z0-9_\-]{0,23}+)?+|(?:" + _WEAK_KEYS
+             + r")(?:[0-9]{1,4}+|[_\-][vV]?[0-9]{1,4}+)?+)")
 # Unquoted value: up to whitespace / separators.
 _KEY_START = r"(?=[pPsScCaAxXtTeEmMhHlL])"  # every key starts with one of these
 _KV = re.compile(
@@ -75,7 +75,7 @@ _PAIR = re.compile(
     r"([\(\[,][ \t]*+b?([\"'])([\w.\-]{1,64}+)\2\s*+,\s*+b?([\"']))"
     r"((?:[^\"'\n\\]|\\.|(?!\4)[\"']){1,4096}+)(?=\4(\s*+[\)\]])?+)")
 _MAX_PAIRS = 128
-_PAIR_STRONG = re.compile(_TUPLE_KEYS + r"|^-*(?:auth|sig|pass|pwd)$", re.IGNORECASE)
+_PAIR_STRONG = re.compile(_TUPLE_KEYS + r"|^(?:[\w\-]*[_\-0-9])?(?:auth|sig|pass|pwd)$", re.IGNORECASE)
 _PAIR_WEAK = re.compile(r"token|signature|credentials?|pwd|pass", re.IGNORECASE)
 
 
@@ -121,10 +121,11 @@ def _pair(m: re.Match) -> str:
 # Double-encoded JSON: ``{\"password\": \"hunter2\"}`` inside another JSON string. The value may
 # hold escaped escapes (``\\u00e9``), an escaped quote (``\\\"``) or the other quote kind.
 _KVQE = re.compile(
-    _KEY_START + r"((?:" + _KEYS + r"|authorization|set-cookie)(?:\\\\){0,4}+\\?+[\"']?+[ \t]*+[:=]"
+    _KEY_START + r"((?:" + _KEYS_SFX + r"|authorization|set-cookie)(?:\\\\){0,4}+\\?+[\"']?+[ \t]*+[:=]"
     r"[ \t]*+(?:\\\\){0,4}+\\([\"']))((?:\\\\\\[\"']|\\\\|\\[^\"'\\\n]|[^\"'\\\n]|(?!\2)[\"'])"
     r"{1,4096}+)(?=\\\2)", re.IGNORECASE)
 _MAX_KEYWORDS = 64    # keyword positions matched with the patterns; beyond, a linear fallback
+_MAX_KVQE = 16        # double-encoded JSON attempts per field; beyond, the fallback
 _KEY_BACK = 12        # a key starts at most this far before its hint ("encryption_" + "key")
 _KEY_PREFIXES = tuple(w + sep for w in ("api", "access", "private", "encryption", "master",
                                         "hmac", "ssh", "license", "signing", "secret", "x-api")
@@ -294,6 +295,12 @@ _VALUE_END = frozenset(" \t\r\n\"'`&")
 _KEY_FIRST = frozenset("pscaxtemhl([")  # first characters of every key, and of a tuple opening
 
 
+# A credential flag followed by its value in a command line: ``psql --password X -h db``.
+_ARGV = re.compile(r"(?<![\w\-])(--?(?:password|passwd|passphrase|secret|client[_-]?secret"
+                   r"|api[_-]?key|access[_-]?key|private[_-]?key|auth[_-]?token|token|pass|pwd)"
+                   r"[ \t]++)(?!-)([^\s\"'`]{1,4096}+)", re.IGNORECASE)
+
+
 def _scrub_keywords(text: str) -> str:  # noqa: C901 - one linear pass, kept together
     """Key/value credentials, in linear time: the patterns run only at keyword positions (found
     with plain substring search), anchored, for the first ``_MAX_KEYWORDS``; any beyond get a
@@ -302,8 +309,11 @@ def _scrub_keywords(text: str) -> str:  # noqa: C901 - one linear pass, kept tog
     if ("'" in text or '"' in text) and _TUPLE_HINT_RE.search(text):
         # Header / key tuples anchor on their own bracket: no back-window to fall outside of.
         text = _scrub_pairs(text)
+    if "-" in text:
+        text = _ARGV.sub(lambda m: m.group(1) + "[REDACTED]", text)
     low = _fold(text)
     escaped = '\\"' in text or "\\'" in text  # double-encoded JSON needs an escaped quote
+    kvqe_left = _MAX_KVQE
     hits: list[int] = []
     for hm in _HINT_RE.finditer(low):  # in order, C-speed; stop just past the pattern budget
         hits.append(hm.start())
@@ -351,10 +361,15 @@ def _scrub_keywords(text: str) -> str:  # noqa: C901 - one linear pass, kept tog
             if m:
                 span = (m.start(), m.end(), m.group(1) + "[REDACTED]")
                 break
-            m = _KVQE.match(text, i) if escaped else None
-            if m:
-                span = (m.start(), m.end(), m.group(1) + "[REDACTED]")
-                break
+            if escaped:
+                if kvqe_left > 0:
+                    kvqe_left -= 1  # each attempt may scan a long value: a fixed budget per call
+                    m = _KVQE.match(text, i)
+                else:
+                    m = _FALLBACK.match(text, i)  # fail closed, one bounded scan
+                if m:
+                    span = (m.start(), m.end(), m.group(1) + "[REDACTED]")
+                    break
             m = _KV.match(text, i)
             if m:
                 rep = _kv(m)
@@ -372,7 +387,7 @@ def _scrub_keywords(text: str) -> str:  # noqa: C901 - one linear pass, kept tog
 
 _FALLBACK = re.compile(
     r"((?:pass|pwd|secret|key|credential|signature|sig|token|authorization|cookie|session|auth)"
-    r"[A-Za-z_\-]{0,24}+[\"'`]?+[ \t]*+[:=][ \t]*+b?)"  # pairs: _KVT covers them, unbudgeted
+    r"[A-Za-z0-9_\-]{0,24}+(?:\\\\){0,4}+\\?+[\"'`]?+[ \t]*+[:=][ \t]*+(?:\\\\){0,4}+\\?+b?)"  # pairs: _KVT covers them, unbudgeted
     r"(\"[^\"\n]{0,4096}+\"|'[^'\n]{0,4096}+'|`[^`\n]{0,4096}+`|[\"'`]?+[^\s\"'`&]{1,4096}+)",
     re.IGNORECASE)
 
