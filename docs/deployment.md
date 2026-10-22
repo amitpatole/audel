@@ -62,9 +62,11 @@ curl -H "Authorization: Bearer $AUDEL_API_TOKEN" http://audel:8000/jobs/5f0c…
 ```
 
 The queue is bounded overall (`AUDEL_MAX_QUEUED_JOBS`, default 64) and per tenant (a quarter of
-that by default). The uploads those queued jobs hold on disk are bounded too, overall
-(`AUDEL_MAX_SPOOL_BYTES`, default 2 GB) and per tenant (a quarter of that by default), counted
-from the declared request size before the body is read. Keep the overall bound below the cache
+that by default). The media held on disk is bounded too, overall (`AUDEL_MAX_SPOOL_BYTES`,
+default 2 GB) and per tenant (a quarter of that by default): every upload in flight or queued
+counts its declared request size (the full request cap when undeclared) from before the body is
+read, and every fetched URL counts `AUDEL_MAX_MEDIA_BYTES` until its file is removed. A request
+that declares a length and also uses chunked framing is refused. Keep the overall bound below the cache
 volume (the Helm chart sets 1.2 GB against its 2Gi `cacheSizeLimit`). Past any bound a
 submission gets `429` with a `Retry-After` header. Finished results are kept for `AUDEL_JOB_RESULT_TTL_S` (default 1 hour) and
 then purged.

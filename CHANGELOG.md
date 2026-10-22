@@ -121,6 +121,23 @@ All notable changes to Audel are recorded here. The format follows
     at most 2 fetches, in a pool of 8.
   - **Low-Medium.** Work abandoned while waiting on its tenant share still ran later. Abandonment now
     propagates through both waits.
+- Red-team round 19 fixes (REST availability and log redaction), each pinned by a regression
+  test. No auth bypass, escalation or tenant crossing was found.
+  - **Medium.** After the round-18b change, `POST /watch` (when enabled) took a grading slot
+    before reading its body, so a slowly sent body held a slot for everyone. The body is now read
+    and checked before the slot is taken.
+  - **Low-Medium.** A request declaring a `Content-Length` and also using chunked framing could
+    reserve a small amount of the upload budget and send much more on servers that frame by the
+    chunks. Such requests are now refused.
+  - **Low-Medium.** The command-line flag redaction added in round 18b took `=` in
+    `--password = value` as the value, so the real value was kept. Flags now cover quoted
+    values and more names (`--x-api-key`, `--authorization`, `--cookie`,
+    `--secret-access-key`, suffixed and glued names), and ambiguous flags (`-pass 1` in ffmpeg
+    two-pass logs, `--token 512`) are redacted only when the value looks like a credential.
+    Prefixed short keys in pairs (`('no_auth', 'true')`) get the same treatment.
+  - **Low.** Uploads to the synchronous routes and files fetched from URLs now count against
+    the same disk budget as queued uploads.
+  - **Info.** Deeply nested JSON sent to `/watch` gets `400`, not `500`.
 - Red-team round 18b fixes (REST availability and log redaction), each pinned by a regression
   test. A full review of authentication, tenant isolation, JWT / token / mTLS handling, the Helm
   chart, the container and CI found no bypass, escalation or tenant crossing.

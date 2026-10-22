@@ -42,7 +42,7 @@ from ..logging import get_logger
 from ..models import Brief, Report
 
 try:
-    from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+    from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
     from fastapi.responses import JSONResponse, PlainTextResponse
 except ImportError:  # pragma: no cover - only without the [serve] extra
     FastAPI = None  # type: ignore
@@ -179,6 +179,11 @@ def build_app(settings: Settings | None = None):
                                       headers={"Retry-After": str(retry)}))
         request.state.principal = principal
         cl = request.headers.get("content-length")
+        if cl is not None and "transfer-encoding" in request.headers:
+            # Ambiguous framing (some servers frame by Transfer-Encoding and still pass the
+            # length through): the declared size can't be trusted for any budget.
+            return reply(JSONResponse({"detail": "Content-Length with Transfer-Encoding."},
+                                      status_code=400))
         if cl and cl.isdigit() and int(cl) > settings.max_request_bytes:
             return reply(JSONResponse({"detail": "Request body too large."}, status_code=413))
         if request.url.path == "/watch" and request.method == "POST":
@@ -200,9 +205,10 @@ def build_app(settings: Settings | None = None):
             return reply(JSONResponse({"detail": "Too many requests in progress."},
                                       status_code=429, headers={"Retry-After": "10"}))
         reserved = 0
-        if request.url.path == "/jobs":
-            # A queued job keeps its spooled upload on disk until it runs: reserve the declared
-            # size (or the cap, undeclared) against the per-tenant and overall spool budgets.
+        if request.url.path != "/watch":
+            # An upload is spooled to disk for the request (and, for /jobs, until the queued job
+            # runs): reserve the declared size (or the cap, undeclared) against the per-tenant
+            # and overall spool budgets, so uploads in flight + queued fit the cache volume.
             reserved = int(cl) if cl and cl.isdigit() else settings.max_request_bytes
             if not spool.reserve(t, reserved):
                 return reply(JSONResponse({"detail": "Too much queued upload data; retry later."},
@@ -279,11 +285,16 @@ def build_app(settings: Settings | None = None):
 
     _tenant_fetch = TenantSemaphores(2)  # concurrent URL fetches per tenant
 
+    _fetch_holds: dict[str, tuple[str, int]] = {}
+
     async def _fetch(url: str, tenant: str) -> Path:
         """Fetch a URL under the tenant's fetch share (one tenant cannot fill the download pool)."""
         from ..ingest import fetch_to_file
         from ..workspace import Workspace
 
+        need = settings.max_media_bytes
+        if not spool.reserve(tenant, need):  # the fetched file sits on the cache volume
+            raise BusyError("Too much downloaded data held; retry later.")
         sem = _tenant_fetch.get(tenant)
         try:
             try:
@@ -291,11 +302,23 @@ def build_app(settings: Settings | None = None):
             except TimeoutError:
                 raise BusyError("Too many downloads in progress.") from None
             try:
-                return await fetch_to_file(url, Workspace(settings).tmp, settings)
+                path = await fetch_to_file(url, Workspace(settings).tmp, settings)
             finally:
                 sem.release()
+        except BaseException:
+            spool.release(tenant, need)
+            raise
         finally:
             _tenant_fetch.done(tenant)
+        _fetch_holds[str(path)] = (tenant, need)
+        return path
+
+    def _drop(path: Path) -> None:
+        """Remove a request's temp media; a fetched file also returns its spool reservation."""
+        path.unlink(missing_ok=True)
+        held = _fetch_holds.pop(str(path), None)
+        if held is not None:
+            spool.release(*held)
 
     @contextlib.asynccontextmanager
     async def _tenant_job_gate(tenant: str):
@@ -336,10 +359,6 @@ def build_app(settings: Settings | None = None):
                 tsem.release()
         finally:
             _tenant_jobs.done(tenant)
-
-    async def _job_slot(request: Request):
-        async with _slot_for(_principal(request).tenant):
-            yield
 
     @app.exception_handler(OSError)
     @app.exception_handler(MemoryError)
@@ -557,7 +576,7 @@ def build_app(settings: Settings | None = None):
             raise _http_error(e) from e
         finally:
             if path is not None:
-                path.unlink(missing_ok=True)
+                _drop(path)
 
     @app.post("/check")
     async def check_ep(request: Request, file: UploadFile | None = File(None),
@@ -635,7 +654,7 @@ def build_app(settings: Settings | None = None):
                             endpoint="/render", kind="render", status=status,
                             input_sha256=digest, input_bytes=size, source=src, source_host=host,
                             duration_ms=int((time.monotonic() - t0) * 1000))
-                path.unlink(missing_ok=True)
+                _drop(path)
 
     @app.post("/handoff")
     async def handoff_ep(request: Request, file: UploadFile | None = File(None),
@@ -653,10 +672,10 @@ def build_app(settings: Settings | None = None):
             raise _http_error(e) from e
         finally:
             if path is not None:
-                path.unlink(missing_ok=True)
+                _drop(path)
 
     @app.post("/watch")
-    async def watch_ep(request: Request, _slot=Depends(_job_slot)):
+    async def watch_ep(request: Request):
         """Temporal grade of an http(s) URL (does the audio play THROUGH?). SSRF-guarded."""
         import json as _json
 
@@ -664,10 +683,11 @@ def build_app(settings: Settings | None = None):
 
         if not settings.rest_allow_watch:
             raise HTTPException(status_code=403, detail="watch is disabled on this server.")
+        # The body is read BEFORE a grading slot is taken: a slow sender must not hold one.
         raw = await request.body()  # _gate capped it at _MAX_WATCH_BODY
         try:
             body = _json.loads(raw) if len(raw) <= _MAX_WATCH_BODY else None
-        except ValueError:
+        except (ValueError, RecursionError):  # malformed or absurdly nested: a 400, not a 500
             body = None
         if not isinstance(body, dict):
             raise HTTPException(status_code=400, detail="watch requires a JSON {\"source\": url}.")
@@ -675,8 +695,9 @@ def build_app(settings: Settings | None = None):
         if not isinstance(source, str) or not source:
             raise HTTPException(status_code=400, detail="watch requires a JSON {\"source\": url}.")
         try:
-            report = await watch(source, settings=settings,  # allow_local_files=False here (URL only)
-                                 click_selector=body.get("click_selector"))
+            async with _slot_for(_principal(request).tenant):
+                report = await watch(source, settings=settings,  # URL only (no local files)
+                                     click_selector=body.get("click_selector"))
             return _public(report)
         except AudelError as e:
             raise _http_error(e) from e
@@ -739,7 +760,7 @@ def build_app(settings: Settings | None = None):
 
         def cleanup() -> None:  # runs on done, failure AND cancel (even while still queued)
             for f in ([spooled] if spooled is not None else []) + fetched:
-                f.unlink(missing_ok=True)
+                _drop(f)
 
         held = getattr(request.state, "spool", None)
         owner, owned = (str(held[0]), int(held[1])) if held is not None else (principal.tenant, 0)

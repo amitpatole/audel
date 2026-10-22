@@ -4380,3 +4380,58 @@ def test_escaped_quote_floods_stay_bounded():
         scrub_text(text)
         best = min(best, time.process_time() - t0)
     assert best < 0.008, best
+
+
+# ==== round 19, REST + redaction ==============================================================
+
+def test_watch_body_is_read_before_a_grading_slot_is_taken():
+    import inspect
+
+    from audel.adapters import rest
+
+    src = inspect.getsource(rest.build_app)
+    body = src[src.index("async def watch_ep"):src.index("# ---- async jobs")]
+    assert "Depends(" not in body.split(")", 1)[0]          # no slot dependency in the signature
+    assert body.index("await request.body()") < body.index("_slot_for(")
+
+
+def test_watch_nested_json_is_a_400_not_a_500(tmp_path):
+    c = TestClient(build_app(settings=_s(tmp_path, rest_allow_watch=True)), raise_server_exceptions=False)
+    h = {"Authorization": f"Bearer {SHARED}", "Content-Type": "application/json"}
+    assert c.post("/watch", content=b"[" * 60000, headers=h).status_code == 400
+
+
+def test_length_with_chunked_framing_is_refused(tmp_path):
+    c = TestClient(build_app(settings=_s(tmp_path)))
+    h = {"Authorization": f"Bearer {SHARED}", "Content-Length": "10", "Transfer-Encoding": "chunked"}
+    r = c.post("/jobs", content=b"5\r\nhello\r\n0\r\n\r\n", headers=h)
+    assert r.status_code == 400
+
+
+def test_sync_uploads_count_against_the_spool_budget(tmp_path):
+    c = TestClient(build_app(settings=_s(tmp_path, max_spool_bytes=10_000,
+                                         max_spool_bytes_per_tenant=5_000)))
+    h = {"Authorization": f"Bearer {SHARED}"}
+    r = c.post("/check", files={"file": ("a.wav", b"\0" * 6_000, "audio/wav")}, headers=h)
+    assert r.status_code == 429
+
+
+@pytest.mark.parametrize("text", [
+    "--password = zQ7hunterZ", '-password = "zQ7hunterZ"', "--password : zQ7hunterZ",
+    'psql --password "zQ7hunterZ" -h db', "psql --password 'zQ7hunterZ'", "--x-api-key zQ7hunterZ",
+    "--authorization zQ7hunterZ", "--cookie zQ7hunterZ", "aws --secret-access-key zQ7hunterZ",
+    "--AWSAccessKey zQ7hunterZ", "--DB_PASSWORD_PROD zQ7hunterZ", "--session_id zQ7hunterZ"])
+def test_command_line_credential_flags_are_redacted(text):
+    from audel.logging import scrub_text
+
+    assert "zQ7hunterZ" not in scrub_text(text)
+
+
+@pytest.mark.parametrize("text", [
+    "ffmpeg -i a -pass 1 -passlogfile x out.mp4", "x264 --pass 2", "llm --token 512",
+    "--pwd /home/me", "--compass north", "--session-timeout 30", "('no_auth','true')",
+    "('two-pass','true')", "('audio_sig','ok')"])
+def test_ordinary_flags_and_flag_pairs_are_kept(text):
+    from audel.logging import scrub_text
+
+    assert scrub_text(text) == text

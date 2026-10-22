@@ -75,8 +75,11 @@ _PAIR = re.compile(
     r"([\(\[,][ \t]*+b?([\"'])([\w.\-]{1,64}+)\2\s*+,\s*+b?([\"']))"
     r"((?:[^\"'\n\\]|\\.|(?!\4)[\"']){1,4096}+)(?=\4(\s*+[\)\]])?+)")
 _MAX_PAIRS = 128
-_PAIR_STRONG = re.compile(_TUPLE_KEYS + r"|^(?:[\w\-]*[_\-0-9])?(?:auth|sig|pass|pwd)$", re.IGNORECASE)
-_PAIR_WEAK = re.compile(r"token|signature|credentials?|pwd|pass", re.IGNORECASE)
+_PAIR_STRONG = re.compile(_TUPLE_KEYS + r"|^-*(?:auth|sig|pass|pwd)$", re.IGNORECASE)
+# Prefixed short keys (``_sig``, ``v2sig``, ``no_auth``, ``two-pass``) are often flags with plain
+# values: redacted only for credential-like values.
+_PAIR_WEAK = re.compile(r"token|signature|credentials?|pwd|pass|[_\-0-9](?:auth|sig)$",
+                        re.IGNORECASE)
 
 
 def _scrub_pairs(text: str) -> str:
@@ -296,9 +299,34 @@ _KEY_FIRST = frozenset("pscaxtemhl([")  # first characters of every key, and of 
 
 
 # A credential flag followed by its value in a command line: ``psql --password X -h db``.
-_ARGV = re.compile(r"(?<![\w\-])(--?(?:password|passwd|passphrase|secret|client[_-]?secret"
-                   r"|api[_-]?key|access[_-]?key|private[_-]?key|auth[_-]?token|token|pass|pwd)"
-                   r"[ \t]++)(?!-)([^\s\"'`]{1,4096}+)", re.IGNORECASE)
+# One possessive pattern captures a flag's NAME and VALUE; the name is then tested in Python (no
+# key alternation tried at every dash). ``--password = x`` / ``--password=x``: the key/value rules.
+_ARGV = re.compile(r"(?<![\w\-])(--?([a-z0-9][a-z0-9_-]{0,63}+)[ \t]++)(?![-=:])"
+                   r"(\"[^\"\n]{1,4096}+\"|'[^'\n]{1,4096}+'|[^\s\"'`]{1,4096}+)", re.IGNORECASE)
+# A credential word ending the flag name, with at most a short suffix (``--db-password``,
+# ``--AWSAccessKey``, ``--password2``, ``--DB_PASSWORD_PROD``).
+_ARGV_NAME = re.compile(
+    r"(?:password|passwd|passphrase|secret|api[_-]?key|access[_-]?key|access[_-]?token"
+    r"|private[_-]?key|authorization|cookie|token|signature|credentials?|pass|pwd|auth|sig"
+    r"|session[_-]?id|secret[_-]?key|(?:signing|encryption|master|hmac|ssh|license)[_-]?key)"
+    r"(?:[0-9]{1,4}|[_-][a-z0-9]{1,16}){0,2}$", re.IGNORECASE)
+# Flags whose value is a credential whatever it looks like; the others (``-pass 1`` in ffmpeg,
+# ``--token 512``, ``--pwd /home``) only when the value looks like one.
+_ARGV_STRONG = re.compile(r"password|passwd|passphrase|secret|api[_-]?key|access[_-]?key"
+                          r"|private[_-]?key|authorization|cookie|auth[_-]?token|access[_-]?token"
+                          r"|session[_-]?id"
+                          r"|(?:signing|encryption|master|hmac|ssh|license)[_-]?key",
+                          re.IGNORECASE)
+
+
+def _argv(m: re.Match) -> str:
+    if not _ARGV_NAME.search(m.group(2)):
+        return m.group()
+    value = m.group(3).strip("\"'")
+    weak_ok = (len(value) >= 8 and not value.startswith(("/", "~", ".")) and _looks_secret(value))
+    if _ARGV_STRONG.search(m.group(2)) or weak_ok:
+        return m.group(1) + "[REDACTED]"
+    return m.group()
 
 
 def _scrub_keywords(text: str) -> str:  # noqa: C901 - one linear pass, kept together
@@ -310,7 +338,7 @@ def _scrub_keywords(text: str) -> str:  # noqa: C901 - one linear pass, kept tog
         # Header / key tuples anchor on their own bracket: no back-window to fall outside of.
         text = _scrub_pairs(text)
     if "-" in text:
-        text = _ARGV.sub(lambda m: m.group(1) + "[REDACTED]", text)
+        text = _ARGV.sub(_argv, text)
     low = _fold(text)
     escaped = '\\"' in text or "\\'" in text  # double-encoded JSON needs an escaped quote
     kvqe_left = _MAX_KVQE
