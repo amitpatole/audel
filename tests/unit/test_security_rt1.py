@@ -1570,3 +1570,88 @@ def test_minted_tokens_are_redacted_wherever_they_appear():
 def test_wildcard_forwarded_proxies_refused():
     with pytest.raises(ValueError):
         Settings(forwarded_allow_ips=["*"])
+
+
+# ==== round 5, network surface ================================================================
+
+def _stub_grade(monkeypatch, seconds, counter=None):
+    import audel.core as core_pkg
+
+    async def slow_check(path, **kw):
+        if counter is not None:
+            counter.append(path)
+        await asyncio.sleep(seconds)
+        from audel.models import Report, Verdict
+
+        return Report(verdict=Verdict.PASS, summary="ok")
+
+    monkeypatch.setattr(core_pkg, "check", slow_check)
+
+
+@requires_ffmpeg
+def test_async_jobs_cannot_starve_another_tenants_grading(tmp_path, media, monkeypatch):
+    _stub_grade(monkeypatch, 1.0)
+    f = tmp_path / "t.json"
+    f.write_text(json.dumps({"tenants": {"alpha": {"sha256": token_hash(A_TOK)}}}))
+    s = Settings(cache_dir=tmp_path / "ws", allow_local_files=False, api_token=SHARED,
+                 api_tokens_file=f, max_concurrent_jobs=4, queue_wait_s=4,
+                 max_queued_jobs_per_tenant=16)
+    body = media["good"].read_bytes()
+    with TestClient(build_app(settings=s)) as c:
+        for _ in range(16):
+            assert c.post("/jobs", headers={"authorization": f"Bearer {A_TOK}"},
+                          files={"file": ("a.wav", body, "audio/wav")}).status_code == 202
+        time.sleep(0.2)
+        t0 = time.monotonic()
+        r = c.post("/check", headers={"authorization": f"Bearer {SHARED}"},
+                   files={"file": ("a.wav", body, "audio/wav")})
+        took = time.monotonic() - t0
+    assert r.status_code == 200 and took < 3.0, (r.status_code, took)
+
+
+def test_url_fetches_are_capped_per_tenant(tmp_path, monkeypatch):
+    import audel.ingest as ing
+
+    active = {"now": 0, "max": 0}
+
+    async def slow_fetch(url, tmp, settings):
+        active["now"] += 1
+        active["max"] = max(active["max"], active["now"])
+        await asyncio.sleep(0.3)
+        active["now"] -= 1
+        raise UnsafeSourceError("stub")
+
+    monkeypatch.setattr(ing, "fetch_to_file", slow_fetch)
+    monkeypatch.setattr(ing, "validate_ingest_url", lambda u, s: None)
+    s = Settings(cache_dir=tmp_path / "ws", allow_url_ingest=True, api_token=SHARED,
+                 max_queued_jobs_per_tenant=20, max_concurrent_jobs=8)
+    h = {"authorization": f"Bearer {SHARED}"}
+    with TestClient(build_app(settings=s)) as c:
+        for _ in range(8):
+            assert c.post("/jobs", headers=h, data={"url": "https://media.example/a.wav"}
+                          ).status_code == 202
+        time.sleep(1.5)
+    assert active["max"] <= 2
+
+
+@requires_ffmpeg
+def test_abandoned_requests_never_run_their_grading(tmp_path, media, monkeypatch):
+    import threading
+
+    runs: list = []
+    _stub_grade(monkeypatch, 2.0, runs)
+    s = Settings(cache_dir=tmp_path / "ws", allow_local_files=False, request_timeout_s=0.5,
+                 max_concurrent_jobs=2, max_inflight_per_tenant=20)
+    body = media["good"].read_bytes()
+    with TestClient(build_app(settings=s)) as c:
+        def hit():
+            c.post("/check", files={"file": ("a.wav", body, "audio/wav")})
+
+        for _wave in range(4):
+            th = [threading.Thread(target=hit) for _ in range(2)]
+            for t in th:
+                t.start()
+            for t in th:
+                t.join()
+        time.sleep(2.5)
+    assert len(runs) <= 3, len(runs)   # only work that actually got slots ran (was 8)

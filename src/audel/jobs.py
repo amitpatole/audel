@@ -47,13 +47,16 @@ class QueueFull(AudelError):
 class JobStore:
     def __init__(self, *, max_queued: int, max_stored: int, ttl_s: float,
                  semaphore: asyncio.Semaphore, max_queued_per_owner: int | None = None,
-                 max_stored_per_owner: int | None = None) -> None:
+                 max_stored_per_owner: int | None = None, owner_gate=None) -> None:
         self._jobs: dict[str, Job] = {}
         self._max_queued, self._max_stored, self._ttl = max_queued, max_stored, ttl_s
         # Fair share: one tenant cannot fill the global queue or evict others' results.
         self._q_owner = max_queued_per_owner or max(1, max_queued // 4)
         self._s_owner = max_stored_per_owner or max(1, max_stored // 4)
         self._sem = semaphore
+        # Optional per-owner gate (async context manager factory) taken BEFORE the global slot,
+        # so one owner's queued jobs never hold global slots while waiting on their own share.
+        self._owner_gate = owner_gate
 
     def _purge(self, owner: str | None = None) -> None:
         now = time.time()
@@ -84,7 +87,8 @@ class JobStore:
 
     def submit(self, owner: str, kind: str, work: Callable[[], Awaitable[dict]],
                on_done: Callable[[Job], None] | None = None,
-               cleanup: Callable[[], None] | None = None) -> Job:
+               cleanup: Callable[[], None] | None = None,
+               prepare: Callable[[], Awaitable[None]] | None = None) -> Job:
         """``cleanup`` ALWAYS runs exactly once when the job ends: done, failed, or cancelled
         (including cancelled while still queued), so spooled inputs never leak."""
         self._purge(owner)
@@ -106,22 +110,28 @@ class JobStore:
                         pass
 
         async def _body() -> None:
-            async with self._sem:
-                if job.status == "cancelled":
-                    return
-                job.status, job.started = "running", time.time()
-                try:
-                    job.result = await work()
-                    job.status = "done"
-                except asyncio.CancelledError:
-                    job.status, job.error = "cancelled", "cancelled"
-                    raise
-                except Exception as e:  # noqa: BLE001 - recorded on the job, never raised
-                    job.status, job.error = "failed", _public_error(e)
-                finally:
-                    job.finished = time.time()
-                    if on_done is not None:
-                        on_done(job)
+            try:
+                if prepare is not None:
+                    # I/O-bound preparation (e.g. fetching a URL) happens BEFORE any grading slot
+                    # is taken, so a slow source cannot hold slots that other tenants need.
+                    await prepare()
+                gate = self._owner_gate(owner) if self._owner_gate else _null_gate()
+                async with gate:
+                    async with self._sem:
+                        if job.status == "cancelled":
+                            return
+                        job.status, job.started = "running", time.time()
+                        job.result = await work()
+                        job.status = "done"
+            except asyncio.CancelledError:
+                job.status, job.error = "cancelled", "cancelled"
+                raise
+            except Exception as e:  # noqa: BLE001 - recorded on the job, never raised
+                job.status, job.error = "failed", _public_error(e)
+            finally:
+                job.finished = time.time()
+                if on_done is not None:
+                    on_done(job)
 
         job.task = asyncio.create_task(run())
         return job
@@ -153,3 +163,11 @@ def _public_error(e: Exception) -> str:
     if isinstance(e, (UnsafeSourceError, ConfigError)):
         return sanitize_message(str(e))
     return "Could not decode or grade the source."
+
+
+class _null_gate:  # noqa: N801 - tiny async context manager
+    async def __aenter__(self):
+        return None
+
+    async def __aexit__(self, *exc):
+        return False

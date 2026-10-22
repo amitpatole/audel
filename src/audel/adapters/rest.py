@@ -21,6 +21,7 @@ Security (mirrors AgentVision's reviewed rest.py, extended for production use):
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import os
 import time
@@ -206,17 +207,54 @@ def build_app(settings: Settings | None = None):
 
     async def _shielded(coro_factory, timeout: float, tenant: str | None = None):
         """Global work slots plus a per-tenant share of them, both held until the work REALLY
-        ends (a cancelled or timed-out request cannot free its tenant's share early)."""
+        ends (a cancelled or timed-out request cannot free its tenant's share early). Work
+        abandoned before it acquires its slots never runs."""
         if tenant is None:
             return await run_shielded(_work_sem, coro_factory, timeout)
         sem = _tenant_work.get(tenant)
+        abandoned = asyncio.Event()
 
-        async def inner():
-            return await run_shielded(_work_sem, coro_factory, None)
+        async def guarded():
+            async with sem:
+                if abandoned.is_set():
+                    return None
+                async with _work_sem:
+                    if abandoned.is_set():
+                        return None
+                    return await coro_factory()
 
-        task = asyncio.ensure_future(run_shielded(sem, inner, None))
+        task = asyncio.ensure_future(guarded())
         task.add_done_callback(lambda _t: _tenant_work.done(tenant))  # cleanup when work ENDS
-        return await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+        try:
+            return await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+        except (TimeoutError, asyncio.CancelledError):
+            abandoned.set()
+            raise
+
+    _tenant_fetch = TenantSemaphores(2)  # concurrent URL fetches per tenant
+
+    async def _fetch(url: str, tenant: str) -> Path:
+        """Fetch a URL under the tenant's fetch share (one tenant cannot fill the download pool)."""
+        from ..ingest import fetch_to_file
+        from ..workspace import Workspace
+
+        sem = _tenant_fetch.get(tenant)
+        try:
+            async with sem:
+                return await fetch_to_file(url, Workspace(settings).tmp, settings)
+        finally:
+            _tenant_fetch.done(tenant)
+
+    @contextlib.asynccontextmanager
+    async def _tenant_job_gate(tenant: str):
+        tsem = _tenant_jobs.get(tenant)
+        try:
+            async with tsem:
+                yield
+        finally:
+            _tenant_jobs.done(tenant)
+
+    jobs._owner_gate = _tenant_job_gate  # async jobs: tenant share before the global slot
 
     async def _job_slot(request: Request):
         """A grading slot: the tenant's share FIRST, then a global slot, each with a bounded wait
@@ -321,17 +359,17 @@ def build_app(settings: Settings | None = None):
             raise UnsafeSourceError("uploaded file is empty")
         return dest
 
-    async def _acquire(file: UploadFile | None, url: str | None) -> tuple[Path, str, str | None]:
+    async def _acquire(file: UploadFile | None, url: str | None,
+                       tenant: str = "anonymous") -> tuple[Path, str, str | None]:
         """(server temp path, source kind, source host). Exactly one of file / url."""
         if (file is None) == (not url):
             raise UnsafeSourceError("send exactly one of: a 'file' upload or a 'url'")
         if file is not None:
             return await _spool(file), "upload", None
-        from ..ingest import fetch_to_file, url_host
-        from ..workspace import Workspace
+        from ..ingest import url_host
 
         assert url is not None
-        return await fetch_to_file(url, Workspace(settings).tmp, settings), "url", url_host(url)
+        return await _fetch(url, tenant), "url", url_host(url)
 
     async def _grade(kind: str, path: Path, p: dict, gs: Settings):
         from ..core import analyze, check, listen
@@ -428,7 +466,7 @@ def build_app(settings: Settings | None = None):
         p, gs = _validate(kind, params)
         path = None
         try:
-            path, src, host = await _acquire(file, url)
+            path, src, host = await _acquire(file, url, _principal(request).tenant)
             return await _run_and_audit(kind, path, src, host, p, gs, _principal(request),
                                         request.state.request_id)
         except AudelError as e:
@@ -486,7 +524,7 @@ def build_app(settings: Settings | None = None):
         t0 = time.monotonic()
         status = "ok"
         try:
-            path, src, host = await _acquire(file, url)
+            path, src, host = await _acquire(file, url, _principal(request).tenant)
             digest, size = await asyncio.to_thread(_sha256, path)
             rr = await _shielded(lambda: render(str(path), settings=grade_settings),
                                  settings.request_timeout_s, _principal(request).tenant)
@@ -517,7 +555,7 @@ def build_app(settings: Settings | None = None):
         p, gs = _validate("analyze", {"brief": brief, "expect": expect, "backend": backend})
         path = None
         try:
-            path, src, host = await _acquire(file, url)
+            path, src, host = await _acquire(file, url, _principal(request).tenant)
             return await _run_and_audit("analyze", path, src, host, p, gs, _principal(request),
                                         request.state.request_id, as_handoff=True)
         except AudelError as e:
@@ -585,22 +623,26 @@ def build_app(settings: Settings | None = None):
         holder: dict[str, str] = {}
 
         fetched: list[Path] = []
+        source: dict = {"path": spooled, "src": "upload", "host": None}
+
+        async def prepare() -> None:  # runs BEFORE any grading slot is taken
+            if source["path"] is None:
+                from ..ingest import url_host
+
+                path = await _fetch(url or "", principal.tenant)
+                fetched.append(path)
+                source.update(path=path, src="url", host=url_host(url or ""))
 
         async def work() -> dict:
-            path = spooled
-            src, host = "upload", None
-            if path is None:
-                path, src, host = await _acquire(None, url)
-                fetched.append(path)
-            return await _run_and_audit(kind, path, src, host, p, gs, principal, rid,
-                                        job_id=holder.get("id"))
+            return await _run_and_audit(kind, source["path"], source["src"], source["host"], p,
+                                        gs, principal, rid, job_id=holder.get("id"))
 
         def cleanup() -> None:  # runs on done, failure AND cancel (even while still queued)
             for f in ([spooled] if spooled is not None else []) + fetched:
                 f.unlink(missing_ok=True)
 
         try:
-            job = jobs.submit(principal.tenant, kind, work, cleanup=cleanup)
+            job = jobs.submit(principal.tenant, kind, work, cleanup=cleanup, prepare=prepare)
         except QueueFull as e:
             if spooled is not None:
                 spooled.unlink(missing_ok=True)

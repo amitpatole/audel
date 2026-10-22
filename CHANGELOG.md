@@ -95,6 +95,14 @@ All notable changes to Audel are recorded here. The format follows
   - **Deploy.** Helm ingress defaults to the same namespace, DNS egress goes to kube-dns only,
     token, JWKS and TLS mounts are supported, and the default is one replica. The Dockerfile base
     is pinned by digest, and GitHub Actions are pinned to commit SHAs.
+- Red-team round 5 fixes (network surface), each pinned by a regression test:
+  - **Medium.** Async jobs took the global grading slot before the tenant's share, and fetched URL
+    inputs while holding it. Jobs now fetch first, before any slot, then take the tenant share,
+    then a global slot.
+  - **Low-Medium.** The download pool was shared without a per-tenant cap. Each tenant may now run
+    at most 2 fetches, in a pool of 8.
+  - **Low-Medium.** Work abandoned while waiting on its tenant share still ran later. Abandonment now
+    propagates through both waits.
 - Red-team round 5 fixes (auth surface): a character-variety floor on token bodies, so patterned
   bodies are refused even when wrapped in a valid checksum, and an honest description of what the
   format check proves. Minted tokens are redacted from logs wherever they appear, including when

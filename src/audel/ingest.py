@@ -103,7 +103,9 @@ def _pool():
     if _DOWNLOAD_POOL is None:
         from concurrent.futures import ThreadPoolExecutor
 
-        _DOWNLOAD_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="audel-ingest")
+        # 8 threads, and the service caps each tenant at 2 concurrent fetches, so it takes several
+        # tenants together to fill the pool.
+        _DOWNLOAD_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="audel-ingest")
     return _DOWNLOAD_POOL
 
 
