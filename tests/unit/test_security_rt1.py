@@ -2073,3 +2073,89 @@ def test_helm_proxy_entry_forms(entry, ok):
     r = subprocess.run(["helm", "template", "t", str(chart), "--set", "auth.existingSecret=s",
                         "--set", f"forwardedAllowIps={{{entry}}}"], capture_output=True, text=True)
     assert (r.returncode == 0) == ok, r.stderr
+
+
+# ==== round 7, network surface ================================================================
+
+@requires_ffmpeg
+def test_render_audit_records_refusals_and_input_identity(tmp_path, media, monkeypatch):
+    import audel.core as core
+
+    log = tmp_path / "audit.jsonl"
+    s = Settings(cache_dir=tmp_path / "ws", audit_log=log)
+
+    def boom(*a, **k):
+        raise ValueError("stub crash")
+
+    with TestClient(build_app(settings=s)) as c:
+        ok = c.post("/render", files={"file": ("a.wav", media["good"].read_bytes(), "audio/wav")})
+        monkeypatch.setattr(core, "render", boom)
+        with pytest.raises(ValueError):
+            c.post("/render", files={"file": ("a.wav", media["good"].read_bytes(), "audio/wav")})
+    rows = [json.loads(x) for x in log.read_text().splitlines() if '"/render"' in x]
+    assert ok.status_code == 200
+    assert [r["status"] for r in rows] == ["ok", "error"]
+    assert all(r.get("input_sha256") and r.get("input_bytes") for r in rows)
+
+
+def test_failed_upload_spool_leaves_no_file(tmp_path, monkeypatch):
+    import os as _os
+
+    s = Settings(cache_dir=tmp_path / "ws")
+    real = _os.fdopen
+
+    class Full:
+        def __init__(self, fh):
+            self.fh = fh
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            self.fh.close()
+
+        def write(self, b):
+            raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(_os, "fdopen", lambda fd, mode="r", *a, **k:
+                        Full(real(fd, mode, *a, **k)) if mode == "wb" else real(fd, mode, *a, **k))
+    with TestClient(build_app(settings=s), raise_server_exceptions=False) as c:
+        r = c.post("/check", files={"file": ("a.wav", b"RIFF" + b"x" * 5000, "audio/wav")})
+    monkeypatch.setattr(_os, "fdopen", real)
+    assert r.status_code >= 400
+    assert not [f for f in (tmp_path / "ws" / "tmp").iterdir() if f.name.startswith("upload_")]
+
+
+def test_busy_fetch_inside_a_job_says_retry(tmp_path, monkeypatch):
+    import audel.ingest as ing
+    from audel.errors import BusyError
+    from audel.jobs import _public_error
+
+    assert "busy" in _public_error(BusyError("Too many downloads in progress.")).lower()
+
+    async def slow_fetch(url, tmp, settings):
+        await asyncio.sleep(4.0)
+        raise UnsafeSourceError("stub upstream")
+
+    monkeypatch.setattr(ing, "fetch_to_file", slow_fetch)
+    monkeypatch.setattr(ing, "validate_ingest_url", lambda u, s: None)
+    s = Settings(cache_dir=tmp_path / "ws", allow_url_ingest=True, queue_wait_s=0.5)
+    with TestClient(build_app(settings=s)) as c:
+        ids = [c.post("/jobs", data={"url": f"https://media.example/{i}.wav"}).json()["job_id"]
+               for i in range(3)]
+        time.sleep(1.5)
+        states = [c.get(f"/jobs/{i}").json() for i in ids]
+    failed = [j for j in states if j["status"] == "failed"]
+    assert failed and "busy" in failed[0]["error"].lower()
+
+
+def test_service_start_reaps_stale_temp_files(tmp_path):
+    ws = tmp_path / "ws"
+    build_app(settings=Settings(cache_dir=ws))
+    stale, fresh = ws / "tmp" / "upload_old.wav", ws / "tmp" / "upload_new.wav"
+    stale.write_bytes(b"x")
+    fresh.write_bytes(b"x")
+    old = time.time() - 2 * 86400
+    os.utime(stale, (old, old))
+    build_app(settings=Settings(cache_dir=ws))
+    assert not stale.exists() and fresh.exists()

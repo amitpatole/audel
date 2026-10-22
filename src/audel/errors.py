@@ -32,6 +32,10 @@ class BackendAuthError(BackendError):
     """A backend was selected but its credential is missing or rejected (fail closed, don't downgrade)."""
 
 
+class BusyError(AudelError):
+    """The server is at capacity for this request (a tenant or global share is full). Retry later."""
+
+
 class ConfigError(AudelError):
     """Invalid or inconsistent configuration."""
 

@@ -32,6 +32,7 @@ from ..auth import Authenticator, Principal, RateLimiter, client_key
 from ..config import Settings, load_settings
 from ..errors import (
     AudelError,
+    BusyError,
     ConfigError,
     MissingDependencyError,
     UnsafeSourceError,
@@ -109,6 +110,12 @@ def build_app(settings: Settings | None = None):
     fail_limiter = RateLimiter(settings.auth_fail_per_min)
     metrics = Metrics()
     audit = AuditLog(settings.audit_log)
+    try:  # reap temp files a crash (or a full disk) left behind; live requests are far younger
+        from ..workspace import Workspace as _Ws
+
+        _Ws(settings).purge_tmp(24 * 3600)
+    except OSError:
+        log.warning("could not sweep the workspace temp directory")
     _job_sem = asyncio.Semaphore(settings.max_concurrent_jobs)
     jobs = JobStore(max_queued=settings.max_queued_jobs, max_stored=settings.max_stored_jobs,
                     ttl_s=settings.job_result_ttl_s, semaphore=_job_sem,
@@ -248,8 +255,7 @@ def build_app(settings: Settings | None = None):
             try:
                 await asyncio.wait_for(sem.acquire(), timeout=settings.queue_wait_s)
             except TimeoutError:
-                raise HTTPException(status_code=429, detail="Too many downloads in progress.",
-                                    headers={"Retry-After": "30"}) from None
+                raise BusyError("Too many downloads in progress.") from None
             try:
                 return await fetch_to_file(url, Workspace(settings).tmp, settings)
             finally:
@@ -302,6 +308,8 @@ def build_app(settings: Settings | None = None):
             yield
 
     def _http_error(e: Exception) -> HTTPException:
+        if isinstance(e, BusyError):
+            return HTTPException(status_code=429, detail=str(e), headers={"Retry-After": "30"})
         if isinstance(e, (ConfigError, UnsafeSourceError)):
             # Caller-input validation or an unsafe source. Safe to surface once any workspace
             # path is redacted.
@@ -359,17 +367,19 @@ def build_app(settings: Settings | None = None):
         total = 0
         cap = settings.max_request_bytes
         fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
-        with os.fdopen(fd, "wb") as fh:
-            while True:
-                chunk = await upload.read(1 << 20)
-                if not chunk:
-                    break
-                total += len(chunk)
-                if total > cap:
-                    fh.close()
-                    dest.unlink(missing_ok=True)
-                    raise UnsafeSourceError("uploaded file exceeds the size cap")
-                fh.write(chunk)
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                while True:
+                    chunk = await upload.read(1 << 20)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > cap:
+                        raise UnsafeSourceError("uploaded file exceeds the size cap")
+                    fh.write(chunk)
+        except BaseException:  # over cap, I/O error (disk full), cancellation: leave nothing
+            dest.unlink(missing_ok=True)
+            raise
         if total == 0:
             dest.unlink(missing_ok=True)
             raise UnsafeSourceError("uploaded file is empty")
@@ -538,6 +548,7 @@ def build_app(settings: Settings | None = None):
         path = None
         t0 = time.monotonic()
         status = "ok"
+        digest = size = src = host = None
         try:
             path, src, host = await _acquire(file, url, _principal(request).tenant)
             digest, size = await asyncio.to_thread(_sha256, path)
@@ -555,10 +566,17 @@ def build_app(settings: Settings | None = None):
         except AudelError as e:
             status = "error"
             raise _http_error(e) from e
+        except HTTPException:
+            status = "refused"
+            raise
+        except BaseException:
+            status = "error"
+            raise
         finally:
             if path is not None:
                 audit.write(request_id=request.state.request_id, tenant=_principal(request).tenant,
                             endpoint="/render", kind="render", status=status,
+                            input_sha256=digest, input_bytes=size, source=src, source_host=host,
                             duration_ms=int((time.monotonic() - t0) * 1000))
                 path.unlink(missing_ok=True)
 

@@ -127,8 +127,9 @@ caption text, tokens, or signed-URL query strings.
 ## Retention
 
 Uploaded and fetched media is written to server-named temp files and deleted when the request or
-job finishes. `audel purge --hours 24` removes anything a crash left behind, and reaps expired
-loop sessions. Run it from cron or a Kubernetes CronJob.
+job finishes, including when a request fails or is cancelled. The service also removes temp files
+older than a day each time it starts. `audel purge --hours 24` does the same on demand and reaps
+expired loop sessions. Run it from cron or a Kubernetes CronJob for long-lived processes.
 
 ## Container
 

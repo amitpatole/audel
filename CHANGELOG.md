@@ -121,6 +121,15 @@ All notable changes to Audel are recorded here. The format follows
     at most 2 fetches, in a pool of 8.
   - **Low-Medium.** Work abandoned while waiting on its tenant share still ran later. Abandonment now
     propagates through both waits.
+- Red-team round 7 fixes (network surface), each pinned by a regression test. A leak stress and
+  a 20,000-task cancellation fuzz returned every counter to baseline.
+  - **Low.** `/render` audited refused or failed requests as `ok` and left out the input digest.
+    The audit now records the real outcome and the input's identity.
+  - **Low.** An upload that failed mid-write (disk full, cancellation) left a partial file. The
+    upload is now removed on any failure, and the service reaps temp files older than a day at
+    startup.
+  - **Info.** A job refused by the per-tenant download limit said the source couldn't be decoded.
+    It now says the server is busy (HTTP 429 on synchronous routes).
 - Red-team round 7 fixes (auth surface), each pinned by a regression test. No bypass or
   escalation was found.
   - **Low.** About one minted token in a million failed the structure check, so it would be refused
