@@ -83,7 +83,8 @@ def _dialogue_gate(path, m: Measurements, settings: Settings) -> None:
         try:
             regions = speech_regions(path, settings, stream=tm.stream.index,
                                      labels=tm.stream.channel_labels(),
-                                     channels=tm.stream.channels, timeout_s=left)
+                                     channels=tm.stream.channels, timeout_s=left,
+                                     layout=tm.stream.layout)
             if regions is None:
                 return  # no VAD installed: graders fall back to programme loudness
             speech_s = sum(b - a for a, b in regions)

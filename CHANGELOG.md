@@ -121,6 +121,19 @@ All notable changes to Audel are recorded here. The format follows
     at most 2 fetches, in a pool of 8.
   - **Low-Medium.** Work abandoned while waiting on its tenant share still ran later. Abandonment now
     propagates through both waits.
+- Red-team round 14 fixes (channel layouts), each pinned by a regression test. 227 files grade
+  unchanged under both specs.
+  - **Medium-High.** Speech detection decoded with a plain channel count, which makes ffmpeg remix
+    any layout that isn't its default for that count (quad, LCR 3.0, the 5.1.2 and 7.1.2 beds and
+    16 more): antiphase dialogue cancelled for the detector only. It now decodes with the same
+    layout the meter uses.
+  - **Medium-High.** WAVs with no channel mask (common from DAWs, and every 16- or 24-channel WAV)
+    were given channel ids that made ffmpeg's meter treat channel 4 as LFE and ignore it, on every
+    spec (up to a 12.6 LU misread). Unlabelled channels are now metered at full weight, except
+    6- and 8-channel files, which keep the conventional 5.1 and 7.1.
+  - **Medium.** On unlabelled files, the speech detector and the meter disagreed about which
+    channel was LFE (centre dialogue in a 3-channel file was never heard). Both now take their
+    labels from the same layout.
 - Red-team round 14 fixes (network and auth surfaces), each pinned by a regression test. No
   bypass, escalation or disclosure was found; the leak stress returned to baseline.
   - **Low-Medium.** A remote origin could send a status line containing Audel's own "busy" text

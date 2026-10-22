@@ -1199,7 +1199,7 @@ def test_layout_argument_rules():
 
     assert channel_layout_arg("quad", 4) == "quad"
     assert channel_layout_arg("7.1(wide)", 8) == "7.1(wide)"
-    assert channel_layout_arg("unknown", 9).startswith("USR0+") and \
+    assert channel_layout_arg("unknown", 9).startswith("USR768+") and \
         channel_layout_arg("unknown", 9).count("+") == 8
     assert channel_layout_arg("", 2) == "stereo"
     assert channel_layout_arg("stereo", 6) != "stereo"          # count mismatch is not trusted
@@ -3800,3 +3800,51 @@ def test_a_timed_out_stream_is_reaped_even_while_suspended(media):
     next(gen)
     time.sleep(1.0)                     # the watchdog fires while we hold the generator
     gen.close()
+
+
+# ==== round 14, decode surface (layouts) ======================================================
+
+@pytest.mark.parametrize("n", [3, 4, 5, 7, 16, 24])
+def test_unknown_channels_are_all_metered(n, tmp_path):
+    from audel.mediaguard import channel_layout_arg
+
+    lay = channel_layout_arg("", n)
+    assert lay.startswith("USR768") and lay.count("+") == n - 1
+    if shutil.which("ffmpeg") is None:
+        return
+    target = min(3, n - 1)
+    expr = "|".join(f"c{i}=" + ("c0" if i == target else "0*c0") for i in range(n))
+    out = subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-f", "lavfi", "-i",
+                          "sine=f=1000:d=3", "-af", f"pan={lay}|{expr},ebur128", "-f", "null",
+                          "-"], capture_output=True, text=True).stderr
+    assert "-70.0 LUFS" not in out.split("Summary:")[-1]     # that channel is measured
+
+
+def test_conventional_unlabelled_counts_keep_their_layout():
+    from audel.mediaguard import StreamInfo, channel_layout_arg
+
+    assert channel_layout_arg("", 6) == "5.1" and channel_layout_arg("unknown", 8) == "7.1"
+    st = StreamInfo(index=0, codec="pcm_s16le", sample_rate=48000, channels=3)
+    assert not any(lab.upper().startswith("LFE") for lab in st.channel_labels())
+
+
+@pytest.mark.parametrize("layout", ["quad", "3.0", "5.1.2", "7.1(wide)", "hexagonal"])
+def test_speech_decode_keeps_the_source_layout(layout):
+    from audel.mediaguard import _keep_layout, layout_channels
+
+    n = len(layout_channels(layout) or [])
+    assert n and _keep_layout(layout, n) == ["-ch_layout", layout]
+
+
+@requires_ffmpeg
+def test_antiphase_across_a_quad_rear_pair_is_still_heard(tmp_path):
+    pytest.importorskip("faster_whisper")
+    from audel.core.render import _render_sync
+
+    mono = _real_speech(tmp_path)
+    ctl, atk = tmp_path / "ctl.wav", tmp_path / "atk.wav"
+    _ff("-i", mono, "-af", "volume=0.3,pan=quad|BL=c0|BR=c0", ctl)
+    _ff("-i", mono, "-af", "volume=0.3,pan=quad|BL=c0|BR=-1*c0", atk)
+    a = _render_sync(str(ctl), Settings(), "netflix").measurements.tracks[0].dialogue_lufs
+    b = _render_sync(str(atk), Settings(), "netflix").measurements.tracks[0].dialogue_lufs
+    assert a is not None and b is not None and abs(a - b) < 1.0, (a, b)

@@ -117,8 +117,10 @@ def layout_channels(layout: str) -> list[str] | None:
     return _ffmpeg_layout_table().get(layout)
 
 
-# FFmpeg's default layout per channel count (used when the container carries no channel mask).
-_DEFAULT_LAYOUT = {1: "mono", 2: "stereo", 3: "2.1", 6: "5.1", 8: "7.1"}
+# Layout assumed when the container carries no channel mask: the counts whose unlabelled files
+# are conventionally these (film-order 5.1 / 7.1 from DAWs). Every other count is treated as N
+# plain channels (see channel_layout_arg), never guessed into one with an LFE.
+_DEFAULT_LAYOUT = {1: "mono", 2: "stereo", 6: "5.1", 8: "7.1"}
 
 
 @dataclass(frozen=True)
@@ -137,9 +139,11 @@ class StreamInfo:
     declared_end_s: float | None = None  # container time the stream DECLARES it ends (start+duration)
 
     def channel_labels(self) -> list[str]:
-        layout = self.layout or _DEFAULT_LAYOUT.get(self.channels, "")
+        """Channel names from the SAME layout the loudness meter is given (channel_layout_arg),
+        so speech detection and the meter always agree on which channel is which (and LFE)."""
+        layout = channel_layout_arg(self.layout, self.channels)
         labels = layout_channels(layout)
-        if labels and len(labels) == self.channels:
+        if labels and len(labels) == self.channels and not layout.startswith("USR"):
             return list(labels)
         return [f"ch{i + 1}" for i in range(self.channels)]
 
@@ -721,11 +725,11 @@ def channel_layout_arg(layout: str, channels: int) -> str:
         known = layout_channels(layout)
         if known is None or len(known) == n:
             return layout
-    if n == 1:
-        return "mono"
-    if n == 2:
-        return "stereo"
-    return "+".join(f"USR{i}" for i in range(n))
+    if n in _DEFAULT_LAYOUT:
+        return _DEFAULT_LAYOUT[n]
+    # N plain channels. ffmpeg reads USRk as channel id k, so USR0..USRn would make index 3 an
+    # LFE (weight 0) and others surrounds; ids from 768 (AV_CHAN_UNKNOWN) are weighted 1.0 each.
+    return "+".join(f"USR{768 + i}" for i in range(n))
 
 
 def validate_source(source: str | os.PathLike, settings: Settings, *, allow_local_files: bool | None = None) -> Path:
@@ -1129,7 +1133,7 @@ def probe_streams(path: Path, settings: Settings) -> dict:
 
 def stream_pcm16(path: Path, settings: Settings, *, stream: int, channels: int,
                  sample_rate: int = 16000, highpass_hz: int | None = None, chunk_s: int = 60,
-                 timeout_s: float | None = None):
+                 timeout_s: float | None = None, layout: str = ""):
     """Decode a validated file and YIELD it as int16 frame blocks of ``chunk_s`` seconds,
     ``(samples, channels)``: no temp file, so a long many-channel track can't hit the write
     limit, and memory stays at one chunk. Same strict decoding as the main pass (CRC errors
@@ -1145,8 +1149,8 @@ def stream_pcm16(path: Path, settings: Settings, *, stream: int, channels: int,
     argv = [ffmpeg, "-nostdin", "-hide_banner", "-v", "error", "-threads", "1",
             "-reinit_filter", "0", "-err_detect", "crccheck+explode", *safe_input(path),
             "-map", f"0:a:{int(stream)}?", "-af", chain, "-t", str(settings.max_duration_s),
-            "-ar", str(sample_rate), "-ac", str(n), "-f", "s16le", "-acodec", "pcm_s16le",
-            "pipe:1"]
+            "-ar", str(sample_rate), *_keep_layout(layout, n), "-f", "s16le",
+            "-acodec", "pcm_s16le", "pipe:1"]
     limit = pass_timeout(settings, settings.max_duration_s)
     timeout = min(limit, timeout_s) if timeout_s else limit
     pre = _rlimit_setter(int(timeout) + _RLIMIT_CPU_PAD_S) if os.name == "posix" else None
@@ -1198,6 +1202,13 @@ def stream_pcm16(path: Path, settings: Settings, *, stream: int, channels: int,
         raise UnsafeSourceError(f"decode exceeded {timeout:.0f}s timeout")
     if proc.returncode != 0:
         raise DecodeError(f"could not decode audio: {_cause(err.join(5).decode('utf-8', 'replace'))}")
+
+
+def _keep_layout(layout: str, n: int) -> list[str]:
+    """Output exactly the source channels in their order, as the main pass meters them. ``-ac n``
+    would remix any layout that isn't ffmpeg's default for n (quad, 3.0, Atmos beds...)."""
+    lay = channel_layout_arg(layout, n)
+    return [] if lay.startswith("USR") else ["-ch_layout", lay]
 
 
 def _mkstemp(prefix: str, settings: Settings) -> tuple[int, str]:
