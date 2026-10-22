@@ -23,7 +23,7 @@ from ..models import (
     Verdict,
     verdict_from_issues,
 )
-from ..signals.checks import evaluate
+from ..signals.checks import effective_spec, evaluate
 from ..speech.conformance import grade
 from .render import _render_sync
 
@@ -32,6 +32,7 @@ DSP_CAPABILITIES = [
     IssueKind.SILENCE, IssueKind.CLIPPING, IssueKind.LOUDNESS, IssueKind.TRUNCATION,
     IssueKind.MISSING_AUDIO, IssueKind.DECODE_ERROR, IssueKind.DURATION,
     IssueKind.TRANSCRIPT_MISMATCH, IssueKind.WRONG_LANGUAGE, IssueKind.DROPOUT, IssueKind.DESYNC,
+    IssueKind.CHANNEL_ISSUE, IssueKind.NOISE,
 ]
 
 
@@ -52,16 +53,20 @@ def _summarize(rr, issues) -> str:
     return f"{len(issues)} issue(s): {kinds}"
 
 
-async def check(source, *, settings: Settings | None = None, brief=None) -> Report:
+async def check(source, *, settings: Settings | None = None, brief=None, spec=None) -> Report:
     """Deterministically grade ``source``; with ``brief``, also grade transcript claims via the
-    OFFLINE local ASR only. This path never constructs a network backend — no egress, ever."""
+    OFFLINE local ASR only. This path never constructs a network backend — no egress, ever.
+
+    ``spec`` is a :class:`~audel.specs.DeliverySpec`, a built-in name (``"ebu_r128"``) or an
+    operator JSON path; default is ``settings.delivery_spec`` (else the loudness preset)."""
     settings = settings or load_settings()
+    sp = effective_spec(settings, spec)  # raises ConfigError on an unknown spec (fail closed)
     try:
-        rr = await asyncio.to_thread(_render_sync, source, settings)
+        rr = await asyncio.to_thread(_render_sync, source, settings, sp)
     except AudelError as e:
         return _decode_error(source, e)
 
-    issues: list[Issue] = list(evaluate(rr.measurements, settings))  # type: ignore[arg-type]
+    issues: list[Issue] = list(evaluate(rr.measurements, settings, sp))  # type: ignore[arg-type]
     conformance: Conformance | None = None
     used = "dsp"
 
@@ -82,5 +87,5 @@ async def check(source, *, settings: Settings | None = None, brief=None) -> Repo
         capabilities=DSP_CAPABILITIES,
         backend=used,
         sample_rate=rr.sample_rate, channels=rr.channels, duration_ms=rr.duration_ms,
-        audio_path=str(source),
+        audio_path=str(source), spec=rr.spec, tracks=rr.tracks,
     )

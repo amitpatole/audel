@@ -18,9 +18,15 @@ from audel.logging import _SecretScrubber, register_secret
 
 
 def test_base_import_is_light():
-    assert "torch" not in sys.modules
-    assert "faster_whisper" not in sys.modules
-    assert "transformers" not in sys.modules
+    # Fresh interpreter: other tests legitimately import the heavy extras, so checking this
+    # process's sys.modules would depend on test order.
+    import subprocess
+
+    code = ("import sys, audel, audel.core, audel.specs, audel.bench, audel.qc_report; "
+            "heavy = [m for m in ('torch', 'faster_whisper', 'transformers', 'fastapi', 'mcp') "
+            "if m in sys.modules]; print(','.join(heavy))")
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
+    assert out.stdout.strip() == "", f"heavy modules imported eagerly: {out.stdout.strip()}"
 
 
 def test_audio_issue_is_time_grounded():

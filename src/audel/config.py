@@ -96,6 +96,14 @@ class Settings(BaseSettings):
     # Loudness / DSP grading
     loudness_target: LoudnessTarget = LoudnessTarget.PODCAST
     silence_dbfs: float = -50.0        # below this RMS = silence
+    # Delivery spec (Phase 9): a built-in name (ebu_r128, atsc_a85, netflix, spotify, ...) or a path
+    # to an operator JSON spec. None keeps the 0.1 behaviour (loudness_target preset, advisory).
+    delivery_spec: str | None = None
+    content_type: str | None = None    # speech|music|mixed; None = take it from the spec
+    analyze_all_tracks: bool = True    # grade every audio stream, not only a:0
+    max_audio_streams: int = 32        # refuse stream-count bombs before any per-track decode
+    hum_detection: bool = True
+    noise_floor_dbfs: float = -50.0    # speech whose quiet passages sit above this = noise/hiss
     clipping_dbtp: float = -1.0        # true-peak ceiling (dBTP) above which we flag clipping
 
     # Realtime streaming (Phase 7) — bounded buffers + backpressure for live grading.

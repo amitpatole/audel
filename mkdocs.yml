@@ -66,3 +66,5 @@ plugins:
 nav:
   - Home: index.md
   - Quickstart: quickstart.md
+  - Delivery specs: specs.md
+  - Checks reference: checks.md

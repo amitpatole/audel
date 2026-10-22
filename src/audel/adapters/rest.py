@@ -24,7 +24,7 @@ import uuid
 from pathlib import Path
 
 from ..config import Settings, load_settings
-from ..errors import AudelError, MissingDependencyError, UnsafeSourceError
+from ..errors import AudelError, ConfigError, MissingDependencyError, UnsafeSourceError
 from ..logging import get_logger
 from ..models import Brief, Report
 
@@ -182,16 +182,42 @@ def build_app(settings: Settings | None = None):
         return {"checks": [{"name": c.name, "ok": c.ok, "detail": c.detail}
                            for c in run_checks(settings)]}
 
+    def _spec_for(name: str | None):
+        """Remote callers may name a BUILT-IN spec only — never a server file path."""
+        if not name:
+            return None
+        from ..specs import builtin_spec
+
+        try:
+            return builtin_spec(name)
+        except ConfigError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+
+    def _settings_for(content: str | None) -> Settings:
+        if not content:
+            return grade_settings
+        if content not in ("speech", "music", "mixed"):
+            raise HTTPException(status_code=400, detail="content must be speech, music or mixed")
+        return grade_settings.model_copy(update={"content_type": content})
+
+    @app.get("/specs")
+    def specs_ep():
+        from ..specs import BUILTIN_SPECS
+
+        return {"specs": [s.model_dump(mode="json") for s in BUILTIN_SPECS.values()]}
+
     @app.post("/check")
     async def check_ep(file: UploadFile = File(...), brief: str | None = Form(None),
-                       expect: list[str] | None = Form(None), _slot=Depends(_job_slot)):
+                       expect: list[str] | None = Form(None), spec: str | None = Form(None),
+                       content: str | None = Form(None), _slot=Depends(_job_slot)):
         """Deterministic grade of an uploaded clip (no LLM, no egress)."""
         from ..core import check
 
+        sp, gs = _spec_for(spec), _settings_for(content)
         dest = None
         try:
             dest = await _spool(file)
-            report = await check(str(dest), settings=grade_settings, brief=_brief_from(brief, expect))
+            report = await check(str(dest), settings=gs, brief=_brief_from(brief, expect), spec=sp)
             return _public(report)
         except AudelError as e:
             raise _http_error(e) from e
@@ -202,16 +228,18 @@ def build_app(settings: Settings | None = None):
     @app.post("/analyze")
     async def analyze_ep(file: UploadFile = File(...), brief: str | None = Form(None),
                          expect: list[str] | None = Form(None), backend: str | None = Form(None),
+                         spec: str | None = Form(None), content: str | None = Form(None),
                          _slot=Depends(_job_slot)):
         """Full grade (signals + ASR + backend critique). Egress only to the server's backend."""
         from ..core import analyze
 
         _check_backend(backend)
+        sp, gs = _spec_for(spec), _settings_for(content)
         dest = None
         try:
             dest = await _spool(file)
-            report = await analyze(str(dest), settings=grade_settings,
-                                   brief=_brief_from(brief, expect), backend=backend)
+            report = await analyze(str(dest), settings=gs,
+                                   brief=_brief_from(brief, expect), backend=backend, spec=sp)
             return _public(report)
         except AudelError as e:
             raise _http_error(e) from e

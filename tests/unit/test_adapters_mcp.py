@@ -11,7 +11,7 @@ pytest.importorskip("mcp")
 
 from audel.adapters.mcp import build_server  # noqa: E402
 
-_EXPECTED = {"check_audio", "analyze_audio", "perceive_handoff", "watch_audio", "render_audio",
+_EXPECTED = {"check_audio", "analyze_audio", "perceive_handoff", "watch_audio", "render_audio", "list_specs",
              "diff_audio", "start_loop", "loop_iterate", "doctor"}
 
 

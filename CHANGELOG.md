@@ -7,6 +7,21 @@ All notable changes to Audel are recorded here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Delivery specs as data.** Built-in EBU R128, R128 s1, ATSC A/85, OP-59, ARIB TR-B32,
+  Netflix-style speech-gated, Spotify, YouTube, Apple Music, Apple Podcasts and podcast specs, plus
+  operator JSON specs. Select with `--spec`, `spec=`, or `AUDEL_DELIVERY_SPEC`. `audel specs` and
+  `GET /specs` list them.
+- Spec grading of short-term and momentary loudness maxima and LRA ceilings, with time-grounded
+  spans for every passage over the limit.
+- Speech-gated loudness for dialogue-gated specs, using the Silero VAD in the `[asr]` extra.
+- Every audio track is graded, with a per-track summary in `Report.tracks` and the spec name in
+  `Report.spec`.
+- Per-channel checks: dead channel, polarity inversion, phase, and DC offset.
+- Mains hum detection at 50 and 60 Hz, and a noise-floor check for speech content.
+- `detail.check` names the precise rule on every DSP finding.
+- `audel qc` writes a self-contained HTML QC report for operators, with JSON alongside.
+- `audel bench` measures precision and recall per check, on a synthetic labelled corpus or on your
+  own labelled corpus.
 - `SECURITY.md` with a private reporting path and supported-version table.
 - `CITATION.cff` and a drift-guard test that pins it, `pyproject` and `__version__` together.
 - CI now gates on strict type checking, the no-key demo, and a dependency vulnerability audit.
@@ -18,6 +33,8 @@ All notable changes to Audel are recorded here. The format follows
   API, so the request now uses `output_config.effort = "low"` and handles a `refusal` stop reason.
 
 ### Changed
+- Truncation now requires the tail to sit near programme level, so a steady noise or hum tail no
+  longer reads as a cut.
 - Default Anthropic critique model is now `claude-haiku-5-5` (was `claude-haiku-4-5`).
 
 ## [0.1.0] - 2026-06-22

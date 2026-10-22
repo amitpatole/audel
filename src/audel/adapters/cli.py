@@ -44,14 +44,93 @@ def doctor() -> None:
                "note: install ffmpeg for the deterministic check path")
 
 
+_SPEC_HELP = "Delivery spec: a built-in name (see `audel specs`) or a path to a JSON spec."
+_CONTENT_HELP = "Content type: speech | music | mixed (enables content-aware checks)."
+
+
+def _settings_for(content: str | None):
+    return load_settings(content_type=content) if content else load_settings()
+
+
 @app.command()
-def check(source: str) -> None:
+def check(source: str,
+          spec: str = typer.Option(None, "--spec", help=_SPEC_HELP),
+          content: str = typer.Option(None, "--content", help=_CONTENT_HELP),
+          json_out: bool = typer.Option(False, "--json", help="Print the JSON report.")) -> None:
     """Deterministic grade (no LLM, no egress)."""
     from ..core import check as _check
 
-    report = asyncio.run(_check(source))
-    _print_report(report)
+    report = asyncio.run(_check(source, settings=_settings_for(content), spec=spec))
+    if json_out:
+        typer.echo(report.model_dump_json(indent=2))
+    else:
+        _print_report(report)
     raise typer.Exit(0 if report.verdict.value != "fail" else 1)
+
+
+@app.command()
+def specs() -> None:
+    """List the built-in delivery specs."""
+    from ..specs import BUILTIN_SPECS
+
+    for s in BUILTIN_SPECS.values():
+        extra = []
+        if s.max_short_term_lufs is not None:
+            extra.append(f"S≤{s.max_short_term_lufs:g}")
+        if s.gating.value == "dialogue":
+            extra.append("speech-gated")
+        typer.echo(f"  {s.name:<15} {s.integrated_lufs:>6.1f} LUFS ±{s.tolerance_lu:<4g} "
+                   f"TP≤{s.max_true_peak_dbtp:<5g} {s.strictness.value:<7} "
+                   f"{' '.join(extra):<20} {s.description}")
+
+
+@app.command()
+def qc(source: str,
+       spec: str = typer.Option(None, "--spec", help=_SPEC_HELP),
+       content: str = typer.Option(None, "--content", help=_CONTENT_HELP),
+       html: Path = typer.Option(None, "--html", help="Write a self-contained HTML QC report here."),
+       json_path: Path = typer.Option(None, "--json", help="Write the JSON report here.")) -> None:
+    """Grade against a delivery spec and write operator-facing QC reports (HTML and/or JSON)."""
+    from ..core import check as _check
+    from ..qc_report import render_html
+
+    report = asyncio.run(_check(source, settings=_settings_for(content), spec=spec))
+    _print_report(report)
+    if html:
+        html.write_text(render_html(report, source_name=Path(source).name), encoding="utf-8")
+        typer.echo(f"html report: {html}")
+    if json_path:
+        json_path.write_text(report.model_dump_json(indent=2), encoding="utf-8")
+        typer.echo(f"json report: {json_path}")
+    raise typer.Exit(0 if report.verdict.value != "fail" else 1)
+
+
+@app.command()
+def bench(corpus: Path = typer.Option(None, "--corpus",
+                                      help="Directory with labels.json (default: synthetic corpus)."),
+          json_out: bool = typer.Option(False, "--json", help="Print the JSON result.")) -> None:
+    """Measure detector precision/recall on a labelled corpus (synthetic by default)."""
+    import json as _json
+
+    from ..bench import load_corpus, run_bench, synthetic_bench
+
+    if corpus:
+        res = asyncio.run(run_bench(load_corpus(corpus)))
+    else:
+        with tempfile.TemporaryDirectory(prefix="audel-bench-") as td:
+            res = synthetic_bench(Path(td))
+    if json_out:
+        typer.echo(_json.dumps(res.to_dict(), indent=2))
+    else:
+        typer.echo(f"{res.exact}/{res.cases} cases graded exactly")
+        typer.echo(f"  {'check':<22}{'tp':>4}{'fn':>4}{'fp':>4}  precision  recall")
+        for k, v in sorted(res.per_check.items()):
+            pr = "-" if v.precision is None else f"{v.precision:.2f}"
+            rc = "-" if v.recall is None else f"{v.recall:.2f}"
+            typer.echo(f"  {k:<22}{v.tp:>4}{v.fn:>4}{v.fp:>4}  {pr:>9}  {rc:>6}")
+        for m in res.misses:
+            typer.echo(f"  miss: {m['case']}: expected {m['expected']}, raised {m['raised']}")
+    raise typer.Exit(0 if res.exact == res.cases else 1)
 
 
 @app.command()

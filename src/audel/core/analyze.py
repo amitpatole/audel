@@ -32,7 +32,7 @@ from ..models import (
     Span,
     verdict_from_issues,
 )
-from ..signals.checks import evaluate
+from ..signals.checks import effective_spec, evaluate
 from ..speech.conformance import grade
 from .check import DSP_CAPABILITIES, _decode_error, _summarize
 from .render import _render_sync
@@ -104,16 +104,18 @@ def _intent_issue(claim, evidence, duration_ms) -> Issue:
                       source=IssueSource.AUDIO_LLM, detail={"claim": claim.text})
 
 
-async def analyze(source, *, settings: Settings | None = None, brief=None, backend=None) -> Report:
+async def analyze(source, *, settings: Settings | None = None, brief=None, backend=None,
+                  spec=None) -> Report:
     """Full grade of ``source``; with a ``brief``, grades deterministic + LLM/CLAP requirements."""
     settings = settings or load_settings()
     backend_name = backend or settings.audio_backend or "ollama"
+    sp = effective_spec(settings, spec)
     try:
-        rr = await asyncio.to_thread(_render_sync, source, settings)
+        rr = await asyncio.to_thread(_render_sync, source, settings, sp)
     except AudelError as e:
         return _decode_error(source, e)
 
-    issues: list[Issue] = list(evaluate(rr.measurements, settings))  # type: ignore[arg-type]
+    issues: list[Issue] = list(evaluate(rr.measurements, settings, sp))  # type: ignore[arg-type]
     conformance: Conformance | None = None
     used = "dsp"
 
@@ -161,5 +163,5 @@ async def analyze(source, *, settings: Settings | None = None, brief=None, backe
         capabilities=DSP_CAPABILITIES,
         backend=used,
         sample_rate=rr.sample_rate, channels=rr.channels, duration_ms=rr.duration_ms,
-        audio_path=str(source),
+        audio_path=str(source), spec=rr.spec, tracks=rr.tracks,
     )

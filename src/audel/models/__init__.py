@@ -29,7 +29,7 @@ from agentsensory import (
     Verdict,
     verdict_from_issues,
 )
-from pydantic import Field
+from pydantic import BaseModel, ConfigDict, Field
 
 __all__ = [
     # shared contract (re-exported)
@@ -37,7 +37,7 @@ __all__ = [
     "BBox", "Span", "Brief", "IntentClaim", "ClaimResult", "Conformance",
     "Handoff", "NextAction", "Sense", "verdict_from_issues",
     # audio specialisation
-    "IssueKind", "IssueSource", "Issue", "Report",
+    "IssueKind", "IssueSource", "Issue", "Report", "TrackSummary",
 ]
 
 
@@ -77,6 +77,28 @@ class Issue(IssueBase):
     source: IssueSource = IssueSource.DSP
 
 
+class TrackSummary(BaseModel):
+    """Per-audio-stream measurements, flat and JSON-safe (non-finite levels become ``None``)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    index: int
+    codec: str = ""
+    channels: int = 0
+    sample_rate: int = 0
+    layout: str = ""
+    language: str | None = None
+    title: str | None = None
+    integrated_lufs: float | None = None
+    dialogue_lufs: float | None = None
+    dialogue_coverage: float | None = None
+    lra: float | None = None
+    true_peak_dbtp: float | None = None
+    max_momentary_lufs: float | None = None
+    max_short_term_lufs: float | None = None
+    rms_dbfs: float | None = None
+
+
 class Report(ReportBase):
     """An audio report: shared fields + the decode/grading-specific surface."""
 
@@ -95,6 +117,9 @@ class Report(ReportBase):
     audio_path: str | None = Field(
         default=None, description="Server-relative artifact id/path; adapters project it."
     )
+    spec: str | None = Field(default=None, description="Delivery spec the audio was graded against.")
+    tracks: list[TrackSummary] = Field(default_factory=list,
+                                       description="Per-audio-stream measurements.")
 
     @property
     def artifact_path(self) -> str | None:

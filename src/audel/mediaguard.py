@@ -40,6 +40,46 @@ _RLIMIT_CPU_PAD_S = 30                         # CPU-seconds headroom over the w
 # bound the actual DoS surface.
 
 
+# Channel labels for the common layouts ffprobe reports (FFmpeg channel order).
+CHANNEL_LABELS: dict[str, list[str]] = {
+    "mono": ["FC"],
+    "stereo": ["FL", "FR"],
+    "2.1": ["FL", "FR", "LFE"],
+    "3.0": ["FL", "FR", "FC"],
+    "quad": ["FL", "FR", "BL", "BR"],
+    "4.0": ["FL", "FR", "FC", "BC"],
+    "5.0": ["FL", "FR", "FC", "BL", "BR"],
+    "5.0(side)": ["FL", "FR", "FC", "SL", "SR"],
+    "5.1": ["FL", "FR", "FC", "LFE", "BL", "BR"],
+    "5.1(side)": ["FL", "FR", "FC", "LFE", "SL", "SR"],
+    "7.1": ["FL", "FR", "FC", "LFE", "BL", "BR", "SL", "SR"],
+}
+
+
+# FFmpeg's default layout per channel count (used when the container carries no channel mask).
+_DEFAULT_LAYOUT = {1: "mono", 2: "stereo", 3: "2.1", 6: "5.1", 8: "7.1"}
+
+
+@dataclass(frozen=True)
+class StreamInfo:
+    """One audio stream (``index`` is the audio-relative index, i.e. ffmpeg's ``0:a:<index>``)."""
+
+    index: int
+    codec: str
+    sample_rate: int
+    channels: int
+    layout: str = ""
+    language: str | None = None
+    title: str | None = None
+
+    def channel_labels(self) -> list[str]:
+        layout = self.layout or _DEFAULT_LAYOUT.get(self.channels, "")
+        labels = CHANNEL_LABELS.get(layout)
+        if labels and len(labels) == self.channels:
+            return list(labels)
+        return [f"ch{i + 1}" for i in range(self.channels)]
+
+
 @dataclass(frozen=True)
 class MediaInfo:
     duration_s: float
@@ -47,6 +87,7 @@ class MediaInfo:
     channels: int
     codec: str
     has_audio: bool
+    streams: tuple[StreamInfo, ...] = ()
 
 
 def _tool(name: str, override: str | None = None) -> str:
@@ -141,7 +182,9 @@ def probe(path: Path, settings: Settings) -> MediaInfo:
     ffprobe = _tool("ffprobe", settings.ffmpeg_path and str(Path(settings.ffmpeg_path).with_name("ffprobe")))
     argv = [
         ffprobe, "-v", "error", "-print_format", "json",
-        "-show_entries", "format=duration:stream=codec_type,codec_name,sample_rate,channels",
+        "-show_entries",
+        "format=duration:stream=codec_type,codec_name,sample_rate,channels,channel_layout"
+        ":stream_tags=language,title",
         "-i", str(path),
     ]
     proc = run(argv, timeout_s=min(30.0, settings.decode_timeout_s))
@@ -175,10 +218,42 @@ def probe(path: Path, settings: Settings) -> MediaInfo:
         )
     if sample_rate > settings.max_sample_rate:
         raise UnsafeSourceError(f"sample rate {sample_rate} exceeds the {settings.max_sample_rate} cap")
+    if len(astreams) > settings.max_audio_streams:
+        raise UnsafeSourceError(
+            f"{len(astreams)} audio streams exceeds the {settings.max_audio_streams}-stream cap")
+    streams: list[StreamInfo] = []
+    for i, st in enumerate(astreams):
+        sr, ch = _int(st.get("sample_rate")), _int(st.get("channels"))
+        if sr > settings.max_sample_rate:
+            raise UnsafeSourceError(f"stream {i} sample rate {sr} exceeds the {settings.max_sample_rate} cap")
+        if ch > settings.max_channels:
+            raise UnsafeSourceError(f"stream {i} channel count {ch} exceeds the {settings.max_channels} cap")
+        tags = st.get("tags") if isinstance(st.get("tags"), dict) else {}
+        streams.append(StreamInfo(
+            index=i, codec=_tag(st.get("codec_name")), sample_rate=sr, channels=ch,
+            layout=_tag(st.get("channel_layout")), language=_tag(tags.get("language")) or None,
+            title=_tag(tags.get("title")) or None))
     if channels > settings.max_channels:
         raise UnsafeSourceError(f"channel count {channels} exceeds the {settings.max_channels} cap")
     return MediaInfo(duration_s=duration_s, sample_rate=sample_rate, channels=channels,
-                     codec=codec, has_audio=has_audio)
+                     codec=codec, has_audio=has_audio, streams=tuple(streams))
+
+
+def _int(v) -> int:
+    try:
+        return int(v or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+_TAG_OK = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ._-()/:+")
+
+
+def _tag(v) -> str:
+    """Container metadata is attacker-controlled: keep it short and printable before it reaches a
+    report, a log line or an HTML page."""
+    s = str(v or "")[:64]
+    return "".join(c for c in s if c in _TAG_OK)
 
 
 def probe_streams(path: Path, settings: Settings) -> dict:
@@ -206,7 +281,8 @@ def probe_streams(path: Path, settings: Settings) -> dict:
     return out
 
 
-def decode_to_wav(path: Path, settings: Settings, *, sample_rate: int = 16000) -> Path:
+def decode_to_wav(path: Path, settings: Settings, *, sample_rate: int = 16000,
+                  stream: int = 0) -> Path:
     """Decode a validated file to a DURATION-BOUNDED 16 kHz mono WAV in a temp file (caller deletes).
 
     This is what the ASR path transcribes — never the raw input — so whisper can never be made to
@@ -217,7 +293,7 @@ def decode_to_wav(path: Path, settings: Settings, *, sample_rate: int = 16000) -
     os.close(fd)
     out = Path(name)
     argv = [ffmpeg, "-nostdin", "-hide_banner", "-threads", "1", "-i", str(path),
-            "-map", "0:a:0?", "-t", str(settings.max_duration_s),
+            "-map", f"0:a:{int(stream)}?", "-t", str(settings.max_duration_s),
             "-ar", str(sample_rate), "-ac", "1", "-f", "wav", "-y", str(out)]
     proc = run(argv, timeout_s=settings.decode_timeout_s)
     if proc.returncode != 0 or out.stat().st_size == 0:

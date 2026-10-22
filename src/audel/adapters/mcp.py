@@ -41,6 +41,23 @@ def _brief(brief: str | None, expect: list[str] | None) -> Brief | None:
     return None if b.is_empty() else b
 
 
+def _builtin(spec: str | None):
+    """Tool arguments come from an agent (possibly prompt-injected): built-in spec NAMES only."""
+    if not spec:
+        return None
+    from ..specs import builtin_spec
+
+    return builtin_spec(spec)
+
+
+def _settings(content: str | None):
+    if content and content not in ("speech", "music", "mixed"):
+        from ..errors import ConfigError
+
+        raise ConfigError("content must be speech, music or mixed")
+    return load_settings(content_type=content) if content else load_settings()
+
+
 def build_server():
     if FastMCP is None:
         raise MissingDependencyError("MCP server needs the mcp package; pip install audel[mcp]")
@@ -49,15 +66,29 @@ def build_server():
 
     @mcp.tool()
     async def check_audio(source: str, brief: str | None = None,
-                          expect: list[str] | None = None) -> dict:
-        """Deterministically grade an audio/media file (silence/clipping/loudness/truncation).
+                          expect: list[str] | None = None, spec: str | None = None,
+                          content: str | None = None) -> dict:
+        """Deterministically grade an audio/media file against a delivery spec.
 
-        No LLM, no network. With brief/expect, also grades transcript claims via OFFLINE local ASR.
+        Checks loudness (integrated, short-term, momentary, LRA), true peak, clipping, silence,
+        truncation, dead / inverted / out-of-phase channels, DC offset, hum and noise floor, on
+        every audio track. ``spec`` is a built-in name (ebu_r128, ebu_r128_s1, atsc_a85, op59,
+        arib_tr_b32, netflix, spotify, youtube, apple_music, apple_podcasts, podcast); ``content``
+        is speech, music or mixed. No LLM, no network. With brief/expect, also grades transcript
+        claims via OFFLINE local ASR.
         """
         from ..core import check
 
-        report = await check(source, settings=load_settings(), brief=_brief(brief, expect))
+        report = await check(source, settings=_settings(content), brief=_brief(brief, expect),
+                             spec=_builtin(spec))
         return report.model_dump(mode="json")
+
+    @mcp.tool()
+    async def list_specs() -> list[dict]:
+        """The built-in delivery specs (loudness target, tolerance, true-peak ceiling, gating)."""
+        from ..specs import BUILTIN_SPECS
+
+        return [s.model_dump(mode="json") for s in BUILTIN_SPECS.values()]
 
     @mcp.tool()
     async def analyze_audio(source: str, brief: str | None = None,
