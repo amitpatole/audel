@@ -4061,6 +4061,12 @@ def test_inverted_left_right_is_caught_in_any_channel_order(tmp_path, order):
     _ff("-f", "lavfi", "-i", "anoisesrc=d=6:c=pink:a=0.1", "-af",
         f"pan={order}|{mapping}", "-c:a", "pcm_s16le", f)
     del n
+    lay = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=channel_layout",
+                          "-of", "csv=p=0", str(f)], capture_output=True, text=True).stdout
+    if order not in lay:
+        # ffmpeg 6.x's mov muxer stores the nearest standard layout without reordering the
+        # audio: the file itself then mislabels its channels, which no grader can see through.
+        pytest.skip(f"this ffmpeg can't write the {order} order (wrote {lay.strip()!r})")
     checks = {i.detail.get("check") for i in asyncio.run(check(str(f))).issues}
     assert "polarity_inversion" in checks, checks
 
