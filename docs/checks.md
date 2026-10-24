@@ -127,7 +127,7 @@ audel bench --corpus ./qc-corpus      # exits non-zero unless every file grades 
 
 ## Throughput
 
-These figures were measured for 1.0.0rc1 on a shared 4-core host under heavy load (load average
+These figures were measured for 1.0.0 on a shared 4-core host under heavy load (load average
 about 14), so an idle machine does better. Each track is graded single-threaded, so run several
 jobs in parallel to use more cores.
 

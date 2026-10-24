@@ -6,6 +6,31 @@ All notable changes to Audel are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-10-24
+
+First stable release. Everything in 1.0.0rc1, plus:
+
+### Added
+- The service image is now built, smoke-tested (it must refuse to start without a token, then
+  serve with one) and pushed to `ghcr.io/amitpatole/audel` by the release workflow, so the Helm
+  chart's image exists. The image carries OCI source, description and license labels.
+- A design and citation page (what Audel is, why, its architecture, how it was verified, its
+  limits, how to cite) and a concept DOI (10.5281/zenodo.23609200) in the README, the docs and
+  `CITATION.cff`.
+
+### Changed
+- Releases publish to TestPyPI and PyPI through Trusted Publishing from the version tag. The
+  workflow checks that the tag matches the package version and skips versions already on PyPI.
+- Development status is Production/Stable; install with plain `pip install audel`.
+- `CITATION.cff` no longer lists a personal email address.
+
+### Verified
+- A false-positive sweep of the unread-media check on legitimate files from real muxers (MP4
+  with cover art, large metadata, faststart, edit lists, CMAF, DASH, ISMV, per-track and tiny
+  fragments; MXF OP1a and OPAtom; multichannel and multiplexed Ogg; multichannel, hybrid and
+  cover-art WavPack): no false positives. On packet-dense files (3 h AAC, 30 min Opus at 2.5 ms
+  frames, 1 h of 0.1 s fragments) the check costs a few percent of the decode.
+
 ## [1.0.0rc1] - 2026-10-22
 
 First release candidate for 1.0.

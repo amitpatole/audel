@@ -9,12 +9,16 @@ type: software
 authors:
   - family-names: Patole
     given-names: Amit
-    email: amit.patole@gmail.com
+doi: 10.5281/zenodo.23609200
+identifiers:
+  - type: doi
+    value: 10.5281/zenodo.23609200
+    description: Concept DOI (always the latest version)
 repository-code: "https://github.com/amitpatole/audel"
 url: "https://amitpatole.github.io/audel/"
 license: MIT
-version: 1.0.0rc1
-date-released: "2026-10-22"
+version: 1.0.0
+date-released: "2026-10-24"
 keywords:
   - audio quality control
   - loudness

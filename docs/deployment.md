@@ -142,11 +142,20 @@ expired loop sessions. Run it from cron or a Kubernetes CronJob for long-lived p
 
 ## Container
 
+Each release publishes the image to `ghcr.io/amitpatole/audel:<version>` (final releases also as
+`:latest`), built with the `serve,asr` extras and the `base` whisper model:
+
 ```bash
-docker build -t audel:1.0.0rc1 --build-arg EXTRAS=serve,asr --build-arg ASR_MODEL=small .
-printf 'AUDEL_API_TOKEN=%s\n' "$AUDEL_API_TOKEN" > audel.env && chmod 600 audel.env
+printf 'AUDEL_API_TOKEN=%s\n' "$(docker run --rm --entrypoint audel ghcr.io/amitpatole/audel:1.0.0 token new)" \
+  > audel.env && chmod 600 audel.env
 docker run --read-only --tmpfs /tmp -v audel-cache:/var/cache/audel \
-  --env-file audel.env -p 8000:8000 audel:1.0.0rc1
+  --env-file audel.env -p 8000:8000 ghcr.io/amitpatole/audel:1.0.0
+```
+
+To build your own (for example with a larger whisper model):
+
+```bash
+docker build -t audel:1.0.0 --build-arg EXTRAS=serve,asr --build-arg ASR_MODEL=small .
 ```
 
 The image runs as uid 10001 and works with a read-only root filesystem. The whisper model is
@@ -177,7 +186,7 @@ for an on-prem LLM or an object store.
 
 ## Throughput
 
-These figures were measured for 1.0.0rc1 on a shared 4-core host under heavy load (load average
+These figures were measured for 1.0.0 on a shared 4-core host under heavy load (load average
 about 14), grading eight 2-minute stereo programmes against `ebu_r128` through `/jobs`:
 
 | `AUDEL_MAX_CONCURRENT_JOBS` | Wall time | Realtime factor | Files per hour |

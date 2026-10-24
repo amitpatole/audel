@@ -6,7 +6,7 @@
 > **self-corrects before it claims done.**
 
 ```bash
-pip install --pre audel          # --pre: the 1.0.0rc1 release candidate
+pip install audel
 audel demo                       # no API key required
 ```
 
@@ -61,4 +61,5 @@ Verel decides and **compounds only verified work** into memory. All three share 
 
 Install: `pip install "verel[hearing]"` pulls the whole stack ·
 Source: [GitHub](https://github.com/amitpatole/audel) ·
-Package: [PyPI](https://pypi.org/project/audel/) · License: MIT.
+Package: [PyPI](https://pypi.org/project/audel/) · License: MIT ·
+Cite: [doi:10.5281/zenodo.23609200](https://doi.org/10.5281/zenodo.23609200) ([how to cite](writeup.md#how-to-cite)).

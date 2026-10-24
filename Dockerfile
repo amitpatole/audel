@@ -44,6 +44,10 @@ ENV HF_HUB_OFFLINE=1 \
 RUN mkdir -p /var/cache/audel && chown 10001:10001 /var/cache/audel
 VOLUME ["/var/cache/audel"]
 
+LABEL org.opencontainers.image.source="https://github.com/amitpatole/audel" \
+      org.opencontainers.image.description="Audel audio QC service (hearing + listening)" \
+      org.opencontainers.image.licenses="MIT"
+
 USER 10001
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \

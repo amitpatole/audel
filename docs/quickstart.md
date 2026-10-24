@@ -3,7 +3,7 @@
 ## Install
 
 ```bash
-pip install --pre audel      # light base: ffmpeg + DSP, no torch (--pre: 1.0.0rc1)
+pip install audel            # light base: ffmpeg + DSP, no torch
 audel doctor                 # check ffmpeg + optional extras
 audel demo                   # FAIL → PASS, no API key required
 ```

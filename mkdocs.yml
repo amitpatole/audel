@@ -75,6 +75,7 @@ nav:
   - On-prem inference: on-prem.md
   - Running as a service: deployment.md
   - Security: security.md
+  - Design and citation: writeup.md
   - Reference:
       - CLI: cli.md
       - Configuration: configuration.md

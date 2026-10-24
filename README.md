@@ -1,5 +1,7 @@
 # Audel — ears for AI agents and media pipelines
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23609200.svg)](https://doi.org/10.5281/zenodo.23609200)
+
 Audel **hears** audio and then **listens** to it. It returns a machine verdict (`pass`, `warn` or
 `fail`) with findings grounded to the millisecond, so an agent or a pipeline can fix the problem
 before it ships.
@@ -21,7 +23,7 @@ entirely on your own hardware through an on-prem Ollama server.
 ## Install
 
 ```bash
-pip install --pre audel           # light base: ffmpeg + DSP (--pre: 1.0.0rc1)
+pip install audel                 # light base: ffmpeg + DSP
 pip install "audel[asr]"          # local faster-whisper: listening
 pip install "audel[serve,oidc]"   # REST service with JWT auth
 audel doctor

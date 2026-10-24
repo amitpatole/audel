@@ -84,3 +84,47 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # release/v1
         with:
           skip-existing: true   # a release first uploaded by hand isn't a failed run
+
+  # The service image the Helm chart runs (ghcr.io/amitpatole/audel:<version>). Plain docker
+  # commands: no third-party actions to pin. Smoke-tested before it is pushed.
+  image:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Build
+        env:
+          TAG: ${{ github.ref_name }}
+        run: docker build -t "ghcr.io/amitpatole/audel:${TAG#v}" .
+      - name: Smoke (refuses to start without a token; serves with one)
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          img="ghcr.io/amitpatole/audel:${TAG#v}"
+          if timeout 60 docker run --rm "$img"; then echo "started without auth"; exit 1; fi
+          tok="$(docker run --rm --entrypoint audel "$img" token new | tail -1)"
+          docker run -d --name smoke --read-only --tmpfs /tmp -e AUDEL_API_TOKEN="$tok" \
+            -p 127.0.0.1:8000:8000 "$img"
+          for i in $(seq 1 45); do curl -fsS http://127.0.0.1:8000/healthz && break; sleep 2; done
+          curl -fsS http://127.0.0.1:8000/healthz | grep -q '"status":"ok"'
+          code="$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8000/check)"
+          test "$code" = "401"
+          docker rm -f smoke
+      - name: Push
+        env:
+          TAG: ${{ github.ref_name }}
+          ACTOR: ${{ github.actor }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          v="${TAG#v}"
+          img="ghcr.io/amitpatole/audel"
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+          docker push "$img:$v"
+          case "$v" in *[a-z]*) ;; *)  # a final release (no rc / a / b) is also :latest
+            docker tag "$img:$v" "$img:latest" && docker push "$img:latest" ;; esac
+          docker logout ghcr.io

@@ -38,7 +38,7 @@ from .errors import (
 )
 from .models import Issue, IssueKind, IssueSource, Report
 
-__version__ = "1.0.0rc1"
+__version__ = "1.0.0"
 
 __all__ = [
     "__version__",
