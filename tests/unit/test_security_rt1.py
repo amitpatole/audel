@@ -3600,8 +3600,10 @@ def test_speech_detection_respects_the_file_deadline(tmp_path):
     _ff("-f", "lavfi", "-i", "anoisesrc=d=600:c=pink:a=0.1", "-ac", "2", f)
     t0 = time.monotonic()
     with pytest.raises(UnsafeSourceError):
+        # A budget no real decode + VAD of 10 min fits in, on any runner (a fast one finished
+        # 2 s worth and correctly did not raise).
         speech_regions(f, Settings(), stream=0, labels=["FL", "FR"],
-                       channels=2, timeout_s=2.0)
+                       channels=2, timeout_s=0.25)
     assert time.monotonic() - t0 < 30
 
 
